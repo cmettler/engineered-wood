@@ -523,6 +523,48 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task Struct_OuterStruct_ListOfStruct()
+    {
+        // struct<m: list<struct<a, b>>>. Each leaf has 4 layers
+        // [item, inner_struct, list, outer_struct]. Exercises the recursive
+        // walker through outer-struct → list → inner-struct → primitive
+        // without any per-shape code path.
+        // 8 rows: row 3 has list=None (list-null inside valid outer),
+        //         row 5 has outer=None (cascades),
+        //         row 6 has list=[]  (empty),
+        //         others have a 2-element list of {a, b}.
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("struct_list_struct_v21.lance"));
+        var s = (Apache.Arrow.StructArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(8, s.Length);
+        Assert.Equal(1, s.NullCount);
+        Assert.True(s.IsNull(5));
+
+        var m = (ListArray)s.Fields[0];
+        Assert.Equal(8, m.Length);
+        Assert.Equal(2, m.NullCount);   // row 3 (list-null) + row 5 (outer cascade)
+        Assert.True(m.IsNull(3));
+        Assert.True(m.IsNull(5));
+        Assert.False(m.IsNull(6));      // empty list, valid
+
+        // Visible items: row 0,1,2,4,7 each contribute 2 → 10 items.
+        var inner = (Apache.Arrow.StructArray)m.Values;
+        Assert.Equal(10, inner.Length);
+        Assert.Equal(0, inner.NullCount);
+
+        var a = (Int32Array)inner.Fields[0];
+        var b = (Int32Array)inner.Fields[1];
+        // Row 0 contributes a[0]=17, a[1]=18; b[0]=113, b[1]=114
+        Assert.Equal(17, a.GetValue(0));
+        Assert.Equal(18, a.GetValue(1));
+        Assert.Equal(113, b.GetValue(0));
+        Assert.Equal(114, b.GetValue(1));
+        // Row 7 (last contributing row) goes at items 8..9: a = 17 + 7*11 = 94, +1 = 95
+        Assert.Equal(94, a.GetValue(8));
+        Assert.Equal(95, a.GetValue(9));
+        Assert.Equal(113 + 7 * 19, b.GetValue(8));
+    }
+
+    [Fact]
     public async Task Struct_Depth3_RecursiveCascade()
     {
         // struct<l1: struct<l2: struct<a: int, b: int>>>. Each leaf has 4

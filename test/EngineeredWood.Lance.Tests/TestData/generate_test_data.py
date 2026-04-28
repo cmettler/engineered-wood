@@ -239,6 +239,27 @@ def main() -> None:
                   type=list_struct_type)}),
               version="2.1")
 
+    # Deeper composition: struct<m: list<struct<a: int, b: int>>>. Each
+    # leaf has 4 layers [item, inner_struct, list, outer_struct]. Tests the
+    # walker against the deepest shape pylance currently reaches in our
+    # test set: a list of structs sitting inside an outer struct.
+    deep_lis_type = pa.struct([
+        ("m", pa.list_(pa.struct([("a", pa.int32()), ("b", pa.int32())]))),
+    ])
+    deep_lis_rows = []
+    for i in range(8):
+        if i == 3: deep_lis_rows.append({"m": None})
+        elif i == 5: deep_lis_rows.append(None)
+        elif i == 6: deep_lis_rows.append({"m": []})
+        else:
+            deep_lis_rows.append({"m": [
+                {"a": 17 + i * 11 + 0, "b": 113 + i * 19 + 0},
+                {"a": 17 + i * 11 + 1, "b": 113 + i * 19 + 1},
+            ]})
+    write_one("struct_list_struct_v21",
+              pa.table({"s": pa.array(deep_lis_rows, type=deep_lis_type)}),
+              version="2.1")
+
     # Three-deep struct nesting: struct<l1: struct<l2: struct<a, b>>>.
     # Each leaf has 4 layers [item, l2, l1, top]. Nullability at every
     # level — exercises the recursive walker's cascade.

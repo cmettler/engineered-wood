@@ -103,14 +103,9 @@ internal static class MiniBlockLayoutDecoder
         }
 
         if (targetType is Apache.Arrow.Types.ListType or LargeListType)
-        {
-            if (generalZstd)
-                throw new NotImplementedException(
-                    "MiniBlockLayout General(ZSTD) wrapping is not yet supported for list columns.");
-            return DecodeListMiniBlock(
-                chunkData, chunks, hasDef, hasRep, hasLargeChunk,
-                layout.Layers, targetType, valueEnc);
-        }
+            throw new InvalidOperationException(
+                "MiniBlockLayoutDecoder.Decode should not be called directly for list types — " +
+                "the recursive nested walker in LanceFileReader handles them.");
         if (targetType is FixedSizeListType fslType
             && valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.FixedSizeList)
         {
@@ -174,34 +169,17 @@ internal static class MiniBlockLayoutDecoder
             throw new NotImplementedException(
                 $"MiniBlockLayout with num_buffers={layout.NumBuffers} is not yet supported (target {targetType}).");
 
-        // Lists have 2 layers [leaf, list]. Primitives and strings have 1 layer.
-        bool isList = targetType is Apache.Arrow.Types.ListType or LargeListType;
-        int expectedLayers = isList ? 2 : 1;
-        if (layout.Layers.Count != expectedLayers)
+        // The Decode entry point handles primitive / string / FSL targets;
+        // list targets are routed through the recursive walker before
+        // reaching this method.
+        if (layout.Layers.Count != 1)
             throw new NotImplementedException(
                 $"MiniBlockLayout with {layout.Layers.Count} layers for target {targetType} is not yet supported.");
 
-        if (!isList)
-        {
-            RepDefLayer layer = layout.Layers[0];
-            if (layer != RepDefLayer.RepdefAllValidItem && layer != RepDefLayer.RepdefNullableItem)
-                throw new NotImplementedException(
-                    $"MiniBlockLayout RepDefLayer '{layer}' is not yet supported for {targetType}.");
-        }
-        else
-        {
-            RepDefLayer leafLayer = layout.Layers[0];
-            if (leafLayer != RepDefLayer.RepdefAllValidItem && leafLayer != RepDefLayer.RepdefNullableItem)
-                throw new NotImplementedException(
-                    $"List leaf RepDefLayer '{leafLayer}' is not yet supported.");
-            RepDefLayer listLayer = layout.Layers[1];
-            if (listLayer != RepDefLayer.RepdefAllValidList
-                && listLayer != RepDefLayer.RepdefNullableList
-                && listLayer != RepDefLayer.RepdefEmptyableList
-                && listLayer != RepDefLayer.RepdefNullAndEmptyList)
-                throw new NotImplementedException(
-                    $"List outer RepDefLayer '{listLayer}' is not yet supported.");
-        }
+        RepDefLayer layer = layout.Layers[0];
+        if (layer != RepDefLayer.RepdefAllValidItem && layer != RepDefLayer.RepdefNullableItem)
+            throw new NotImplementedException(
+                $"MiniBlockLayout RepDefLayer '{layer}' is not yet supported for {targetType}.");
     }
 
     private static IArrowArray DecodeFixedWidthMiniBlock(
@@ -1400,211 +1378,6 @@ internal static class MiniBlockLayoutDecoder
             throw new LanceFormatException(
                 $"Failed to build FSST decoder from Lance symbol table ({numSymbols} codes).", ex);
         }
-    }
-
-    // --- Phase 7: List of primitive ---
-
-    /// <summary>
-    /// Decodes a single-column v2.1 list of primitives. Layers are
-    /// <c>[leaf, list]</c>. Rep=1 opens a new row boundary; def>0 marks an
-    /// invisible placeholder (null or empty list, depending on the list
-    /// layer type). Handles both <see cref="Apache.Arrow.Types.ListType"/>
-    /// (i32 offsets, <see cref="ListArray"/> output) and
-    /// <see cref="LargeListType"/> (i64 offsets, <see cref="LargeListArray"/>
-    /// output) — they differ only in offset width on the wire.
-    /// </summary>
-    private static IArrowArray DecodeListMiniBlock(
-        ReadOnlySpan<byte> chunkData, List<MiniChunk> chunks,
-        bool hasDef, bool hasRep, bool hasLargeChunk,
-        Google.Protobuf.Collections.RepeatedField<RepDefLayer> layers,
-        IArrowType listType, CompressiveEncoding valueEnc)
-    {
-        IArrowType itemType = listType switch
-        {
-            Apache.Arrow.Types.ListType lt => lt.ValueDataType,
-            LargeListType llt => llt.ValueDataType,
-            _ => throw new LanceFormatException(
-                $"DecodeListMiniBlock target {listType} is not a list type."),
-        };
-        bool isLargeList = listType is LargeListType;
-
-        if (!hasRep)
-            throw new LanceFormatException("List MiniBlockLayout must have rep_compression.");
-        if (chunks.Count != 1)
-            throw new NotImplementedException(
-                "Multi-chunk list mini-block decoding is not yet supported.");
-        if (valueEnc.CompressionCase != CompressiveEncoding.CompressionOneofCase.Flat)
-            throw new NotImplementedException(
-                $"List items with value_compression '{valueEnc.CompressionCase}' are not yet supported.");
-
-        int valueBytesPerItem = ResolveFlatBytesPerValue(valueEnc, itemType);
-
-        ReadOnlySpan<byte> chunkBytes = chunkData.Slice(0, (int)chunks[0].SizeBytes);
-
-        int cursor = 0;
-        int numLevels = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2)); cursor += 2;
-        int repSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2)); cursor += 2;
-        int defSize = hasDef
-            ? BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2))
-            : 0;
-        if (hasDef) cursor += 2;
-
-        int valueBufSize = hasLargeChunk
-            ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
-            : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
-        cursor += hasLargeChunk ? 4 : 2;
-        cursor = AlignUp(cursor, MiniBlockAlignment);
-
-        if (repSize != numLevels * sizeof(ushort))
-            throw new NotImplementedException(
-                $"List rep buffer size {repSize} != {numLevels * 2} (non-Flat(16) rep is not yet supported).");
-        var rep = new ushort[numLevels];
-        for (int i = 0; i < numLevels; i++)
-            rep[i] = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor + i * 2, 2));
-        cursor += repSize;
-        cursor = AlignUp(cursor, MiniBlockAlignment);
-
-        ushort[]? def = null;
-        if (hasDef)
-        {
-            if (defSize != numLevels * sizeof(ushort))
-                throw new NotImplementedException(
-                    $"List def buffer size {defSize} != {numLevels * 2} (non-Flat(16) def is not yet supported).");
-            def = new ushort[numLevels];
-            for (int i = 0; i < numLevels; i++)
-                def[i] = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor + i * 2, 2));
-            cursor += defSize;
-            cursor = AlignUp(cursor, MiniBlockAlignment);
-        }
-
-        // Compute def-slot assignment for the layer shape. def=0 is always
-        // "fully valid"; subsequent defs go from innermost-nullable layer
-        // outward. For NULL_AND_EMPTY_LIST, null comes before empty.
-        RepDefLayer leafLayer = layers[0];
-        RepDefLayer listLayer = layers[1];
-        bool itemNullable = leafLayer == RepDefLayer.RepdefNullableItem;
-        bool listNullable = listLayer == RepDefLayer.RepdefNullableList
-                            || listLayer == RepDefLayer.RepdefNullAndEmptyList;
-        bool listEmptyable = listLayer == RepDefLayer.RepdefEmptyableList
-                             || listLayer == RepDefLayer.RepdefNullAndEmptyList;
-        int next = 1;
-        int leafNullDef = itemNullable ? next++ : -1;
-        int listNullDef = listNullable ? next++ : -1;
-        int listEmptyDef = listEmptyable ? next++ : -1;
-
-        // Walk rep/def to derive row boundaries, list validity, leaf validity,
-        // and visible count.
-        var arrowOffsetList = new List<int>();
-        var validityList = new List<bool>();
-        arrowOffsetList.Add(0);
-
-        int visibleCount = 0;
-        byte[]? leafValidity = itemNullable ? new byte[(checked(numLevels) + 7) / 8] : null;
-        int leafNullCount = 0;
-
-        for (int i = 0; i < numLevels; i++)
-        {
-            int defValue = def is null ? 0 : def[i];
-
-            if (rep[i] == 1)
-            {
-                if (arrowOffsetList.Count > 1 || i > 0)
-                    arrowOffsetList.Add(visibleCount);
-
-                if (defValue == listNullDef)
-                {
-                    validityList.Add(false);  // null list
-                    continue;
-                }
-                if (defValue == listEmptyDef)
-                {
-                    validityList.Add(true);   // empty list, valid
-                    continue;
-                }
-                validityList.Add(true);
-                // fall through to per-item processing
-            }
-
-            // rep=0 (continuation) or rep=1 with a visible item.
-            if (defValue == 0)
-            {
-                if (leafValidity is not null)
-                    leafValidity[visibleCount >> 3] |= (byte)(1 << (visibleCount & 7));
-            }
-            else if (defValue == leafNullDef)
-            {
-                leafNullCount++;
-            }
-            else
-            {
-                throw new LanceFormatException(
-                    $"Unexpected def value {defValue} at level {i} for list (layers=[{leafLayer},{listLayer}]).");
-            }
-            visibleCount++;
-        }
-        arrowOffsetList.Add(visibleCount);
-
-        int numRows = arrowOffsetList.Count - 1;
-        if (numRows != validityList.Count)
-            throw new LanceFormatException(
-                $"List decode mismatch: {numRows} rows vs {validityList.Count} validity entries.");
-
-        int valuesExpected = visibleCount * valueBytesPerItem;
-        if (valueBufSize < valuesExpected)
-            throw new LanceFormatException(
-                $"List value buffer {valueBufSize} < expected {valuesExpected} for {visibleCount} items.");
-        var valueBytes = chunkBytes.Slice(cursor, valuesExpected).ToArray();
-
-        // The leaf validity bitmap was sized for numLevels; trim to visibleCount.
-        byte[]? trimmedLeafValidity = null;
-        if (leafValidity is not null)
-        {
-            trimmedLeafValidity = new byte[(visibleCount + 7) / 8];
-            System.Array.Copy(leafValidity, trimmedLeafValidity, trimmedLeafValidity.Length);
-        }
-        ArrowBuffer leafValidityBuf = (trimmedLeafValidity is not null && leafNullCount > 0)
-            ? new ArrowBuffer(trimmedLeafValidity)
-            : ArrowBuffer.Empty;
-        var childData = new ArrayData(
-            itemType, visibleCount,
-            nullCount: leafNullCount, offset: 0,
-            new[] { leafValidityBuf, new ArrowBuffer(valueBytes) });
-        IArrowArray childArr = ArrowArrayFactory.BuildArray(childData);
-
-        // Offset width depends on list flavour: int32 vs int64.
-        byte[] arrowOffsets;
-        if (isLargeList)
-        {
-            arrowOffsets = new byte[(numRows + 1) * sizeof(long)];
-            for (int i = 0; i <= numRows; i++)
-                BinaryPrimitives.WriteInt64LittleEndian(
-                    arrowOffsets.AsSpan(i * 8, 8), arrowOffsetList[i]);
-        }
-        else
-        {
-            arrowOffsets = new byte[(numRows + 1) * sizeof(int)];
-            for (int i = 0; i <= numRows; i++)
-                BinaryPrimitives.WriteInt32LittleEndian(
-                    arrowOffsets.AsSpan(i * 4, 4), arrowOffsetList[i]);
-        }
-
-        byte[]? listBitmap = null;
-        int listNullCount = 0;
-        for (int i = 0; i < numRows; i++) if (!validityList[i]) listNullCount++;
-        if (listNullCount > 0)
-        {
-            listBitmap = new byte[(numRows + 7) / 8];
-            for (int i = 0; i < numRows; i++)
-                if (validityList[i])
-                    listBitmap[i >> 3] |= (byte)(1 << (i & 7));
-        }
-
-        ArrowBuffer listValidity = listBitmap is null ? ArrowBuffer.Empty : new ArrowBuffer(listBitmap);
-        var listData = new ArrayData(
-            listType, numRows, listNullCount, offset: 0,
-            new[] { listValidity, new ArrowBuffer(arrowOffsets) },
-            children: new[] { childArr.Data });
-        return isLargeList ? new LargeListArray(listData) : new ListArray(listData);
     }
 
     /// <summary>
