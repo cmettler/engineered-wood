@@ -22,8 +22,9 @@ namespace EngineeredWood.Lance;
 /// (<see cref="sbyte"/>, <see cref="short"/>, <see cref="int"/>,
 /// <see cref="long"/> and unsigned counterparts, <see cref="float"/>,
 /// <see cref="double"/>) or variable-length strings/binary, nullable
-/// or not, with all rows packed into a single MiniBlockLayout page per
-/// column. Fixed-width columns use <see cref="Flat"/> value
+/// or not, packed into a single MiniBlockLayout page per column with
+/// as many chunks as needed (each chunk capped at 32 KB by the v2.1
+/// chunk-meta word). Fixed-width columns use <see cref="Flat"/> value
 /// compression; strings/binary use <see cref="Variable"/> with
 /// Flat(u32) offsets.
 ///
@@ -46,7 +47,9 @@ namespace EngineeredWood.Lance;
 ///   <item>Lists, structs, FSL.</item>
 ///   <item>Other value encodings (FullZip, Bitpacking, FSST,
 ///   Dictionary, ByteStreamSplit, ...).</item>
-///   <item>Multi-page columns (large data → page splits).</item>
+///   <item>Multi-page columns (Lance splits at the page boundary too,
+///   typically once a page approaches its preferred size). Right now
+///   we always emit exactly one page per column.</item>
 ///   <item>Lance dataset wrapper (manifest, fragments, _versions/).</item>
 ///   <item>Cloud / multipart upload — only <see cref="ISequentialFile"/>
 ///   to a local file or memory.</item>
@@ -109,19 +112,19 @@ public sealed class LanceFileWriter : IAsyncDisposable
 
     /// <summary>Append a non-nullable <see cref="sbyte"/> column.</summary>
     public Task WriteInt8ColumnAsync(string name, ReadOnlySpan<sbyte> values, CancellationToken cancellationToken = default)
-        => WriteSinglePageColumnAsync(name, "int8", FlatEncoding(8), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteFlatPageAsync(name, "int8", 1, values.Length, MemoryMarshal.AsBytes(values).ToArray(), null, 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="byte"/> column.</summary>
     public Task WriteUInt8ColumnAsync(string name, ReadOnlySpan<byte> values, CancellationToken cancellationToken = default)
-        => WriteSinglePageColumnAsync(name, "uint8", FlatEncoding(8), values.Length, values.ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteFlatPageAsync(name, "uint8", 1, values.Length, values.ToArray(), null, 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="short"/> column.</summary>
     public Task WriteInt16ColumnAsync(string name, ReadOnlySpan<short> values, CancellationToken cancellationToken = default)
-        => WriteSinglePageColumnAsync(name, "int16", FlatEncoding(16), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteFlatPageAsync(name, "int16", 2, values.Length, MemoryMarshal.AsBytes(values).ToArray(), null, 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="ushort"/> column.</summary>
     public Task WriteUInt16ColumnAsync(string name, ReadOnlySpan<ushort> values, CancellationToken cancellationToken = default)
-        => WriteSinglePageColumnAsync(name, "uint16", FlatEncoding(16), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteFlatPageAsync(name, "uint16", 2, values.Length, MemoryMarshal.AsBytes(values).ToArray(), null, 0, cancellationToken);
 
     /// <summary>
     /// Append a non-nullable <see cref="int"/> column to the file.
@@ -129,27 +132,27 @@ public sealed class LanceFileWriter : IAsyncDisposable
     /// length becomes the file's row count.
     /// </summary>
     public Task WriteInt32ColumnAsync(string name, ReadOnlySpan<int> values, CancellationToken cancellationToken = default)
-        => WriteSinglePageColumnAsync(name, "int32", FlatEncoding(32), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteFlatPageAsync(name, "int32", 4, values.Length, MemoryMarshal.AsBytes(values).ToArray(), null, 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="uint"/> column.</summary>
     public Task WriteUInt32ColumnAsync(string name, ReadOnlySpan<uint> values, CancellationToken cancellationToken = default)
-        => WriteSinglePageColumnAsync(name, "uint32", FlatEncoding(32), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteFlatPageAsync(name, "uint32", 4, values.Length, MemoryMarshal.AsBytes(values).ToArray(), null, 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="long"/> column.</summary>
     public Task WriteInt64ColumnAsync(string name, ReadOnlySpan<long> values, CancellationToken cancellationToken = default)
-        => WriteSinglePageColumnAsync(name, "int64", FlatEncoding(64), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteFlatPageAsync(name, "int64", 8, values.Length, MemoryMarshal.AsBytes(values).ToArray(), null, 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="ulong"/> column.</summary>
     public Task WriteUInt64ColumnAsync(string name, ReadOnlySpan<ulong> values, CancellationToken cancellationToken = default)
-        => WriteSinglePageColumnAsync(name, "uint64", FlatEncoding(64), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteFlatPageAsync(name, "uint64", 8, values.Length, MemoryMarshal.AsBytes(values).ToArray(), null, 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="float"/> (Float32) column.</summary>
     public Task WriteFloatColumnAsync(string name, ReadOnlySpan<float> values, CancellationToken cancellationToken = default)
-        => WriteSinglePageColumnAsync(name, "float", FlatEncoding(32), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteFlatPageAsync(name, "float", 4, values.Length, MemoryMarshal.AsBytes(values).ToArray(), null, 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="double"/> (Float64) column.</summary>
     public Task WriteDoubleColumnAsync(string name, ReadOnlySpan<double> values, CancellationToken cancellationToken = default)
-        => WriteSinglePageColumnAsync(name, "double", FlatEncoding(64), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteFlatPageAsync(name, "double", 8, values.Length, MemoryMarshal.AsBytes(values).ToArray(), null, 0, cancellationToken);
 
     /// <summary>
     /// Append an Apache Arrow column. Supported types:
@@ -170,24 +173,24 @@ public sealed class LanceFileWriter : IAsyncDisposable
         if (array is BinaryArray ba)
             return WriteVariableColumnAsync(name, "binary", ba, cancellationToken);
 
-        var (logicalType, bitsPerValue, valueBytes) = array switch
+        var (logicalType, bytesPerValue, valueBytes) = array switch
         {
-            Int8Array a => ("int8", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
-            UInt8Array a => ("uint8", 8, a.Values.ToArray()),
-            Int16Array a => ("int16", 16, MemoryMarshal.AsBytes(a.Values).ToArray()),
-            UInt16Array a => ("uint16", 16, MemoryMarshal.AsBytes(a.Values).ToArray()),
-            Int32Array a => ("int32", 32, MemoryMarshal.AsBytes(a.Values).ToArray()),
-            UInt32Array a => ("uint32", 32, MemoryMarshal.AsBytes(a.Values).ToArray()),
-            Int64Array a => ("int64", 64, MemoryMarshal.AsBytes(a.Values).ToArray()),
-            UInt64Array a => ("uint64", 64, MemoryMarshal.AsBytes(a.Values).ToArray()),
-            FloatArray a => ("float", 32, MemoryMarshal.AsBytes(a.Values).ToArray()),
-            DoubleArray a => ("double", 64, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Int8Array a => ("int8", 1, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt8Array a => ("uint8", 1, a.Values.ToArray()),
+            Int16Array a => ("int16", 2, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt16Array a => ("uint16", 2, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Int32Array a => ("int32", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt32Array a => ("uint32", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Int64Array a => ("int64", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt64Array a => ("uint64", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            FloatArray a => ("float", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            DoubleArray a => ("double", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
             _ => throw new NotSupportedException(
                 $"LanceFileWriter doesn't yet support Arrow array type '{array.GetType().Name}'."),
         };
 
-        return WriteSinglePageColumnAsync(
-            name, logicalType, FlatEncoding(bitsPerValue), array.Length, valueBytes,
+        return WriteFlatPageAsync(
+            name, logicalType, bytesPerValue, array.Length, valueBytes,
             ExtractValidityBitmap(array), array.NullCount, cancellationToken);
     }
 
@@ -201,33 +204,76 @@ public sealed class LanceFileWriter : IAsyncDisposable
         return span.IsEmpty ? null : span.ToArray();
     }
 
+    /// <summary>
+    /// Plans a multi-chunk Flat-encoded page. Picks the largest power-of-2
+    /// item count whose chunk fits in 32 KB, then carves the input value
+    /// bytes into chunks of that size (last chunk holds the remainder).
+    /// </summary>
+    private Task WriteFlatPageAsync(
+        string name, string logicalType, int bytesPerValue,
+        int numItems, byte[] valueBytes,
+        byte[]? validityBitmap, int nullCount,
+        CancellationToken cancellationToken)
+    {
+        bool hasDef = nullCount > 0 && validityBitmap is not null;
+        int chunkSize = LargestPow2FlatChunkSize(bytesPerValue, hasDef);
+
+        var chunks = new List<(int itemStart, int itemCount, byte[] valueBuf)>();
+        int idx = 0;
+        while (idx < numItems)
+        {
+            int items = Math.Min(numItems - idx, chunkSize);
+            byte[] chunkValBytes = new byte[items * bytesPerValue];
+            new ReadOnlySpan<byte>(valueBytes, idx * bytesPerValue, items * bytesPerValue)
+                .CopyTo(chunkValBytes);
+            chunks.Add((idx, items, chunkValBytes));
+            idx += items;
+        }
+
+        return WriteMultiChunkPageAsync(
+            name, logicalType, FlatEncoding(bytesPerValue * 8), numItems, chunks,
+            validityBitmap, nullCount, cancellationToken);
+    }
+
     private Task WriteVariableColumnAsync(
         string name, string logicalType, BinaryArray array,
         CancellationToken cancellationToken)
     {
-        // Lance v2.1 Variable wire format (single chunk):
-        //   value buffer = (numItems + 1) × u32 absolute offsets, then
+        // Lance v2.1 Variable wire format (per chunk):
+        //   value buffer = (chunkItems + 1) × u32 absolute offsets, then
         //                  concatenated data bytes
-        // offsets[0] = (numItems + 1) * 4 (start of data section);
-        // offsets[i+1] = offsets[i] + len(item i). For null items we still
-        // emit an offset (with len = 0); the def buffer carries the null bit.
+        // offsets[0] = (chunkItems + 1) * 4 (start of data section in this
+        // chunk's value buffer); offsets[i+1] = offsets[i] + len(item i).
+        // Multi-chunk: each chunk has its own self-contained offsets array
+        // (relative within the chunk), so we just need to chunk by byte
+        // budget. Non-last chunks must have power-of-2 item counts.
         int numItems = array.Length;
-        int totalDataLen = 0;
-        for (int i = 0; i < numItems; i++)
-            totalDataLen += array.GetBytes(i).Length;
-        int offsetsBytes = checked((numItems + 1) * sizeof(uint));
-        int valueBufLen = checked(offsetsBytes + totalDataLen);
+        bool hasDef = array.NullCount > 0;
 
-        byte[] valueBuf = new byte[valueBufLen];
-        uint dataCursor = (uint)offsetsBytes;
-        BinaryPrimitives.WriteUInt32LittleEndian(valueBuf.AsSpan(0, sizeof(uint)), dataCursor);
-        for (int i = 0; i < numItems; i++)
+        var chunks = new List<(int itemStart, int itemCount, byte[] valueBuf)>();
+        int idx = 0;
+        while (idx < numItems)
         {
-            var rowBytes = array.GetBytes(i);
-            rowBytes.CopyTo(valueBuf.AsSpan((int)dataCursor));
-            dataCursor += (uint)rowBytes.Length;
-            BinaryPrimitives.WriteUInt32LittleEndian(
-                valueBuf.AsSpan((i + 1) * sizeof(uint), sizeof(uint)), dataCursor);
+            int items = 0;
+            int dataBytes = 0;
+            while (idx + items < numItems)
+            {
+                int newCount = items + 1;
+                int newDataBytes = dataBytes + array.GetBytes(idx + items).Length;
+                int valueBufLen = (newCount + 1) * sizeof(uint) + newDataBytes;
+                int total = ChunkTotalBytes(newCount, valueBufLen, hasDef);
+                if (total > MaxChunkBytes) break;
+                items = newCount;
+                dataBytes = newDataBytes;
+            }
+            if (items == 0)
+                throw new InvalidOperationException(
+                    $"Variable item at index {idx} alone exceeds the {MaxChunkBytes}-byte chunk limit.");
+            bool isLast = idx + items == numItems;
+            int finalItems = isLast ? items : Pow2Floor(items);
+            byte[] valueBuf = BuildVariableChunkValueBuffer(array, idx, finalItems);
+            chunks.Add((idx, finalItems, valueBuf));
+            idx += finalItems;
         }
 
         var valueEncoding = new CompressiveEncoding
@@ -242,28 +288,79 @@ public sealed class LanceFileWriter : IAsyncDisposable
             },
         };
 
-        return WriteSinglePageColumnAsync(
-            name, logicalType, valueEncoding, numItems, valueBuf,
+        return WriteMultiChunkPageAsync(
+            name, logicalType, valueEncoding, numItems, chunks,
             ExtractValidityBitmap(array), array.NullCount, cancellationToken);
     }
 
+    private const int MaxChunkBytes = 4096 * MiniBlockAlignment; // 32 KiB; v2.1 chunk-meta divided_bytes is 12 bits
+
+    private static int LargestPow2FlatChunkSize(int bytesPerValue, bool hasDef)
+    {
+        // Find largest 2^k such that the resulting chunk fits in MaxChunkBytes.
+        for (int log2 = 15; log2 >= 1; log2--)
+        {
+            int items = 1 << log2;
+            int valueBufLen = items * bytesPerValue;
+            if (ChunkTotalBytes(items, valueBufLen, hasDef) <= MaxChunkBytes)
+                return items;
+        }
+        return 1;
+    }
+
+    private static int ChunkTotalBytes(int items, int valueBufLen, bool hasDef)
+    {
+        int headerPadded = AlignUp(hasDef ? 6 : 4, MiniBlockAlignment);
+        int defPadded = hasDef ? AlignUp(items * sizeof(ushort), MiniBlockAlignment) : 0;
+        return headerPadded + defPadded + AlignUp(valueBufLen, MiniBlockAlignment);
+    }
+
+    private static int Pow2Floor(int n)
+    {
+        if (n < 1) return 1;
+        int p = 1;
+        while ((p << 1) <= n) p <<= 1;
+        return p;
+    }
+
+    private static byte[] BuildVariableChunkValueBuffer(BinaryArray array, int itemStart, int itemCount)
+    {
+        int totalDataLen = 0;
+        for (int i = 0; i < itemCount; i++)
+            totalDataLen += array.GetBytes(itemStart + i).Length;
+        int offsetsBytes = checked((itemCount + 1) * sizeof(uint));
+        byte[] buf = new byte[offsetsBytes + totalDataLen];
+        uint dataCursor = (uint)offsetsBytes;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(0, sizeof(uint)), dataCursor);
+        for (int i = 0; i < itemCount; i++)
+        {
+            var rowBytes = array.GetBytes(itemStart + i);
+            rowBytes.CopyTo(buf.AsSpan((int)dataCursor));
+            dataCursor += (uint)rowBytes.Length;
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                buf.AsSpan((i + 1) * sizeof(uint), sizeof(uint)), dataCursor);
+        }
+        return buf;
+    }
+
     /// <summary>
-    /// Single-page MiniBlockLayout for any value-encoding shape with
-    /// <c>num_buffers = 1</c> and a single chunk. Caller pre-builds
-    /// <paramref name="valueBytes"/> in whatever layout
-    /// <paramref name="valueEncoding"/> describes (Flat: little-endian
-    /// fixed-width values; Variable: <c>(numItems+1)</c> u32 absolute
-    /// offsets followed by raw data bytes). An optional Arrow-style LSB
-    /// <paramref name="validityBitmap"/> (bit set = valid) emits a
-    /// Flat(16) def buffer and the <c>NULLABLE_ITEM</c> layer; otherwise
-    /// the page uses <c>ALL_VALID_ITEM</c>.
+    /// Emits a multi-chunk MiniBlockLayout page for any value encoding with
+    /// <c>num_buffers = 1</c>. Each entry in <paramref name="chunks"/>
+    /// supplies that chunk's items range and its post-def value buffer
+    /// (Flat: raw little-endian values; Variable: per-chunk
+    /// <c>(items+1)</c> absolute u32 offsets followed by data bytes). The
+    /// helper assembles each chunk's header + def bytes (if any) + value
+    /// buffer, packs all chunks into buffer 1, and writes a u16-per-chunk
+    /// metadata word into buffer 0. Non-last chunks must have power-of-2
+    /// item counts (encoded as <c>log_num_values</c>); the last chunk's
+    /// item count is recovered as <c>numItems - sum(prior chunks)</c>.
     /// </summary>
-    private async Task WriteSinglePageColumnAsync(
+    private async Task WriteMultiChunkPageAsync(
         string name,
         string logicalType,
         CompressiveEncoding valueEncoding,
         int numItems,
-        byte[] valueBytes,
+        IReadOnlyList<(int itemStart, int itemCount, byte[] valueBuf)> chunks,
         byte[]? validityBitmap,
         int nullCount,
         CancellationToken cancellationToken)
@@ -276,75 +373,101 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 nameof(numItems));
 
         bool hasDef = nullCount > 0 && validityBitmap is not null;
+        int N = chunks.Count;
+        int headerLen = hasDef ? 6 : 4;
+        int headerPadded = AlignUp(headerLen, MiniBlockAlignment);
 
-        // --- Build the page's two buffers (chunk metadata + chunk data) ---
-        // Chunk inner layout (v2.1 MiniBlockLayout, num_buffers = 1, no rep):
-        //   u16 num_levels      (= numItems if hasDef, else 0)
-        //   u16 def_size        (only if hasDef)
-        //   u16 valueBufSize
-        //   pad to 8-byte alignment
-        //   def buffer          (only if hasDef; numItems × u16, padded to 8)
-        //   value buffer        (valueBytes, padded to 8)
-        int valueByteLen = valueBytes.Length;
-        int chunkHeaderLen = hasDef ? 6 : 4;  // num_levels [+ def_size] + valueBufSize
-        int chunkHeaderPadded = AlignUp(chunkHeaderLen, MiniBlockAlignment);
-        int defByteLen = hasDef ? numItems * sizeof(ushort) : 0;
-        int defPadded = hasDef ? AlignUp(defByteLen, MiniBlockAlignment) : 0;
-        int chunkBeforePad = chunkHeaderPadded + defPadded + valueByteLen;
-        int chunkTotal = AlignUp(chunkBeforePad, MiniBlockAlignment);
-        int dividedBytes = (chunkTotal / MiniBlockAlignment) - 1;
-        if (dividedBytes < 0 || dividedBytes > 0xFFF)
-            throw new InvalidOperationException(
-                $"Chunk byte length {chunkTotal} cannot be encoded as a v2.1 mini-block word.");
+        byte[][] chunkBytes = new byte[N][];
+        ushort[] metaWords = new ushort[N];
+        long dataTotal = 0;
 
-        // Buffer 0: chunk metadata. v2.1 uses u16 words: low 4 bits =
-        // log_num_values (ignored for the last chunk; here the only chunk
-        // is also the last), high 12 bits = divided_bytes.
-        byte[] chunkMeta = new byte[2];
-        ushort word = (ushort)((dividedBytes << 4) | 0);
-        BinaryPrimitives.WriteUInt16LittleEndian(chunkMeta.AsSpan(0, 2), word);
-
-        // Buffer 1: chunk data.
-        byte[] chunkData = new byte[chunkTotal];
-        int headCursor = 0;
-        BinaryPrimitives.WriteUInt16LittleEndian(
-            chunkData.AsSpan(headCursor, 2), checked((ushort)(hasDef ? numItems : 0)));
-        headCursor += 2;
-        if (hasDef)
+        for (int c = 0; c < N; c++)
         {
-            BinaryPrimitives.WriteUInt16LittleEndian(
-                chunkData.AsSpan(headCursor, 2), checked((ushort)defByteLen));
-            headCursor += 2;
-        }
-        BinaryPrimitives.WriteUInt16LittleEndian(
-            chunkData.AsSpan(headCursor, 2), checked((ushort)valueByteLen));
-        // remaining header padding bytes already zero
-        if (hasDef)
-        {
-            // Convert Arrow LSB-first validity bitmap → Lance Flat(16) def
-            // levels: bit set ⇒ def = 0 (valid); bit clear ⇒ def = 1 (null).
-            Span<byte> defOut = chunkData.AsSpan(chunkHeaderPadded, defByteLen);
-            for (int i = 0; i < numItems; i++)
+            var (itemStart, itemCount, chunkValueBuf) = chunks[c];
+            int valueBufLen = chunkValueBuf.Length;
+            int defByteLen = hasDef ? itemCount * sizeof(ushort) : 0;
+            int defPadded = hasDef ? AlignUp(defByteLen, MiniBlockAlignment) : 0;
+            int chunkTotal = AlignUp(headerPadded + defPadded + valueBufLen, MiniBlockAlignment);
+            int dividedBytes = (chunkTotal / MiniBlockAlignment) - 1;
+            if (dividedBytes < 0 || dividedBytes > 0xFFF)
+                throw new InvalidOperationException(
+                    $"Chunk {c} byte length {chunkTotal} cannot be encoded as a v2.1 mini-block word.");
+
+            int logNumValues;
+            bool isLast = c == N - 1;
+            if (isLast)
             {
-                bool valid = (validityBitmap![i >> 3] & (1 << (i & 7))) != 0;
-                BinaryPrimitives.WriteUInt16LittleEndian(
-                    defOut.Slice(i * sizeof(ushort), sizeof(ushort)),
-                    valid ? (ushort)0 : (ushort)1);
+                // log_num_values is ignored for the last chunk (the reader
+                // computes its size as items_in_page - prior_values), but
+                // pick a representative power so meta dumps look sensible.
+                logNumValues = itemCount > 0 ? Log2Floor(itemCount) : 0;
             }
-        }
-        valueBytes.CopyTo(chunkData.AsSpan(chunkHeaderPadded + defPadded));
-        // trailing padding already zero
+            else
+            {
+                int log2 = Log2Floor(itemCount);
+                if ((1 << log2) != itemCount || log2 == 0)
+                    throw new InvalidOperationException(
+                        $"Non-last chunk {c} item count {itemCount} must be a power of 2 >= 2.");
+                logNumValues = log2;
+            }
+            metaWords[c] = (ushort)((dividedBytes << 4) | (logNumValues & 0xF));
 
-        // --- Write the buffers, recording their absolute file offsets ---
+            byte[] cb = new byte[chunkTotal];
+            int cursor = 0;
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                cb.AsSpan(cursor, 2), checked((ushort)(hasDef ? itemCount : 0)));
+            cursor += 2;
+            if (hasDef)
+            {
+                BinaryPrimitives.WriteUInt16LittleEndian(
+                    cb.AsSpan(cursor, 2), checked((ushort)defByteLen));
+                cursor += 2;
+            }
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                cb.AsSpan(cursor, 2), checked((ushort)valueBufLen));
+
+            if (hasDef)
+            {
+                Span<byte> defOut = cb.AsSpan(headerPadded, defByteLen);
+                for (int i = 0; i < itemCount; i++)
+                {
+                    int globalIdx = itemStart + i;
+                    bool valid = (validityBitmap![globalIdx >> 3] & (1 << (globalIdx & 7))) != 0;
+                    BinaryPrimitives.WriteUInt16LittleEndian(
+                        defOut.Slice(i * sizeof(ushort), sizeof(ushort)),
+                        valid ? (ushort)0 : (ushort)1);
+                }
+            }
+            chunkValueBuf.CopyTo(cb, headerPadded + defPadded);
+
+            chunkBytes[c] = cb;
+            dataTotal += chunkTotal;
+        }
+
+        // Buffer 0: one u16 chunk-meta word per chunk.
+        byte[] metaBuf = new byte[checked(N * sizeof(ushort))];
+        for (int c = 0; c < N; c++)
+            BinaryPrimitives.WriteUInt16LittleEndian(metaBuf.AsSpan(c * sizeof(ushort), sizeof(ushort)), metaWords[c]);
+
+        // Buffer 1: concatenated chunk bytes.
+        byte[] dataBuf = new byte[checked((int)dataTotal)];
+        int writePos = 0;
+        for (int c = 0; c < N; c++)
+        {
+            chunkBytes[c].CopyTo(dataBuf, writePos);
+            writePos += chunkBytes[c].Length;
+        }
+
+        // --- Write the page's two buffers, recording their offsets ---
         await PadToAlignmentAsync(PageBufferAlignment, cancellationToken).ConfigureAwait(false);
         long buf0Offset = _file.Position;
-        await _file.WriteAsync(chunkMeta, cancellationToken).ConfigureAwait(false);
-        long buf0Size = chunkMeta.Length;
+        await _file.WriteAsync(metaBuf, cancellationToken).ConfigureAwait(false);
+        long buf0Size = metaBuf.Length;
 
         await PadToAlignmentAsync(PageBufferAlignment, cancellationToken).ConfigureAwait(false);
         long buf1Offset = _file.Position;
-        await _file.WriteAsync(chunkData, cancellationToken).ConfigureAwait(false);
-        long buf1Size = chunkData.Length;
+        await _file.WriteAsync(dataBuf, cancellationToken).ConfigureAwait(false);
+        long buf1Size = dataBuf.Length;
 
         // --- Build the page's encoding (PageLayout → Any → DirectEncoding → Encoding) ---
         var miniBlock = new MiniBlockLayout
@@ -528,6 +651,15 @@ public sealed class LanceFileWriter : IAsyncDisposable
         if (padBytes == 0) return;
         byte[] zeros = new byte[padBytes];
         await _file.WriteAsync(zeros, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static int Log2Floor(int n)
+    {
+        if (n <= 1) return 0;
+        int log = 0;
+        int v = n;
+        while (v > 1) { v >>= 1; log++; }
+        return log;
     }
 
     private static int AlignUp(int value, int alignment) =>

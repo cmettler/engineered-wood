@@ -242,6 +242,174 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task LargeInt64_MultiChunk_RoundTrip_ViaOurReader()
+    {
+        // 10_000 Int64 values = 80 KB raw. With B=8 the writer caps each
+        // chunk at 2048 items (16 KB), so this needs ~5 chunks per page.
+        int n = 10_000;
+        var values = new long[n];
+        for (int i = 0; i < n; i++) values[i] = (long)i * 1_000_003L - 1;  // mix high and low bits
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-multi-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteInt64ColumnAsync("v", values);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(n, reader.NumberOfRows);
+            var readBack = (Int64Array)await reader.ReadColumnAsync(0);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(values[i], readBack.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task LargeNullableInt32_MultiChunk_RoundTrip_ViaOurReader()
+    {
+        // Nullable Int32 with 20_000 rows + ~10% nulls. With B=4 + def
+        // (2 bytes/item), each chunk fits ~4096 items. Exercises both
+        // multi-chunk AND the per-chunk def buffer construction.
+        int n = 20_000;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 11 == 0) b.AppendNull();
+            else b.Append(i * 7);
+        }
+        var arr = b.Build();
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-multi-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("v", arr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(n, reader.NumberOfRows);
+            var readBack = (Int32Array)await reader.ReadColumnAsync(0);
+            Assert.Equal(arr.NullCount, readBack.NullCount);
+            for (int i = 0; i < n; i++)
+            {
+                Assert.Equal(arr.IsNull(i), readBack.IsNull(i));
+                if (!arr.IsNull(i))
+                    Assert.Equal(arr.GetValue(i), readBack.GetValue(i));
+            }
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task LargeStrings_MultiChunk_RoundTrip_ViaOurReader()
+    {
+        // Many short strings totalling > 32 KB of data → multi-chunk
+        // Variable page. Mix in some nulls and a sprinkling of longer
+        // strings to exercise the greedy chunker's power-of-2 rounding.
+        int n = 5_000;
+        var b = new StringArray.Builder();
+        var expected = new string?[n];
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 23 == 0) { b.AppendNull(); expected[i] = null; }
+            else
+            {
+                string v = i % 97 == 0
+                    ? new string('x', 200)             // longer item every now and then
+                    : $"row_{i}_value_{i * 13 % 9991}";
+                b.Append(v);
+                expected[i] = v;
+            }
+        }
+        var arr = b.Build();
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-multi-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("s", arr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(n, reader.NumberOfRows);
+            var readBack = (StringArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(arr.NullCount, readBack.NullCount);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(expected[i], readBack.GetString(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task LargeInt64_MultiChunk_CrossValidatedAgainstPylance()
+    {
+        if (!IsPythonAvailable()) return;
+
+        int n = 10_000;
+        var values = new long[n];
+        for (int i = 0; i < n; i++) values[i] = (long)i - 5000;
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-pylance-multi-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteInt64ColumnAsync("v", values);
+                await writer.FinishAsync();
+            }
+
+            string script = "import sys, json\n" +
+                "from lance.file import LanceFileReader\n" +
+                $"r = LanceFileReader(r'{path}')\n" +
+                "t = r.read_all().to_table()\n" +
+                "vals = t['v'].to_pylist()\n" +
+                "out = { 'rows': len(t), 'first': vals[:3], 'last': vals[-3:], 'sum': sum(vals) }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            var root = json.RootElement;
+            Assert.Equal(n, root.GetProperty("rows").GetInt32());
+            long expectedSum = 0;
+            for (int i = 0; i < n; i++) expectedSum += values[i];
+            Assert.Equal(expectedSum, root.GetProperty("sum").GetInt64());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task NullableInt32_RoundTrip_ViaOurReader()
     {
         string path = Path.Combine(Path.GetTempPath(), $"ew-lance-writer-{Guid.NewGuid():N}.lance");
