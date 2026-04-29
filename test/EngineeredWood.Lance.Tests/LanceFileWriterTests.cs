@@ -126,6 +126,122 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task Strings_RoundTrip_ViaOurReader()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-writer-{Guid.NewGuid():N}.lance");
+        try
+        {
+            var sb = new StringArray.Builder();
+            sb.Append("alpha");
+            sb.Append("");
+            sb.Append("Lance");
+            sb.AppendNull();
+            sb.Append("éclat");  // multi-byte UTF-8
+            var strings = sb.Build();
+
+            var bb = new BinaryArray.Builder();
+            bb.Append(new byte[] { 0xDE, 0xAD });
+            bb.AppendNull();
+            bb.Append(System.Array.Empty<byte>());
+            bb.Append(new byte[] { 0xBE, 0xEF, 0xCA, 0xFE });
+            bb.Append(new byte[] { 0x00 });
+            var binaries = bb.Build();
+
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("s", strings);
+                await writer.WriteColumnAsync("b", binaries);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(5, reader.NumberOfRows);
+            Assert.IsType<StringType>(reader.Schema.FieldsList[0].DataType);
+            Assert.IsType<BinaryType>(reader.Schema.FieldsList[1].DataType);
+
+            var rs = (StringArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(1, rs.NullCount);
+            Assert.Equal("alpha", rs.GetString(0));
+            Assert.Equal("", rs.GetString(1));
+            Assert.Equal("Lance", rs.GetString(2));
+            Assert.Null(rs.GetString(3));
+            Assert.Equal("éclat", rs.GetString(4));
+
+            var rb = (BinaryArray)await reader.ReadColumnAsync(1);
+            Assert.Equal(1, rb.NullCount);
+            Assert.Equal(new byte[] { 0xDE, 0xAD }, rb.GetBytes(0).ToArray());
+            Assert.True(rb.IsNull(1));
+            Assert.Equal(System.Array.Empty<byte>(), rb.GetBytes(2).ToArray());
+            Assert.Equal(new byte[] { 0xBE, 0xEF, 0xCA, 0xFE }, rb.GetBytes(3).ToArray());
+            Assert.Equal(new byte[] { 0x00 }, rb.GetBytes(4).ToArray());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Strings_CrossValidatedAgainstPylance()
+    {
+        if (!IsPythonAvailable())
+        {
+            return;
+        }
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-pylance-str-{Guid.NewGuid():N}.lance");
+        try
+        {
+            var sb = new StringArray.Builder();
+            sb.Append("alpha");
+            sb.AppendNull();
+            sb.Append("Lance");
+            sb.Append("éclat");
+            sb.Append("");
+            var strings = sb.Build();
+
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("s", strings);
+                await writer.FinishAsync();
+            }
+
+            string script = "import sys, json\n" +
+                "from lance.file import LanceFileReader\n" +
+                $"r = LanceFileReader(r'{path}')\n" +
+                "t = r.read_all().to_table()\n" +
+                "out = { 'rows': len(t), 'type': str(t.schema[0].type), 'values': t['s'].to_pylist() }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            var root = json.RootElement;
+            Assert.Equal(5, root.GetProperty("rows").GetInt32());
+            Assert.Equal("string", root.GetProperty("type").GetString());
+            var values = new List<string?>();
+            foreach (var v in root.GetProperty("values").EnumerateArray())
+                values.Add(v.ValueKind == System.Text.Json.JsonValueKind.Null ? null : v.GetString());
+            Assert.Equal(new string?[] { "alpha", null, "Lance", "éclat", "" }, values);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task NullableInt32_RoundTrip_ViaOurReader()
     {
         string path = Path.Combine(Path.GetTempPath(), $"ew-lance-writer-{Guid.NewGuid():N}.lance");

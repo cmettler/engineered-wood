@@ -18,11 +18,14 @@ namespace EngineeredWood.Lance;
 /// <summary>
 /// Writer for v2.1 Lance files. Phase 13 MVP: produces a single-file
 /// (no Lance dataset wrapper, no manifest) Lance v2.1 file containing
-/// one or more fixed-width primitive columns (<see cref="sbyte"/>,
-/// <see cref="short"/>, <see cref="int"/>, <see cref="long"/> and
-/// unsigned counterparts, <see cref="float"/>, <see cref="double"/>),
-/// nullable or not, with all rows packed into a single MiniBlockLayout
-/// page per column using <see cref="Flat"/> value compression.
+/// one or more columns of either fixed-width primitives
+/// (<see cref="sbyte"/>, <see cref="short"/>, <see cref="int"/>,
+/// <see cref="long"/> and unsigned counterparts, <see cref="float"/>,
+/// <see cref="double"/>) or variable-length strings/binary, nullable
+/// or not, with all rows packed into a single MiniBlockLayout page per
+/// column. Fixed-width columns use <see cref="Flat"/> value
+/// compression; strings/binary use <see cref="Variable"/> with
+/// Flat(u32) offsets.
 ///
 /// <para><b>What this writer covers</b>:</para>
 /// <list type="bullet">
@@ -32,8 +35,7 @@ namespace EngineeredWood.Lance;
 ///   <item><see cref="MiniBlockLayout"/> with <c>num_buffers=1</c>,
 ///   <c>layers=[ALL_VALID_ITEM]</c> for null-free columns or
 ///   <c>layers=[NULLABLE_ITEM]</c> with <c>def_compression=Flat(16)</c>
-///   for nullable ones; <c>value_compression=Flat(N)</c>; single chunk,
-///   no rep.</item>
+///   for nullable ones; single chunk, no rep.</item>
 ///   <item>Schema: top-level primitive leaves with sequential field
 ///   ids.</item>
 /// </list>
@@ -41,8 +43,8 @@ namespace EngineeredWood.Lance;
 /// <para><b>What's deferred</b>:</para>
 /// <list type="bullet">
 ///   <item>Booleans (bit-packed encoding, not byte-aligned).</item>
-///   <item>Strings, binary, lists, structs, FSL.</item>
-///   <item>Other encodings (Variable, FullZip, Bitpacking, FSST,
+///   <item>Lists, structs, FSL.</item>
+///   <item>Other value encodings (FullZip, Bitpacking, FSST,
 ///   Dictionary, ByteStreamSplit, ...).</item>
 ///   <item>Multi-page columns (large data → page splits).</item>
 ///   <item>Lance dataset wrapper (manifest, fragments, _versions/).</item>
@@ -102,21 +104,24 @@ public sealed class LanceFileWriter : IAsyncDisposable
         return new LanceFileWriter(seq, ownsFile: true, LanceVersion.V2_1);
     }
 
+    private static CompressiveEncoding FlatEncoding(int bitsPerValue) =>
+        new() { Flat = new Proto.Encodings.V21.Flat { BitsPerValue = (ulong)bitsPerValue } };
+
     /// <summary>Append a non-nullable <see cref="sbyte"/> column.</summary>
     public Task WriteInt8ColumnAsync(string name, ReadOnlySpan<sbyte> values, CancellationToken cancellationToken = default)
-        => WriteFlatPrimitiveColumnAsync(name, "int8", 8, values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteSinglePageColumnAsync(name, "int8", FlatEncoding(8), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="byte"/> column.</summary>
     public Task WriteUInt8ColumnAsync(string name, ReadOnlySpan<byte> values, CancellationToken cancellationToken = default)
-        => WriteFlatPrimitiveColumnAsync(name, "uint8", 8, values.Length, values.ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteSinglePageColumnAsync(name, "uint8", FlatEncoding(8), values.Length, values.ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="short"/> column.</summary>
     public Task WriteInt16ColumnAsync(string name, ReadOnlySpan<short> values, CancellationToken cancellationToken = default)
-        => WriteFlatPrimitiveColumnAsync(name, "int16", 16, values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteSinglePageColumnAsync(name, "int16", FlatEncoding(16), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="ushort"/> column.</summary>
     public Task WriteUInt16ColumnAsync(string name, ReadOnlySpan<ushort> values, CancellationToken cancellationToken = default)
-        => WriteFlatPrimitiveColumnAsync(name, "uint16", 16, values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteSinglePageColumnAsync(name, "uint16", FlatEncoding(16), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
 
     /// <summary>
     /// Append a non-nullable <see cref="int"/> column to the file.
@@ -124,38 +129,47 @@ public sealed class LanceFileWriter : IAsyncDisposable
     /// length becomes the file's row count.
     /// </summary>
     public Task WriteInt32ColumnAsync(string name, ReadOnlySpan<int> values, CancellationToken cancellationToken = default)
-        => WriteFlatPrimitiveColumnAsync(name, "int32", 32, values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteSinglePageColumnAsync(name, "int32", FlatEncoding(32), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="uint"/> column.</summary>
     public Task WriteUInt32ColumnAsync(string name, ReadOnlySpan<uint> values, CancellationToken cancellationToken = default)
-        => WriteFlatPrimitiveColumnAsync(name, "uint32", 32, values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteSinglePageColumnAsync(name, "uint32", FlatEncoding(32), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="long"/> column.</summary>
     public Task WriteInt64ColumnAsync(string name, ReadOnlySpan<long> values, CancellationToken cancellationToken = default)
-        => WriteFlatPrimitiveColumnAsync(name, "int64", 64, values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteSinglePageColumnAsync(name, "int64", FlatEncoding(64), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="ulong"/> column.</summary>
     public Task WriteUInt64ColumnAsync(string name, ReadOnlySpan<ulong> values, CancellationToken cancellationToken = default)
-        => WriteFlatPrimitiveColumnAsync(name, "uint64", 64, values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteSinglePageColumnAsync(name, "uint64", FlatEncoding(64), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="float"/> (Float32) column.</summary>
     public Task WriteFloatColumnAsync(string name, ReadOnlySpan<float> values, CancellationToken cancellationToken = default)
-        => WriteFlatPrimitiveColumnAsync(name, "float", 32, values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteSinglePageColumnAsync(name, "float", FlatEncoding(32), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
 
     /// <summary>Append a non-nullable <see cref="double"/> (Float64) column.</summary>
     public Task WriteDoubleColumnAsync(string name, ReadOnlySpan<double> values, CancellationToken cancellationToken = default)
-        => WriteFlatPrimitiveColumnAsync(name, "double", 64, values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
+        => WriteSinglePageColumnAsync(name, "double", FlatEncoding(64), values.Length, MemoryMarshal.AsBytes(values).ToArray(), validityBitmap: null, nullCount: 0, cancellationToken);
 
     /// <summary>
-    /// Append an Apache Arrow primitive column. The array's null bitmap (if
-    /// any) is converted to a Lance <c>NULLABLE_ITEM</c> def buffer; if the
-    /// array has no nulls the page uses <c>ALL_VALID_ITEM</c> for the same
-    /// wire format as the typed Write methods. Supports the same primitives
-    /// as those methods (Int8/16/32/64, UInt8/16/32/64, Float, Double).
+    /// Append an Apache Arrow column. Supported types:
+    /// fixed-width primitives (Int8/16/32/64, UInt8/16/32/64, Float,
+    /// Double) plus variable-length <see cref="StringArray"/> and
+    /// <see cref="BinaryArray"/>. The array's null bitmap (if any) is
+    /// converted to a Lance <c>NULLABLE_ITEM</c> def buffer; if the array
+    /// has no nulls the page uses <c>ALL_VALID_ITEM</c>.
     /// </summary>
     public Task WriteColumnAsync(string name, IArrowArray array, CancellationToken cancellationToken = default)
     {
         if (array is null) throw new ArgumentNullException(nameof(array));
+
+        // StringArray inherits from BinaryArray, so test it first; the only
+        // wire-level difference is the schema's logical_type string.
+        if (array is StringArray sa)
+            return WriteVariableColumnAsync(name, "string", sa, cancellationToken);
+        if (array is BinaryArray ba)
+            return WriteVariableColumnAsync(name, "binary", ba, cancellationToken);
+
         var (logicalType, bitsPerValue, valueBytes) = array switch
         {
             Int8Array a => ("int8", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
@@ -172,34 +186,82 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 $"LanceFileWriter doesn't yet support Arrow array type '{array.GetType().Name}'."),
         };
 
-        byte[]? validityBitmap = null;
-        if (array.NullCount > 0)
+        return WriteSinglePageColumnAsync(
+            name, logicalType, FlatEncoding(bitsPerValue), array.Length, valueBytes,
+            ExtractValidityBitmap(array), array.NullCount, cancellationToken);
+    }
+
+    private static byte[]? ExtractValidityBitmap(IArrowArray array)
+    {
+        if (array.NullCount <= 0) return null;
+        // Validity bitmap lives on Apache.Arrow.ArrayData.Buffers[0] for
+        // every primitive/variable-length Arrow array. Spec: LSB-first,
+        // bit set = valid.
+        var span = array.Data.Buffers[0].Span;
+        return span.IsEmpty ? null : span.ToArray();
+    }
+
+    private Task WriteVariableColumnAsync(
+        string name, string logicalType, BinaryArray array,
+        CancellationToken cancellationToken)
+    {
+        // Lance v2.1 Variable wire format (single chunk):
+        //   value buffer = (numItems + 1) × u32 absolute offsets, then
+        //                  concatenated data bytes
+        // offsets[0] = (numItems + 1) * 4 (start of data section);
+        // offsets[i+1] = offsets[i] + len(item i). For null items we still
+        // emit an offset (with len = 0); the def buffer carries the null bit.
+        int numItems = array.Length;
+        int totalDataLen = 0;
+        for (int i = 0; i < numItems; i++)
+            totalDataLen += array.GetBytes(i).Length;
+        int offsetsBytes = checked((numItems + 1) * sizeof(uint));
+        int valueBufLen = checked(offsetsBytes + totalDataLen);
+
+        byte[] valueBuf = new byte[valueBufLen];
+        uint dataCursor = (uint)offsetsBytes;
+        BinaryPrimitives.WriteUInt32LittleEndian(valueBuf.AsSpan(0, sizeof(uint)), dataCursor);
+        for (int i = 0; i < numItems; i++)
         {
-            // Validity bitmap lives on Apache.Arrow.ArrayData.Buffers[0] for
-            // every primitive Arrow array. Spec: LSB-first, bit set = valid.
-            var span = array.Data.Buffers[0].Span;
-            validityBitmap = span.IsEmpty ? null : span.ToArray();
+            var rowBytes = array.GetBytes(i);
+            rowBytes.CopyTo(valueBuf.AsSpan((int)dataCursor));
+            dataCursor += (uint)rowBytes.Length;
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                valueBuf.AsSpan((i + 1) * sizeof(uint), sizeof(uint)), dataCursor);
         }
 
-        return WriteFlatPrimitiveColumnAsync(
-            name, logicalType, bitsPerValue, array.Length, valueBytes,
-            validityBitmap, array.NullCount, cancellationToken);
+        var valueEncoding = new CompressiveEncoding
+        {
+            Variable = new Proto.Encodings.V21.Variable
+            {
+                Offsets = new CompressiveEncoding
+                {
+                    Flat = new Proto.Encodings.V21.Flat { BitsPerValue = 32 },
+                },
+                // values: leave unset = no further compression on the data bytes
+            },
+        };
+
+        return WriteSinglePageColumnAsync(
+            name, logicalType, valueEncoding, numItems, valueBuf,
+            ExtractValidityBitmap(array), array.NullCount, cancellationToken);
     }
 
     /// <summary>
-    /// Single-page MiniBlockLayout + Flat encoding for any byte-aligned
-    /// fixed-width primitive. Caller pre-serializes <paramref name="valueBytes"/>
-    /// in little-endian (<paramref name="bitsPerValue"/> per item) and
-    /// optionally supplies an Arrow-style <paramref name="validityBitmap"/>
-    /// (LSB-first, bit set = valid). When <paramref name="nullCount"/> is
-    /// zero we emit an <c>ALL_VALID_ITEM</c> page; otherwise the page
-    /// carries a Flat(16) def buffer (0 = valid, 1 = null) per the
-    /// <c>NULLABLE_ITEM</c> layer.
+    /// Single-page MiniBlockLayout for any value-encoding shape with
+    /// <c>num_buffers = 1</c> and a single chunk. Caller pre-builds
+    /// <paramref name="valueBytes"/> in whatever layout
+    /// <paramref name="valueEncoding"/> describes (Flat: little-endian
+    /// fixed-width values; Variable: <c>(numItems+1)</c> u32 absolute
+    /// offsets followed by raw data bytes). An optional Arrow-style LSB
+    /// <paramref name="validityBitmap"/> (bit set = valid) emits a
+    /// Flat(16) def buffer and the <c>NULLABLE_ITEM</c> layer; otherwise
+    /// the page uses <c>ALL_VALID_ITEM</c>.
     /// </summary>
-    private async Task WriteFlatPrimitiveColumnAsync(
+    private async Task WriteSinglePageColumnAsync(
         string name,
         string logicalType,
-        int bitsPerValue,
+        CompressiveEncoding valueEncoding,
         int numItems,
         byte[] valueBytes,
         byte[]? validityBitmap,
@@ -287,10 +349,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         // --- Build the page's encoding (PageLayout → Any → DirectEncoding → Encoding) ---
         var miniBlock = new MiniBlockLayout
         {
-            ValueCompression = new CompressiveEncoding
-            {
-                Flat = new Proto.Encodings.V21.Flat { BitsPerValue = (ulong)bitsPerValue },
-            },
+            ValueCompression = valueEncoding,
             NumBuffers = 1,
             NumItems = (ulong)numItems,
         };
