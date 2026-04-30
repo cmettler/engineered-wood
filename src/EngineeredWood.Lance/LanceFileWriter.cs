@@ -565,13 +565,6 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 $"List inner type {innerFw} is not yet supported by the writer."),
         };
 
-        // Inner-element nulls (NULLABLE_ITEM) are deferred — would require
-        // emitting non-zero def values for inner-null positions and threading
-        // them through visible-item accounting.
-        if (innerValues.NullCount > 0)
-            throw new NotSupportedException(
-                "List with inner-element nulls is not yet supported by the writer.");
-
         int outerRows = outerLength;
         int innerBytesPerItem = innerFw.BitWidth / 8;
 
@@ -590,28 +583,43 @@ public sealed class LanceFileWriter : IAsyncDisposable
             if (len == 0) { anyEmpty = true; break; }
         }
 
+        // Inner-element nulls trigger NULLABLE_ITEM at the leaf layer.
+        bool anyInnerNull = innerValues.NullCount > 0;
+        byte[]? innerValidity = anyInnerNull ? ExtractValidityBitmap(innerValues) : null;
+
+        // Layer order is leaf-first, so layers[0] is the item layer and
+        // layers[1] is the list layer. The reader walks them outermost
+        // (highest index) to innermost (lowest), assigning def slots in
+        // ascending order — innermost layer gets the smallest def value.
+        var itemLayer = anyInnerNull
+            ? RepDefLayer.RepdefNullableItem
+            : RepDefLayer.RepdefAllValidItem;
+
+        int next = 1;
+        int itemNullDef = anyInnerNull ? next++ : 0;
+        int listNullDef = 0, listEmptyDef = 0;
+
         Proto.Encodings.V21.RepDefLayer listLayer;
-        int nullDef = 0, emptyDef = 0;
         if (anyNull && anyEmpty)
         {
             listLayer = RepDefLayer.RepdefNullAndEmptyList;
-            nullDef = 1; emptyDef = 2;
+            listNullDef = next++; listEmptyDef = next++;
         }
         else if (anyNull)
         {
             listLayer = RepDefLayer.RepdefNullableList;
-            nullDef = 1;
+            listNullDef = next++;
         }
         else if (anyEmpty)
         {
             listLayer = RepDefLayer.RepdefEmptyableList;
-            emptyDef = 1;
+            listEmptyDef = next++;
         }
         else
         {
             listLayer = RepDefLayer.RepdefAllValidList;
         }
-        bool hasDef = anyNull || anyEmpty;
+        bool hasDef = anyInnerNull || anyNull || anyEmpty;
 
         // Compute level count and visible items in one pass.
         int totalLevels = 0;
@@ -626,7 +634,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
 
         // Build rep/def streams. rep=1 opens a list boundary; rep=0 is a
         // continuation. def=0 marks a valid item or list opening; non-zero
-        // marks a null/empty list at the corresponding cascade layer.
+        // marks a null/empty list at the corresponding cascade layer or a
+        // null inner element at the item layer.
         var rep = new ushort[totalLevels];
         var def = hasDef ? new ushort[totalLevels] : null;
         int writePos = 0;
@@ -634,16 +643,17 @@ public sealed class LanceFileWriter : IAsyncDisposable
         {
             bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
             int len = isNull ? 0 : outerOffsets[i + 1] - outerOffsets[i];
+            int rowStart = isNull ? 0 : outerOffsets[i];
             if (isNull)
             {
                 rep[writePos] = 1;
-                def![writePos] = (ushort)nullDef;
+                def![writePos] = (ushort)listNullDef;
                 writePos++;
             }
             else if (len == 0)
             {
                 rep[writePos] = 1;
-                if (hasDef) def![writePos] = (ushort)emptyDef;
+                if (hasDef) def![writePos] = (ushort)listEmptyDef;
                 writePos++;
             }
             else
@@ -651,7 +661,14 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 for (int j = 0; j < len; j++)
                 {
                     rep[writePos] = (ushort)(j == 0 ? 1 : 0);
-                    if (hasDef) def![writePos] = 0;
+                    if (hasDef)
+                    {
+                        // Item-level null is detected against the inner Arrow
+                        // array's own validity bitmap at index = rowStart + j.
+                        bool itemValid = !anyInnerNull
+                            || (innerValidity![(rowStart + j) >> 3] & (1 << ((rowStart + j) & 7))) != 0;
+                        def![writePos] = itemValid ? (ushort)0 : (ushort)itemNullDef;
+                    }
                     writePos++;
                 }
             }
@@ -700,11 +717,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         var chunk = new PageChunk(0, visibleItems, valueBytes,
             RepLevels: rep, DefLevels: def);
         var valueEncoding = FlatEncoding(innerBytesPerItem * 8);
-        var layers = new List<RepDefLayer>
-        {
-            RepDefLayer.RepdefAllValidItem,
-            listLayer,
-        };
+        var layers = new List<RepDefLayer> { itemLayer, listLayer };
 
         ThrowIfFinalized();
         if (_totalRows < 0) _totalRows = outerRows;

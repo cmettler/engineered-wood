@@ -1112,6 +1112,91 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task ListInt32_InnerNulls_RoundTrip_ViaOurReader()
+    {
+        // Inner-element nulls force NULLABLE_ITEM at the leaf layer; a
+        // null inner cell shows up as def=1 (itemNullDef) at the
+        // corresponding position, while the outer list itself is valid
+        // (rep opens normally).
+        // Rows: [1, null, 3], [], [null, 5], null, [6]
+        int[] innerValues = { 1, 0, 3, 0, 5, 6 };  // 0 placeholders for nulls
+        bool[] innerNullMask = { true, false, true, false, true, true };
+        int[] offsets = { 0, 3, 3, 5, 5, 6 };  // 5 outer rows
+
+        var innerBytes = new byte[innerValues.Length * sizeof(int)];
+        for (int i = 0; i < innerValues.Length; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                innerBytes.AsSpan(i * 4, 4), innerValues[i]);
+        var innerValidity = new byte[(innerValues.Length + 7) / 8];
+        int innerNullCount = 0;
+        for (int i = 0; i < innerNullMask.Length; i++)
+        {
+            if (innerNullMask[i]) innerValidity[i >> 3] |= (byte)(1 << (i & 7));
+            else innerNullCount++;
+        }
+        var innerData = new ArrayData(
+            Int32Type.Default, innerValues.Length, innerNullCount, 0,
+            new[] { new ArrowBuffer(innerValidity), new ArrowBuffer(innerBytes) });
+        var inner = new Int32Array(innerData);
+
+        var offsetsBytes = new byte[offsets.Length * sizeof(int)];
+        for (int i = 0; i < offsets.Length; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                offsetsBytes.AsSpan(i * 4, 4), offsets[i]);
+
+        // Outer null mask: row 3 (4th row) is null.
+        bool[] outerNullMask = { true, true, true, false, true };
+        var outerValidity = new byte[1];
+        int outerNullCount = 0;
+        for (int i = 0; i < outerNullMask.Length; i++)
+        {
+            if (outerNullMask[i]) outerValidity[i >> 3] |= (byte)(1 << (i & 7));
+            else outerNullCount++;
+        }
+
+        var listType = new ListType(new Field("item", Int32Type.Default, nullable: true));
+        var listData = new ArrayData(
+            listType, outerNullMask.Length, outerNullCount, 0,
+            new[] { new ArrowBuffer(outerValidity), new ArrowBuffer(offsetsBytes) },
+            children: new[] { inner.Data });
+        var listArr = new ListArray(listData);
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-list-innernul-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("nums", listArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (ListArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(5, read.Length);
+            Assert.Equal(1, read.NullCount);
+            Assert.True(read.IsNull(3));
+            // Inner-array nulls.
+            var readInner = (Int32Array)read.Values;
+            Assert.Equal(6, readInner.Length);
+            Assert.Equal(2, readInner.NullCount);
+            Assert.False(readInner.IsNull(0));
+            Assert.True(readInner.IsNull(1));
+            Assert.False(readInner.IsNull(2));
+            Assert.True(readInner.IsNull(3));
+            Assert.False(readInner.IsNull(4));
+            Assert.False(readInner.IsNull(5));
+            Assert.Equal(1, readInner.GetValue(0));
+            Assert.Equal(3, readInner.GetValue(2));
+            Assert.Equal(5, readInner.GetValue(4));
+            Assert.Equal(6, readInner.GetValue(5));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task LargeListInt64_AllValid_RoundTrip_ViaOurReader()
     {
         // LargeList<int64> with 3 non-null/non-empty rows. Schema's parent
