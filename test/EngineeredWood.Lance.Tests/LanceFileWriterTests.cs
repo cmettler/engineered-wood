@@ -755,6 +755,150 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task ListInt32_CrossValidatedAgainstPylance()
+    {
+        // Verifies our list writer's wire format against the upstream
+        // Rust-based reader. Mixes valid, empty, and null list rows so the
+        // page exercises NULL_AND_EMPTY_LIST + ALL_VALID_ITEM. We compare
+        // pylance's pylist against the same rows we wrote.
+        if (!IsPythonAvailable()) return;
+
+        var listArr = BuildListInt32(
+            new int[][] {
+                new[] { 1, 2, 3 },
+                System.Array.Empty<int>(),
+                new[] { 4 },
+                System.Array.Empty<int>(),
+                new[] { 5, 6, 7, 8 },
+            },
+            nullMask: new[] { true, true, true, false, true });
+
+        string path = Path.Combine(Path.GetTempPath(),
+            $"ew-lance-pylance-list-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("nums", listArr);
+                await writer.FinishAsync();
+            }
+
+            string script = "import sys, json\n" +
+                "from lance.file import LanceFileReader\n" +
+                $"r = LanceFileReader(r'{path}')\n" +
+                "t = r.read_all().to_table()\n" +
+                "out = { 'rows': len(t), 'type': str(t.schema[0].type), " +
+                "'data': t['nums'].to_pylist() }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(5, json.RootElement.GetProperty("rows").GetInt32());
+            Assert.StartsWith("list", json.RootElement.GetProperty("type").GetString());
+            var data = json.RootElement.GetProperty("data");
+            // Row 0: [1,2,3]
+            Assert.Equal(System.Text.Json.JsonValueKind.Array, data[0].ValueKind);
+            Assert.Equal(3, data[0].GetArrayLength());
+            // Row 3: null
+            Assert.Equal(System.Text.Json.JsonValueKind.Null, data[3].ValueKind);
+            // Row 4: [5,6,7,8]
+            Assert.Equal(4, data[4].GetArrayLength());
+            Assert.Equal(8, data[4][3].GetInt32());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Struct_CrossValidatedAgainstPylance()
+    {
+        // Write a struct<a:int32, s:string> and have pylance parse it back.
+        // This stresses two leaves with different value encodings sharing a
+        // single struct cascade.
+        if (!IsPythonAvailable()) return;
+
+        var aBuilder = new Int32Array.Builder();
+        aBuilder.Append(1).Append(2).AppendNull().Append(4);
+        var a = aBuilder.Build();
+
+        var sBuilder = new StringArray.Builder();
+        sBuilder.Append("alpha").Append("beta").Append("gamma").Append("delta");
+        var s = sBuilder.Build();
+
+        var structValidity = new byte[1] { 0b1011 };  // row 2 = null
+        var st = new StructType(new[]
+        {
+            new Field("a", Int32Type.Default, nullable: true),
+            new Field("s", StringType.Default, nullable: true),
+        });
+        var structArr = new StructArray(new ArrayData(
+            st, 4, 1, 0,
+            new[] { new ArrowBuffer(structValidity) },
+            new[] { a.Data, s.Data }));
+
+        string path = Path.Combine(Path.GetTempPath(),
+            $"ew-lance-pylance-struct-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("rec", structArr);
+                await writer.FinishAsync();
+            }
+
+            string script = "import sys, json\n" +
+                "from lance.file import LanceFileReader\n" +
+                $"r = LanceFileReader(r'{path}')\n" +
+                "t = r.read_all().to_table()\n" +
+                "out = { 'rows': len(t), 'type': str(t.schema[0].type), " +
+                "'data': t['rec'].to_pylist() }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(4, json.RootElement.GetProperty("rows").GetInt32());
+            Assert.StartsWith("struct", json.RootElement.GetProperty("type").GetString());
+
+            var data = json.RootElement.GetProperty("data");
+            Assert.Equal(1, data[0].GetProperty("a").GetInt32());
+            Assert.Equal("alpha", data[0].GetProperty("s").GetString());
+            Assert.Equal(System.Text.Json.JsonValueKind.Null, data[0 + 2].ValueKind);  // struct null at row 2
+            Assert.Equal(4, data[3].GetProperty("a").GetInt32());
+            Assert.Equal("delta", data[3].GetProperty("s").GetString());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task NullableInt32_RoundTrip_ViaOurReader()
     {
         string path = Path.Combine(Path.GetTempPath(), $"ew-lance-writer-{Guid.NewGuid():N}.lance");
