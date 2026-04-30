@@ -208,6 +208,30 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task List_Of_String_OolBitpackedRepDef()
+    {
+        // list<string> 50×30 random 100-char text — pylance picks
+        // OutOfLineBitpacking for rep/def with small chunks, writing a
+        // packed buffer shorter than the FastLanes 128-byte minimum.
+        // The reader now zero-pads the packed area before unpacking and
+        // discards the unused lanes.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("list_string_ool_v21.lance"));
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(50, outer.Length);
+        Assert.Equal(0, outer.NullCount);
+        Assert.Equal(0, outer.ValueOffsets[0]);
+        Assert.Equal(30, outer.ValueOffsets[1]);
+        Assert.Equal(50 * 30, outer.ValueOffsets[50]);
+
+        var leaf = (StringArray)outer.Values;
+        Assert.Equal(50 * 30, leaf.Length);
+        for (int i = 0; i < leaf.Length; i += 200)
+            Assert.Equal(100, leaf.GetString(i)!.Length);
+        Assert.NotEqual(leaf.GetString(0), leaf.GetString(1));
+    }
+
+    [Fact]
     public async Task List_Of_String_FsstMiniBlock()
     {
         // list<string> with FSST in MiniBlock cascade — 20 outer rows ×

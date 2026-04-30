@@ -136,6 +136,20 @@ def main() -> None:
               pa.table({"xs": pa.array([[1, 2], None, [3, 4]],
                                         type=pa.list_(pa.int32()))}),
               version="2.1")
+    # list<string> shape that pushes rep/def from InlineBitpacking onto
+    # OutOfLineBitpacking — 50×30 random 100-char strings. Each chunk
+    # has fewer than 1024 items, so pylance writes a short packed buffer
+    # (smaller than the FastLanes 128-byte minimum). Reader pads up.
+    import random as _r5
+    _r5.seed(5)
+    _ool_data = [
+        [''.join(chr(_r5.randint(97, 122)) for _ in range(100)) for _ in range(30)]
+        for _ in range(50)
+    ]
+    write_one("list_string_ool_v21",
+              pa.table({"x": pa.array(_ool_data, type=pa.list_(pa.string()))}),
+              version="2.1")
+
     # list<string> with FSST in MiniBlock — pylance picks FSST when there
     # is enough text to build a useful symbol table. 20×30 random
     # 100-char strings hits this while keeping rep/def encoded as

@@ -1455,8 +1455,11 @@ internal static class MiniBlockLayoutDecoder
                     // OutOfLineBitpacking(uncompressed=16, values=Flat(bits_per_value=K))
                     // — like InlineBitpacking but the bit width K lives in the
                     // encoding (constant across the page), not in a per-chunk
-                    // header. The buffer is fastlanes-packed for the full
-                    // 1024-element block; we unpack and take the live prefix.
+                    // header. The buffer is fastlanes-packed for one or more
+                    // 1024-element blocks. pylance writes shorter buffers
+                    // when the chunk has fewer than 1024 items — we pad up
+                    // to the FastLanes block minimum (1024*bpv/8 bytes) and
+                    // take the live prefix from the unpacked output.
                     var ool = defComp.OutOfLineBitpacking;
                     if (ool.UncompressedBitsPerValue != 16)
                         throw new NotImplementedException(
@@ -1473,8 +1476,24 @@ internal static class MiniBlockLayoutDecoder
                     if (itemsInChunk > FastLanesChunk)
                         throw new NotImplementedException(
                             $"Def OutOfLineBitpacking with {itemsInChunk} > {FastLanesChunk} items is not supported.");
+                    int requiredBytes = checked((int)(FastLanesChunk * bpv / 8));
                     Span<ushort> full = stackalloc ushort[FastLanesChunk];
-                    Clast.FastLanes.BitPacking.UnpackChunk<ushort>((int)bpv, defBuf, full);
+                    if (defBuf.Length >= requiredBytes)
+                    {
+                        Clast.FastLanes.BitPacking.UnpackChunk<ushort>((int)bpv, defBuf, full);
+                    }
+                    else
+                    {
+                        // Pad the packed area up to the full FastLanes block.
+                        // The padded suffix only affects lanes whose elements
+                        // are beyond itemsInChunk, which we discard below.
+                        Span<byte> padded = requiredBytes <= 256
+                            ? stackalloc byte[requiredBytes]
+                            : new byte[requiredBytes];
+                        defBuf.CopyTo(padded);
+                        // remaining bytes already zero
+                        Clast.FastLanes.BitPacking.UnpackChunk<ushort>((int)bpv, padded, full);
+                    }
                     full.Slice(0, itemsInChunk).CopyTo(output);
                     return output;
                 }
