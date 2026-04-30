@@ -488,6 +488,46 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         return result;
     }
 
+    /// <summary>
+    /// Concatenate per-page packed validity bitmaps (LSB-first) given each
+    /// page's bit count. Returns null if every entry is null. Caller's
+    /// <paramref name="bitCounts"/> entries must match each chunk's actual
+    /// bit population.
+    /// </summary>
+    private static byte[]? ConcatBitmaps(
+        IReadOnlyList<byte[]?> parts, IReadOnlyList<int> bitCounts)
+    {
+        bool anyPresent = false;
+        long totalBits = 0;
+        for (int i = 0; i < parts.Count; i++)
+        {
+            if (parts[i] is not null)
+            {
+                anyPresent = true;
+                totalBits += bitCounts[i];
+            }
+        }
+        if (!anyPresent) return null;
+        var result = new byte[(checked((int)totalBits) + 7) / 8];
+        int writeBitPos = 0;
+        for (int i = 0; i < parts.Count; i++)
+        {
+            byte[]? src = parts[i];
+            int n = bitCounts[i];
+            if (src is null) continue;
+            for (int b = 0; b < n; b++)
+            {
+                if ((src[b >> 3] & (1 << (b & 7))) != 0)
+                {
+                    int outIdx = writeBitPos + b;
+                    result[outIdx >> 3] |= (byte)(1 << (outIdx & 7));
+                }
+            }
+            writeBitPos += n;
+        }
+        return result;
+    }
+
     private static ushort[]? ConcatUshortStreams(IReadOnlyList<ushort[]?> parts)
     {
         // If any chunk has the stream, every chunk must (rep/def is uniform
@@ -576,7 +616,10 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         var perPageValues = new List<byte[]>(cm.Pages.Count);
         var perPageRep = new List<ushort[]?>(cm.Pages.Count);
         var perPageDef = new List<ushort[]?>(cm.Pages.Count);
+        var perPageInnerValidity = new List<byte[]?>(cm.Pages.Count);
+        var perPageInnerItemCount = new List<int>(cm.Pages.Count);
         int visibleItems = 0;
+        int totalInnerNullCount = 0;
 
         foreach (var page in cm.Pages)
         {
@@ -593,8 +636,9 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                         $"Leaf column {columnIndex} uses {pageLayout.LayoutCase}; only MiniBlockLayout is supported.");
 
                 var mb = pageLayout.MiniBlockLayout;
-                var (vals, r, d, bpi, visible) = Encodings.V21.MiniBlockLayoutDecoder
-                    .DecodeNestedLeafChunk(mb, leafType, pageContext);
+                var (vals, r, d, innerValidity, innerNullCount, bpi, visible) =
+                    Encodings.V21.MiniBlockLayoutDecoder
+                        .DecodeNestedLeafChunk(mb, leafType, pageContext);
 
                 if (layers is null)
                 {
@@ -610,7 +654,13 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 perPageValues.Add(vals);
                 perPageRep.Add(r);
                 perPageDef.Add(d);
+                perPageInnerValidity.Add(innerValidity);
+                int pageInnerItemCount = leafType is FixedSizeListType fslLeaf
+                    ? checked(visible * fslLeaf.ListSize)
+                    : 0;
+                perPageInnerItemCount.Add(pageInnerItemCount);
                 visibleItems = checked(visibleItems + visible);
+                totalInnerNullCount = checked(totalInnerNullCount + innerNullCount);
             }
             finally
             {
@@ -624,6 +674,7 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         byte[] valueBytes = ConcatBytes(perPageValues);
         ushort[]? rep = ConcatUshortStreams(perPageRep);
         ushort[]? def = ConcatUshortStreams(perPageDef);
+        byte[]? innerValidityFinal = ConcatBitmaps(perPageInnerValidity, perPageInnerItemCount);
 
         int n = layers.Length;
         if (n == 0)
@@ -926,13 +977,16 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             // FSL leaf: the rep/def cascade produced a row-level validity
             // bitmap at level 0 (treating each FSL row as one item). The
             // value bytes are visibleItems * dim * inner-bytes wide; wrap
-            // them as the inner primitive array, then build the FSL.
+            // them as the inner primitive array, then build the FSL. When
+            // FSL.has_validity = true, innerValidityFinal carries per-item
+            // nulls inside the FSL rows.
             int dim = leafFsl.ListSize;
             int rowCount = levelLengths[0];
             int innerCount = checked(rowCount * dim);
             var innerArr = Encodings.V21.MiniBlockLayoutDecoder.BuildFixedWidthArray(
                 leafFsl.ValueDataType, innerCount, valueBytes,
-                validityBitmap: null, nullCount: 0);
+                validityBitmap: innerValidityFinal,
+                nullCount: totalInnerNullCount);
             ArrowBuffer rowValidity = leafValidity is null
                 ? ArrowBuffer.Empty
                 : new ArrowBuffer(leafValidity);

@@ -124,6 +124,38 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task List_Of_FixedSizeList_Float32_WithInnerNulls()
+    {
+        // list<FSL<float32, 3>> with inner None values.
+        // Outer rows: [[1, _, 3], [4, 5, _]], None, [[7, 8, 9]]
+        // → 3 visible FSL rows, 9 inner floats, 2 inner nulls.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("list_fsl_inner_nulls_v21.lance"));
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(3, outer.Length);
+        Assert.Equal(1, outer.NullCount);
+        Assert.True(outer.IsNull(1));
+
+        var fsls = (FixedSizeListArray)outer.Values;
+        Assert.Equal(3, fsls.Length);
+        Assert.Equal(0, fsls.NullCount);
+
+        var inner = (FloatArray)fsls.Values;
+        Assert.Equal(9, inner.Length);
+        Assert.Equal(2, inner.NullCount);
+        // Row 0 inner: [1, _, 3, 4, 5, _]; row 2 inner: [7, 8, 9]
+        Assert.Equal(1f, inner.GetValue(0));
+        Assert.Null(inner.GetValue(1));
+        Assert.Equal(3f, inner.GetValue(2));
+        Assert.Equal(4f, inner.GetValue(3));
+        Assert.Equal(5f, inner.GetValue(4));
+        Assert.Null(inner.GetValue(5));
+        Assert.Equal(7f, inner.GetValue(6));
+        Assert.Equal(8f, inner.GetValue(7));
+        Assert.Equal(9f, inner.GetValue(8));
+    }
+
+    [Fact]
     public async Task Struct_With_FixedSizeList_Float32()
     {
         // struct<int32, FSL<float32, 3>> — FSL inside a struct.

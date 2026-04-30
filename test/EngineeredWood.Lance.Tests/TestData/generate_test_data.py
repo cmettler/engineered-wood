@@ -136,6 +136,17 @@ def main() -> None:
               pa.table({"xs": pa.array([[1, 2], None, [3, 4]],
                                         type=pa.list_(pa.int32()))}),
               version="2.1")
+    # list<FixedSizeList<float32, 3>> with inner nulls — exercises the
+    # has_validity=true + num_buffers=2 path on the FSL nested-leaf
+    # decoder. Inner None positions become per-item validity bits.
+    write_one("list_fsl_inner_nulls_v21",
+              pa.table({"lf": pa.array(
+                  [[[1.0, None, 3.0], [4.0, 5.0, None]],
+                   None,
+                   [[7.0, 8.0, 9.0]]],
+                  type=pa.list_(pa.list_(pa.float32(), list_size=3)))}),
+              version="2.1")
+
     # struct<int32, FixedSizeList<float32, 3>> — FSL inside a struct.
     _struct_fsl_t = pa.struct([
         ("id", pa.int32()),

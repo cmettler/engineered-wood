@@ -614,15 +614,36 @@ internal static class MiniBlockLayoutDecoder
     /// responsibility — this method only enforces the wire invariants
     /// common to every nested shape.</para>
     /// </summary>
-    public static (byte[] ValueBytes, ushort[]? Rep, ushort[]? Def, int ValueBytesPerItem, int VisibleItems)
+    public static (byte[] ValueBytes, ushort[]? Rep, ushort[]? Def, byte[]? InnerValidity, int InnerNullCount, int ValueBytesPerItem, int VisibleItems)
         DecodeNestedLeafChunk(MiniBlockLayout layout, IArrowType childType, in PageContext context)
     {
-        if (layout.NumBuffers != 1)
-            throw new NotImplementedException(
-                $"Nested-leaf MiniBlockLayout num_buffers={layout.NumBuffers} is not supported (must be 1).");
         if (layout.Dictionary is not null)
             throw new NotImplementedException(
                 "Nested-leaf MiniBlockLayout with a dictionary is not supported.");
+
+        CompressiveEncoding valueEnc = layout.ValueCompression
+            ?? throw new LanceFormatException("MiniBlockLayout has no value_compression.");
+
+        // FSL with has_validity=true adds an extra inner-validity bitmap
+        // buffer per chunk and bumps num_buffers from 1 to 2. The chunk
+        // header gains a u16 validity_size field after def_size and before
+        // valueBufSize. Detect this case once up front so the per-chunk
+        // loop knows what to read.
+        bool fslHasValidity = false;
+        int fslDim = 0;
+        if (valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.FixedSizeList
+            && childType is FixedSizeListType fslChild)
+        {
+            fslHasValidity = valueEnc.FixedSizeList.HasValidity;
+            fslDim = checked((int)valueEnc.FixedSizeList.ItemsPerValue);
+        }
+
+        ulong expectedNumBuffers = fslHasValidity ? 2UL : 1UL;
+        if (layout.NumBuffers != expectedNumBuffers)
+            throw new NotImplementedException(
+                $"Nested-leaf MiniBlockLayout num_buffers={layout.NumBuffers} is not supported " +
+                $"(expected {expectedNumBuffers} for value_compression={valueEnc.CompressionCase}" +
+                (fslHasValidity ? "/has_validity=true" : "") + ").");
 
         bool hasRep = layout.RepCompression is not null;
         bool hasDef = layout.DefCompression is not null;
@@ -634,12 +655,20 @@ internal static class MiniBlockLayoutDecoder
         ReadOnlySpan<byte> chunkData = context.PageBuffers[1].Span;
         var chunks = ParseChunkMetadata(chunkMeta, hasLargeChunk, numItems);
 
-        CompressiveEncoding valueEnc = layout.ValueCompression
-            ?? throw new LanceFormatException("MiniBlockLayout has no value_compression.");
         int valueBytesPerItem = ResolveFlatBytesPerValue(valueEnc, childType);
 
         int visibleItems = checked((int)numItems);
         var valueBytes = new byte[visibleItems * valueBytesPerItem];
+
+        // Inner validity bitmap (only for FSL with has_validity=true).
+        // Total inner items = visibleItems * fslDim; bitmap is one bit per
+        // inner item, LSB-first within each byte.
+        int totalInnerItems = fslHasValidity ? checked(visibleItems * fslDim) : 0;
+        byte[]? innerValidity = fslHasValidity
+            ? new byte[(totalInnerItems + 7) / 8]
+            : null;
+        int innerValidityWritePos = 0; // measured in inner items, not bytes
+        int innerNullCount = 0;
 
         // rep/def lengths sum across chunks; we don't know the total up
         // front (per-chunk num_levels can vary, especially for list shapes
@@ -687,6 +716,14 @@ internal static class MiniBlockLayoutDecoder
                 defSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
                 cursor += 2;
             }
+            int validityBufSize = 0;
+            if (fslHasValidity)
+            {
+                validityBufSize = hasLargeChunk
+                    ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
+                    : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+                cursor += hasLargeChunk ? 4 : 2;
+            }
             int valueBufSize = hasLargeChunk
                 ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
                 : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
@@ -714,6 +751,26 @@ internal static class MiniBlockLayoutDecoder
                 cursor = AlignUp(cursor, MiniBlockAlignment);
             }
 
+            if (fslHasValidity)
+            {
+                int chunkInnerItems = chunkVisibleItems * fslDim;
+                int chunkValidityBytesNeeded = (chunkInnerItems + 7) / 8;
+                if (validityBufSize < chunkValidityBytesNeeded)
+                    throw new LanceFormatException(
+                        $"FSL inner-validity buffer {validityBufSize} < expected " +
+                        $"{chunkValidityBytesNeeded} for {chunkInnerItems} inner items.");
+                AppendBitsLsbFirst(
+                    chunkBytes.Slice(cursor, chunkValidityBytesNeeded),
+                    chunkInnerItems,
+                    innerValidity!,
+                    innerValidityWritePos,
+                    out int chunkInnerNullCount);
+                innerNullCount = checked(innerNullCount + chunkInnerNullCount);
+                innerValidityWritePos += chunkInnerItems;
+                cursor += validityBufSize;
+                cursor = AlignUp(cursor, MiniBlockAlignment);
+            }
+
             int chunkValueBytes = chunkVisibleItems * valueBytesPerItem;
             if (valueBufSize < chunkValueBytes)
                 throw new LanceFormatException(
@@ -727,7 +784,32 @@ internal static class MiniBlockLayoutDecoder
             globalChunkByteOffset += (long)chunk.SizeBytes;
         }
 
-        return (valueBytes, rep, def, valueBytesPerItem, visibleItems);
+        return (valueBytes, rep, def, innerValidity, innerNullCount, valueBytesPerItem, visibleItems);
+    }
+
+    /// <summary>
+    /// Append <paramref name="numBits"/> LSB-first bits from
+    /// <paramref name="src"/> into <paramref name="dest"/> starting at bit
+    /// position <paramref name="destBitOffset"/>. Counts cleared bits
+    /// (=null inner items) into <paramref name="zeroCount"/>.
+    /// </summary>
+    private static void AppendBitsLsbFirst(
+        ReadOnlySpan<byte> src, int numBits,
+        byte[] dest, int destBitOffset, out int zeroCount)
+    {
+        zeroCount = 0;
+        // Slow but simple per-bit append; bitmaps for FSL inner items are
+        // typically small (visibleItems * dim bits). Optimize later if a
+        // benchmark warrants it.
+        for (int i = 0; i < numBits; i++)
+        {
+            bool bit = (src[i >> 3] & (1 << (i & 7))) != 0;
+            int outIdx = destBitOffset + i;
+            if (bit)
+                dest[outIdx >> 3] |= (byte)(1 << (outIdx & 7));
+            else
+                zeroCount++;
+        }
     }
 
     // --- v2.1 string-encoding gap (1/3): MiniBlockLayout-level dictionary ---
