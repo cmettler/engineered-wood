@@ -981,4 +981,373 @@ public class LanceFileWriterTests
         // Wrap in quotes; escape interior double quotes.
         return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
     }
+
+    [Fact]
+    public async Task ListInt32_AllValid_RoundTrip_ViaOurReader()
+    {
+        // List<int32> with 4 non-null, non-empty rows. Layers should be
+        // [ALL_VALID_ITEM, ALL_VALID_LIST] — no def buffer, just rep.
+        var listArr = BuildListInt32(
+            new int[][] { new[] { 1, 2, 3 }, new[] { 4 }, new[] { 5, 6 }, new[] { 7, 8, 9, 10 } },
+            nullMask: null);
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-list-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("nums", listArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(4, reader.NumberOfRows);
+            Assert.IsType<ListType>(reader.Schema.FieldsList[0].DataType);
+            var read = (ListArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(4, read.Length);
+            Assert.Equal(0, read.NullCount);
+            Assert.Equal(0, read.ValueOffsets[0]);
+            Assert.Equal(3, read.ValueOffsets[1]);
+            Assert.Equal(4, read.ValueOffsets[2]);
+            Assert.Equal(6, read.ValueOffsets[3]);
+            Assert.Equal(10, read.ValueOffsets[4]);
+            var inner = (Int32Array)read.Values;
+            Assert.Equal(10, inner.Length);
+            int[] expected = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+            for (int i = 0; i < expected.Length; i++)
+                Assert.Equal(expected[i], inner.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ListInt32_WithEmpty_RoundTrip_ViaOurReader()
+    {
+        // List<int32> with one empty row → EMPTYABLE_LIST layer; def value 1
+        // marks the empty list slot.
+        var listArr = BuildListInt32(
+            new int[][] { new[] { 1, 2 }, System.Array.Empty<int>(), new[] { 3 } },
+            nullMask: null);
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-list-empty-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("nums", listArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (ListArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(3, read.Length);
+            Assert.Equal(0, read.NullCount);
+            Assert.Equal(0, read.ValueOffsets[0]);
+            Assert.Equal(2, read.ValueOffsets[1]);
+            Assert.Equal(2, read.ValueOffsets[2]);  // empty
+            Assert.Equal(3, read.ValueOffsets[3]);
+            var inner = (Int32Array)read.Values;
+            Assert.Equal(3, inner.Length);
+            Assert.Equal(1, inner.GetValue(0));
+            Assert.Equal(2, inner.GetValue(1));
+            Assert.Equal(3, inner.GetValue(2));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ListInt32_WithNullsAndEmpties_RoundTrip_ViaOurReader()
+    {
+        // Mix of valid, null, and empty list rows → NULL_AND_EMPTY_LIST.
+        var listArr = BuildListInt32(
+            new int[][] {
+                new[] { 1, 2 },
+                System.Array.Empty<int>(),
+                new[] { 3, 4, 5 },
+                System.Array.Empty<int>(),  // overridden to null by mask
+                new[] { 6 },
+            },
+            nullMask: new[] { true, true, true, false, true });
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-list-mix-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("nums", listArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (ListArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(5, read.Length);
+            Assert.Equal(1, read.NullCount);
+            Assert.False(read.IsNull(0));
+            Assert.False(read.IsNull(1));
+            Assert.False(read.IsNull(2));
+            Assert.True(read.IsNull(3));
+            Assert.False(read.IsNull(4));
+            Assert.Equal(0, read.ValueOffsets[0]);
+            Assert.Equal(2, read.ValueOffsets[1]);
+            Assert.Equal(2, read.ValueOffsets[2]);  // empty
+            Assert.Equal(5, read.ValueOffsets[3]);
+            Assert.Equal(5, read.ValueOffsets[4]);  // null (no items)
+            Assert.Equal(6, read.ValueOffsets[5]);
+            var inner = (Int32Array)read.Values;
+            Assert.Equal(6, inner.Length);
+            int[] expected = { 1, 2, 3, 4, 5, 6 };
+            for (int i = 0; i < expected.Length; i++)
+                Assert.Equal(expected[i], inner.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task LargeListInt64_AllValid_RoundTrip_ViaOurReader()
+    {
+        // LargeList<int64> with 3 non-null/non-empty rows. Schema's parent
+        // field carries logical_type "large_list"; on read the converter
+        // must produce a LargeListType.
+        long[][] rows = { new long[] { 100, 200 }, new long[] { 300 }, new long[] { 400, 500, 600 } };
+        var listArr = BuildLargeListInt64(rows, nullMask: null);
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-llist-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("nums", listArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.IsType<LargeListType>(reader.Schema.FieldsList[0].DataType);
+            var read = (LargeListArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(3, read.Length);
+            Assert.Equal(0, read.NullCount);
+            Assert.Equal(0L, read.ValueOffsets[0]);
+            Assert.Equal(2L, read.ValueOffsets[1]);
+            Assert.Equal(3L, read.ValueOffsets[2]);
+            Assert.Equal(6L, read.ValueOffsets[3]);
+            var inner = (Int64Array)read.Values;
+            Assert.Equal(6, inner.Length);
+            long[] expected = { 100, 200, 300, 400, 500, 600 };
+            for (int i = 0; i < expected.Length; i++)
+                Assert.Equal(expected[i], inner.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ListFloat_OnlyNulls_RoundTrip_ViaOurReader()
+    {
+        // List<float> with one null row only → NULLABLE_LIST.
+        var listArr = BuildListFloat(
+            new float[][] { new[] { 1.5f, 2.5f }, System.Array.Empty<float>(), new[] { 3.5f } },
+            nullMask: new[] { true, false, true });
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-list-fnul-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("nums", listArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (ListArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(3, read.Length);
+            Assert.Equal(1, read.NullCount);
+            Assert.False(read.IsNull(0));
+            Assert.True(read.IsNull(1));
+            Assert.False(read.IsNull(2));
+            var inner = (FloatArray)read.Values;
+            Assert.Equal(3, inner.Length);
+            Assert.Equal(1.5f, inner.GetValue(0));
+            Assert.Equal(2.5f, inner.GetValue(1));
+            Assert.Equal(3.5f, inner.GetValue(2));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    private static ListArray BuildListInt32(int[][] rows, bool[]? nullMask)
+    {
+        int totalInner = 0;
+        for (int i = 0; i < rows.Length; i++)
+        {
+            bool isNull = nullMask is not null && !nullMask[i];
+            if (!isNull) totalInner += rows[i].Length;
+        }
+        var innerBytes = new byte[totalInner * sizeof(int)];
+        var offsetsBytes = new byte[(rows.Length + 1) * sizeof(int)];
+        int innerCursor = 0;
+        int runningOffset = 0;
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+            offsetsBytes.AsSpan(0, 4), 0);
+        for (int i = 0; i < rows.Length; i++)
+        {
+            bool isNull = nullMask is not null && !nullMask[i];
+            if (!isNull)
+            {
+                MemoryMarshal.AsBytes(rows[i].AsSpan())
+                    .CopyTo(innerBytes.AsSpan(innerCursor));
+                innerCursor += rows[i].Length * sizeof(int);
+                runningOffset += rows[i].Length;
+            }
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                offsetsBytes.AsSpan((i + 1) * sizeof(int), sizeof(int)),
+                runningOffset);
+        }
+
+        var innerData = new ArrayData(
+            Int32Type.Default, totalInner, 0, 0,
+            new[] { ArrowBuffer.Empty, new ArrowBuffer(innerBytes) });
+        var innerArr = new Int32Array(innerData);
+
+        ArrowBuffer validity = ArrowBuffer.Empty;
+        int nullCount = 0;
+        if (nullMask is not null)
+        {
+            var validityBytes = new byte[(rows.Length + 7) / 8];
+            for (int i = 0; i < rows.Length; i++)
+            {
+                if (nullMask[i]) validityBytes[i >> 3] |= (byte)(1 << (i & 7));
+                else nullCount++;
+            }
+            validity = new ArrowBuffer(validityBytes);
+        }
+
+        var listType = new ListType(new Field("item", Int32Type.Default, nullable: true));
+        var data = new ArrayData(
+            listType, rows.Length, nullCount, 0,
+            new[] { validity, new ArrowBuffer(offsetsBytes) },
+            children: new[] { innerArr.Data });
+        return new ListArray(data);
+    }
+
+    private static LargeListArray BuildLargeListInt64(long[][] rows, bool[]? nullMask)
+    {
+        int totalInner = 0;
+        for (int i = 0; i < rows.Length; i++)
+        {
+            bool isNull = nullMask is not null && !nullMask[i];
+            if (!isNull) totalInner += rows[i].Length;
+        }
+        var innerBytes = new byte[totalInner * sizeof(long)];
+        var offsetsBytes = new byte[(rows.Length + 1) * sizeof(long)];
+        int innerCursor = 0;
+        long runningOffset = 0;
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(
+            offsetsBytes.AsSpan(0, 8), 0L);
+        for (int i = 0; i < rows.Length; i++)
+        {
+            bool isNull = nullMask is not null && !nullMask[i];
+            if (!isNull)
+            {
+                MemoryMarshal.AsBytes(rows[i].AsSpan())
+                    .CopyTo(innerBytes.AsSpan(innerCursor));
+                innerCursor += rows[i].Length * sizeof(long);
+                runningOffset += rows[i].Length;
+            }
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(
+                offsetsBytes.AsSpan((i + 1) * sizeof(long), sizeof(long)),
+                runningOffset);
+        }
+
+        var innerData = new ArrayData(
+            Int64Type.Default, totalInner, 0, 0,
+            new[] { ArrowBuffer.Empty, new ArrowBuffer(innerBytes) });
+        var innerArr = new Int64Array(innerData);
+
+        ArrowBuffer validity = ArrowBuffer.Empty;
+        int nullCount = 0;
+        if (nullMask is not null)
+        {
+            var validityBytes = new byte[(rows.Length + 7) / 8];
+            for (int i = 0; i < rows.Length; i++)
+            {
+                if (nullMask[i]) validityBytes[i >> 3] |= (byte)(1 << (i & 7));
+                else nullCount++;
+            }
+            validity = new ArrowBuffer(validityBytes);
+        }
+
+        var listType = new LargeListType(new Field("item", Int64Type.Default, nullable: true));
+        var data = new ArrayData(
+            listType, rows.Length, nullCount, 0,
+            new[] { validity, new ArrowBuffer(offsetsBytes) },
+            children: new[] { innerArr.Data });
+        return new LargeListArray(data);
+    }
+
+    private static ListArray BuildListFloat(float[][] rows, bool[]? nullMask)
+    {
+        int totalInner = 0;
+        for (int i = 0; i < rows.Length; i++)
+        {
+            bool isNull = nullMask is not null && !nullMask[i];
+            if (!isNull) totalInner += rows[i].Length;
+        }
+        var innerBytes = new byte[totalInner * sizeof(float)];
+        var offsetsBytes = new byte[(rows.Length + 1) * sizeof(int)];
+        int innerCursor = 0;
+        int runningOffset = 0;
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+            offsetsBytes.AsSpan(0, 4), 0);
+        for (int i = 0; i < rows.Length; i++)
+        {
+            bool isNull = nullMask is not null && !nullMask[i];
+            if (!isNull)
+            {
+                MemoryMarshal.AsBytes(rows[i].AsSpan())
+                    .CopyTo(innerBytes.AsSpan(innerCursor));
+                innerCursor += rows[i].Length * sizeof(float);
+                runningOffset += rows[i].Length;
+            }
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                offsetsBytes.AsSpan((i + 1) * sizeof(int), sizeof(int)),
+                runningOffset);
+        }
+
+        var innerData = new ArrayData(
+            FloatType.Default, totalInner, 0, 0,
+            new[] { ArrowBuffer.Empty, new ArrowBuffer(innerBytes) });
+        var innerArr = new FloatArray(innerData);
+
+        ArrowBuffer validity = ArrowBuffer.Empty;
+        int nullCount = 0;
+        if (nullMask is not null)
+        {
+            var validityBytes = new byte[(rows.Length + 7) / 8];
+            for (int i = 0; i < rows.Length; i++)
+            {
+                if (nullMask[i]) validityBytes[i >> 3] |= (byte)(1 << (i & 7));
+                else nullCount++;
+            }
+            validity = new ArrowBuffer(validityBytes);
+        }
+
+        var listType = new ListType(new Field("item", FloatType.Default, nullable: true));
+        var data = new ArrayData(
+            listType, rows.Length, nullCount, 0,
+            new[] { validity, new ArrowBuffer(offsetsBytes) },
+            children: new[] { innerArr.Data });
+        return new ListArray(data);
+    }
 }

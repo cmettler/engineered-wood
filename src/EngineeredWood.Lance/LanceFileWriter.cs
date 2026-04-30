@@ -185,7 +185,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         {
             int pageRows = arr.Length;
             // Re-use the same Variable chunking algorithm via a helper.
-            var chunks = new List<(int, int, byte[])>();
+            var chunks = new List<PageChunk>();
             int idx = 0;
             while (idx < pageRows)
             {
@@ -207,13 +207,14 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 bool isLast = idx + items == pageRows;
                 int finalItems = isLast ? items : Pow2Floor(items);
                 byte[] valueBuf = BuildVariableChunkValueBuffer(arr, idx, finalItems);
-                chunks.Add((idx, finalItems, valueBuf));
+                chunks.Add(new PageChunk(idx, finalItems, valueBuf));
                 idx += finalItems;
             }
 
             var page = await BuildAndWritePageAsync(
-                valueEncoding, pageRows, chunks, validityBitmap: null, nullCount: 0,
-                cancellationToken).ConfigureAwait(false);
+                valueEncoding, pageRows, chunks,
+                new[] { RepDefLayer.RepdefAllValidItem }, cancellationToken)
+                .ConfigureAwait(false);
             pageProtos.Add(page);
         }
 
@@ -284,6 +285,34 @@ public sealed class LanceFileWriter : IAsyncDisposable
             return WriteVariableColumnAsync(name, "binary", ba, cancellationToken);
         if (array is FixedSizeListArray fsl)
             return WriteFixedSizeListColumnAsync(name, fsl, cancellationToken);
+        if (array is ListArray list)
+        {
+            int[] offsets = list.ValueOffsets.Slice(0, list.Length + 1).ToArray();
+            return WriteListColumnCommonAsync(
+                name, parentLogical: "list",
+                outerLength: list.Length, outerNullCount: list.NullCount,
+                outerValidity: ExtractValidityBitmap(list),
+                outerOffsets: offsets, innerValues: list.Values,
+                listType: (Apache.Arrow.Types.ListType)list.Data.DataType,
+                cancellationToken);
+        }
+        if (array is LargeListArray largeList)
+        {
+            // Large lists use i64 offsets, but Lance's leaf encoding only ever
+            // sees one page worth of visible items at a time — well under 2^31.
+            // Narrow each offset to int; throw if the column genuinely exceeds it.
+            var srcOffsets = largeList.ValueOffsets.Slice(0, largeList.Length + 1);
+            int[] offsets = new int[srcOffsets.Length];
+            for (int i = 0; i < srcOffsets.Length; i++)
+                offsets[i] = checked((int)srcOffsets[i]);
+            return WriteListColumnCommonAsync(
+                name, parentLogical: "large_list",
+                outerLength: largeList.Length, outerNullCount: largeList.NullCount,
+                outerValidity: ExtractValidityBitmap(largeList),
+                outerOffsets: offsets, innerValues: largeList.Values,
+                listType: ((LargeListType)largeList.Data.DataType),
+                cancellationToken);
+        }
 
         var (logicalType, bytesPerValue, valueBytes) = array switch
         {
@@ -501,6 +530,196 @@ public sealed class LanceFileWriter : IAsyncDisposable
             ExtractValidityBitmap(array), array.NullCount, cancellationToken);
     }
 
+    private async Task WriteListColumnCommonAsync(
+        string name, string parentLogical,
+        int outerLength, int outerNullCount, byte[]? outerValidity,
+        int[] outerOffsets, IArrowArray innerValues,
+        Apache.Arrow.Types.NestedType listType,
+        CancellationToken cancellationToken)
+    {
+        IArrowType innerType = listType switch
+        {
+            Apache.Arrow.Types.ListType lt => lt.ValueDataType,
+            LargeListType llt => llt.ValueDataType,
+            _ => throw new InvalidOperationException(
+                $"Unexpected list type {listType.GetType().Name}."),
+        };
+        if (innerType is not Apache.Arrow.Types.FixedWidthType innerFw)
+            throw new NotSupportedException(
+                $"LanceFileWriter only supports List<fixed-width primitive> initially " +
+                $"(got inner {innerType}).");
+
+        string innerLogical = innerFw switch
+        {
+            Apache.Arrow.Types.Int8Type => "int8",
+            Apache.Arrow.Types.UInt8Type => "uint8",
+            Apache.Arrow.Types.Int16Type => "int16",
+            Apache.Arrow.Types.UInt16Type => "uint16",
+            Apache.Arrow.Types.Int32Type => "int32",
+            Apache.Arrow.Types.UInt32Type => "uint32",
+            Apache.Arrow.Types.Int64Type => "int64",
+            Apache.Arrow.Types.UInt64Type => "uint64",
+            Apache.Arrow.Types.FloatType => "float",
+            Apache.Arrow.Types.DoubleType => "double",
+            _ => throw new NotSupportedException(
+                $"List inner type {innerFw} is not yet supported by the writer."),
+        };
+
+        // Inner-element nulls (NULLABLE_ITEM) are deferred — would require
+        // emitting non-zero def values for inner-null positions and threading
+        // them through visible-item accounting.
+        if (innerValues.NullCount > 0)
+            throw new NotSupportedException(
+                "List with inner-element nulls is not yet supported by the writer.");
+
+        int outerRows = outerLength;
+        int innerBytesPerItem = innerFw.BitWidth / 8;
+
+        // Detect null/empty content so we pick the minimal layer combination.
+        // pylance and lance-rs's reader both happily accept e.g.
+        // NULL_AND_EMPTY_LIST when neither nulls nor empties exist, but the
+        // tighter encoding produces smaller def buffers (or no def buffer at
+        // all for ALL_VALID_LIST).
+        bool anyNull = outerNullCount > 0;
+        bool anyEmpty = false;
+        for (int i = 0; i < outerRows; i++)
+        {
+            bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
+            if (isNull) continue;
+            int len = outerOffsets[i + 1] - outerOffsets[i];
+            if (len == 0) { anyEmpty = true; break; }
+        }
+
+        Proto.Encodings.V21.RepDefLayer listLayer;
+        int nullDef = 0, emptyDef = 0;
+        if (anyNull && anyEmpty)
+        {
+            listLayer = RepDefLayer.RepdefNullAndEmptyList;
+            nullDef = 1; emptyDef = 2;
+        }
+        else if (anyNull)
+        {
+            listLayer = RepDefLayer.RepdefNullableList;
+            nullDef = 1;
+        }
+        else if (anyEmpty)
+        {
+            listLayer = RepDefLayer.RepdefEmptyableList;
+            emptyDef = 1;
+        }
+        else
+        {
+            listLayer = RepDefLayer.RepdefAllValidList;
+        }
+        bool hasDef = anyNull || anyEmpty;
+
+        // Compute level count and visible items in one pass.
+        int totalLevels = 0;
+        int visibleItems = 0;
+        for (int i = 0; i < outerRows; i++)
+        {
+            bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
+            int len = isNull ? 0 : outerOffsets[i + 1] - outerOffsets[i];
+            if (isNull || len == 0) totalLevels += 1;
+            else { totalLevels += len; visibleItems += len; }
+        }
+
+        // Build rep/def streams. rep=1 opens a list boundary; rep=0 is a
+        // continuation. def=0 marks a valid item or list opening; non-zero
+        // marks a null/empty list at the corresponding cascade layer.
+        var rep = new ushort[totalLevels];
+        var def = hasDef ? new ushort[totalLevels] : null;
+        int writePos = 0;
+        for (int i = 0; i < outerRows; i++)
+        {
+            bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
+            int len = isNull ? 0 : outerOffsets[i + 1] - outerOffsets[i];
+            if (isNull)
+            {
+                rep[writePos] = 1;
+                def![writePos] = (ushort)nullDef;
+                writePos++;
+            }
+            else if (len == 0)
+            {
+                rep[writePos] = 1;
+                if (hasDef) def![writePos] = (ushort)emptyDef;
+                writePos++;
+            }
+            else
+            {
+                for (int j = 0; j < len; j++)
+                {
+                    rep[writePos] = (ushort)(j == 0 ? 1 : 0);
+                    if (hasDef) def![writePos] = 0;
+                    writePos++;
+                }
+            }
+        }
+
+        // Concatenate the inner value bytes for the visible items only.
+        // The inner array is the full inner slice; visible bytes start at
+        // outerOffsets[i] for each non-null/non-empty row.
+        int valueBytesLen = checked(visibleItems * innerBytesPerItem);
+        var valueBytes = new byte[valueBytesLen];
+        if (visibleItems > 0)
+        {
+            var innerValuesBuf = innerValues.Data.Buffers[1];
+            int outBytes = 0;
+            for (int i = 0; i < outerRows; i++)
+            {
+                bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
+                if (isNull) continue;
+                int start = outerOffsets[i];
+                int end = outerOffsets[i + 1];
+                int rowLen = end - start;
+                if (rowLen == 0) continue;
+                int byteCount = rowLen * innerBytesPerItem;
+                innerValuesBuf.Span.Slice(start * innerBytesPerItem, byteCount)
+                    .CopyTo(valueBytes.AsSpan(outBytes, byteCount));
+                outBytes += byteCount;
+            }
+        }
+
+        // Single-chunk only for now. Multi-chunk lists need to split the
+        // rep stream at list-row boundaries (so a chunk doesn't bisect a
+        // single list's items), which adds enough bookkeeping that it's
+        // best handled in a follow-up.
+        int repPadded = AlignUp(totalLevels * sizeof(ushort), MiniBlockAlignment);
+        int defPadded = hasDef ? AlignUp(totalLevels * sizeof(ushort), MiniBlockAlignment) : 0;
+        int chunkTotalBytes = AlignUp(
+            AlignUp(2 + 2 + (hasDef ? 2 : 0) + 2, MiniBlockAlignment)
+                + repPadded + defPadded
+                + AlignUp(valueBytesLen, MiniBlockAlignment),
+            MiniBlockAlignment);
+        if (chunkTotalBytes > MaxChunkBytes)
+            throw new NotSupportedException(
+                $"List page exceeds 32 KiB chunk budget ({chunkTotalBytes} bytes); " +
+                "multi-chunk list pages are not yet supported by the writer.");
+
+        var chunk = new PageChunk(0, visibleItems, valueBytes,
+            RepLevels: rep, DefLevels: def);
+        var valueEncoding = FlatEncoding(innerBytesPerItem * 8);
+        var layers = new List<RepDefLayer>
+        {
+            RepDefLayer.RepdefAllValidItem,
+            listLayer,
+        };
+
+        ThrowIfFinalized();
+        if (_totalRows < 0) _totalRows = outerRows;
+        else if (_totalRows != outerRows)
+            throw new ArgumentException(
+                $"Column '{name}' has {outerRows} rows but earlier columns have {_totalRows}.",
+                nameof(name));
+
+        var page = await BuildAndWritePageAsync(
+            valueEncoding, visibleItems, new[] { chunk }, layers, cancellationToken)
+            .ConfigureAwait(false);
+
+        RegisterListColumn(name, parentLogical, innerLogical, valueEncoding, new[] { page });
+    }
+
     private Task WriteVariableColumnAsync(
         string name, string logicalType, BinaryArray array,
         CancellationToken cancellationToken)
@@ -610,6 +829,22 @@ public sealed class LanceFileWriter : IAsyncDisposable
     }
 
     /// <summary>
+    /// Per-chunk page payload. <see cref="ItemCount"/> is the number of
+    /// visible items in the chunk (used to derive <c>log_num_values</c> in
+    /// the chunk metadata word). <see cref="RepLevels"/> and
+    /// <see cref="DefLevels"/> are the pre-encoded chunk-local rep/def
+    /// streams when the page carries them — both must have the same length
+    /// (= <c>num_levels</c> in the chunk header). Either may be null when
+    /// the corresponding compression isn't set on the layout.
+    /// </summary>
+    private readonly record struct PageChunk(
+        int ItemStart,
+        int ItemCount,
+        byte[] ValueBuf,
+        ushort[]? RepLevels = null,
+        ushort[]? DefLevels = null);
+
+    /// <summary>
     /// Single-page wrapper around <see cref="BuildAndWritePageAsync"/> +
     /// <see cref="RegisterColumn"/> — the common path for the typed Write
     /// methods when each column is one page.
@@ -631,8 +866,33 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 $"Column '{name}' has {numItems} rows but earlier columns have {_totalRows}.",
                 nameof(numItems));
 
+        bool hasDef = nullCount > 0 && validityBitmap is not null;
+        var pageChunks = new PageChunk[chunks.Count];
+        for (int c = 0; c < chunks.Count; c++)
+        {
+            var (itemStart, itemCount, valueBuf) = chunks[c];
+            ushort[]? defLevels = null;
+            if (hasDef)
+            {
+                defLevels = new ushort[itemCount];
+                for (int i = 0; i < itemCount; i++)
+                {
+                    int globalIdx = itemStart + i;
+                    bool valid = (validityBitmap![globalIdx >> 3] & (1 << (globalIdx & 7))) != 0;
+                    defLevels[i] = valid ? (ushort)0 : (ushort)1;
+                }
+            }
+            pageChunks[c] = new PageChunk(itemStart, itemCount, valueBuf,
+                RepLevels: null, DefLevels: defLevels);
+        }
+
+        var layers = new List<RepDefLayer>
+        {
+            hasDef ? RepDefLayer.RepdefNullableItem : RepDefLayer.RepdefAllValidItem,
+        };
+
         var page = await BuildAndWritePageAsync(
-            valueEncoding, numItems, chunks, validityBitmap, nullCount, cancellationToken)
+            valueEncoding, numItems, pageChunks, layers, cancellationToken)
             .ConfigureAwait(false);
         RegisterColumn(name, logicalType, valueEncoding, new[] { page });
     }
@@ -657,14 +917,16 @@ public sealed class LanceFileWriter : IAsyncDisposable
     private async Task<ColumnMetadata.Types.Page> BuildAndWritePageAsync(
         CompressiveEncoding valueEncoding,
         int numItems,
-        IReadOnlyList<(int itemStart, int itemCount, byte[] valueBuf)> chunks,
-        byte[]? validityBitmap,
-        int nullCount,
+        IReadOnlyList<PageChunk> chunks,
+        IReadOnlyList<RepDefLayer> layers,
         CancellationToken cancellationToken)
     {
-        bool hasDef = nullCount > 0 && validityBitmap is not null;
         int N = chunks.Count;
-        int headerLen = hasDef ? 6 : 4;
+        bool hasRep = N > 0 && chunks[0].RepLevels is not null;
+        bool hasDef = N > 0 && chunks[0].DefLevels is not null;
+        // num_levels (u16) + optional rep_size (u16) + optional def_size (u16)
+        // + value_buf_size (u16).
+        int headerLen = 2 + (hasRep ? 2 : 0) + (hasDef ? 2 : 0) + 2;
         int headerPadded = AlignUp(headerLen, MiniBlockAlignment);
 
         byte[][] chunkBytes = new byte[N][];
@@ -673,11 +935,23 @@ public sealed class LanceFileWriter : IAsyncDisposable
 
         for (int c = 0; c < N; c++)
         {
-            var (itemStart, itemCount, chunkValueBuf) = chunks[c];
+            PageChunk chunk = chunks[c];
+            int itemCount = chunk.ItemCount;
+            byte[] chunkValueBuf = chunk.ValueBuf;
             int valueBufLen = chunkValueBuf.Length;
-            int defByteLen = hasDef ? itemCount * sizeof(ushort) : 0;
+
+            int numLevels = chunk.RepLevels?.Length ?? chunk.DefLevels?.Length ?? 0;
+            if (chunk.RepLevels is not null && chunk.DefLevels is not null
+                && chunk.RepLevels.Length != chunk.DefLevels.Length)
+                throw new InvalidOperationException(
+                    $"Chunk {c}: rep ({chunk.RepLevels.Length}) and def " +
+                    $"({chunk.DefLevels.Length}) level counts must match.");
+
+            int repByteLen = chunk.RepLevels is null ? 0 : chunk.RepLevels.Length * sizeof(ushort);
+            int repPadded = hasRep ? AlignUp(repByteLen, MiniBlockAlignment) : 0;
+            int defByteLen = chunk.DefLevels is null ? 0 : chunk.DefLevels.Length * sizeof(ushort);
             int defPadded = hasDef ? AlignUp(defByteLen, MiniBlockAlignment) : 0;
-            int chunkTotal = AlignUp(headerPadded + defPadded + valueBufLen, MiniBlockAlignment);
+            int chunkTotal = AlignUp(headerPadded + repPadded + defPadded + valueBufLen, MiniBlockAlignment);
             int dividedBytes = (chunkTotal / MiniBlockAlignment) - 1;
             if (dividedBytes < 0 || dividedBytes > 0xFFF)
                 throw new InvalidOperationException(
@@ -706,16 +980,23 @@ public sealed class LanceFileWriter : IAsyncDisposable
 
             byte[] cb = new byte[chunkTotal];
             int cursor = 0;
-            // num_levels: for Flat/Variable item-shape chunks the reader
-            // only needs this when there are def levels. For the FSL
-            // value-compression path the reader instead asserts
-            // num_levels == num_rows even without def — set it to
-            // itemCount whenever the chunk is FSL-shaped (or has def).
+            // num_levels: for chunks that carry rep or def, this is the
+            // count of levels in the rep/def buffers. For the FSL
+            // value-compression path the reader asserts num_levels ==
+            // num_rows even without def; otherwise (no rep, no def, not FSL)
+            // the reader treats num_levels = 0.
             bool isFsl = valueEncoding.CompressionCase
                 == CompressiveEncoding.CompressionOneofCase.FixedSizeList;
+            int numLevelsHeader = (hasRep || hasDef) ? numLevels : (isFsl ? itemCount : 0);
             BinaryPrimitives.WriteUInt16LittleEndian(
-                cb.AsSpan(cursor, 2), checked((ushort)((hasDef || isFsl) ? itemCount : 0)));
+                cb.AsSpan(cursor, 2), checked((ushort)numLevelsHeader));
             cursor += 2;
+            if (hasRep)
+            {
+                BinaryPrimitives.WriteUInt16LittleEndian(
+                    cb.AsSpan(cursor, 2), checked((ushort)repByteLen));
+                cursor += 2;
+            }
             if (hasDef)
             {
                 BinaryPrimitives.WriteUInt16LittleEndian(
@@ -732,19 +1013,26 @@ public sealed class LanceFileWriter : IAsyncDisposable
             BinaryPrimitives.WriteUInt16LittleEndian(
                 cb.AsSpan(cursor, 2), checked((ushort)valueBufLenOnDisk));
 
+            int writeCursor = headerPadded;
+            if (hasRep)
+            {
+                Span<byte> repOut = cb.AsSpan(writeCursor, repByteLen);
+                for (int i = 0; i < chunk.RepLevels!.Length; i++)
+                    BinaryPrimitives.WriteUInt16LittleEndian(
+                        repOut.Slice(i * sizeof(ushort), sizeof(ushort)),
+                        chunk.RepLevels[i]);
+                writeCursor += repPadded;
+            }
             if (hasDef)
             {
-                Span<byte> defOut = cb.AsSpan(headerPadded, defByteLen);
-                for (int i = 0; i < itemCount; i++)
-                {
-                    int globalIdx = itemStart + i;
-                    bool valid = (validityBitmap![globalIdx >> 3] & (1 << (globalIdx & 7))) != 0;
+                Span<byte> defOut = cb.AsSpan(writeCursor, defByteLen);
+                for (int i = 0; i < chunk.DefLevels!.Length; i++)
                     BinaryPrimitives.WriteUInt16LittleEndian(
                         defOut.Slice(i * sizeof(ushort), sizeof(ushort)),
-                        valid ? (ushort)0 : (ushort)1);
-                }
+                        chunk.DefLevels[i]);
+                writeCursor += defPadded;
             }
-            chunkValueBuf.CopyTo(cb, headerPadded + defPadded);
+            chunkValueBuf.CopyTo(cb, writeCursor);
 
             chunkBytes[c] = cb;
             dataTotal += chunkTotal;
@@ -782,6 +1070,14 @@ public sealed class LanceFileWriter : IAsyncDisposable
             NumBuffers = 1,
             NumItems = (ulong)numItems,
         };
+        if (hasRep)
+        {
+            // Reader expects Flat(16) for the rep buffer.
+            miniBlock.RepCompression = new CompressiveEncoding
+            {
+                Flat = new Proto.Encodings.V21.Flat { BitsPerValue = 16 },
+            };
+        }
         if (hasDef)
         {
             // Reader expects Flat(16) for the def buffer per the v2.1 chunk
@@ -790,12 +1086,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
             {
                 Flat = new Proto.Encodings.V21.Flat { BitsPerValue = 16 },
             };
-            miniBlock.Layers.Add(RepDefLayer.RepdefNullableItem);
         }
-        else
-        {
-            miniBlock.Layers.Add(RepDefLayer.RepdefAllValidItem);
-        }
+        foreach (var layer in layers) miniBlock.Layers.Add(layer);
 
         var pageLayout = new PageLayout { MiniBlockLayout = miniBlock };
 
@@ -876,6 +1168,57 @@ public sealed class LanceFileWriter : IAsyncDisposable
     }
 
     /// <summary>
+    /// Schema variant for a List column: registers exactly one column-metadata
+    /// entry (the leaf carries rep/def/values) but two schema fields — the
+    /// outer list parent (logical_type "list" or "large_list") and the inner
+    /// item child (logical_type for the primitive type).
+    /// </summary>
+    private void RegisterListColumn(
+        string name, string parentLogical, string innerLogical,
+        CompressiveEncoding valueEncoding,
+        IEnumerable<ColumnMetadata.Types.Page> pages)
+    {
+        var columnEncodingProto = new ColumnEncoding { Values = new Empty() };
+        var columnAny = new Any
+        {
+            TypeUrl = "/lance.encodings.ColumnEncoding",
+            Value = columnEncodingProto.ToByteString(),
+        };
+        var columnEncoding = new Proto.V2.Encoding
+        {
+            Direct = new DirectEncoding { Encoding = columnAny.ToByteString() },
+        };
+
+        var columnMeta = new ColumnMetadata { Encoding = columnEncoding };
+        foreach (var page in pages) columnMeta.Pages.Add(page);
+        _columns.Add(columnMeta);
+
+        int parentId = _fields.Count;
+        _fields.Add(new Proto.Field
+        {
+            Name = name,
+            Id = parentId,
+            ParentId = -1,
+            LogicalType = parentLogical,
+            Nullable = true,
+            Encoding = Proto.Encoding.Plain,
+        });
+        var innerFieldEncoding = valueEncoding.CompressionCase
+                == CompressiveEncoding.CompressionOneofCase.Variable
+            ? Proto.Encoding.VarBinary
+            : Proto.Encoding.Plain;
+        _fields.Add(new Proto.Field
+        {
+            Name = "item",
+            Id = parentId + 1,
+            ParentId = parentId,
+            LogicalType = innerLogical,
+            Nullable = true,
+            Encoding = innerFieldEncoding,
+        });
+    }
+
+    /// <summary>
     /// Multi-page Flat-encoded column. Each entry of
     /// <paramref name="valueChunksPerPage"/> is the raw little-endian byte
     /// buffer for one page's items. Pages are stitched into a single
@@ -902,7 +1245,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         {
             int numItems = valueBytes.Length / bytesPerValue;
             int chunkSize = LargestPow2FlatChunkSize(bytesPerValue, hasDef: false);
-            var chunks = new List<(int, int, byte[])>();
+            var chunks = new List<PageChunk>();
             int idx = 0;
             while (idx < numItems)
             {
@@ -910,12 +1253,13 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 byte[] chunkValBytes = new byte[items * bytesPerValue];
                 new ReadOnlySpan<byte>(valueBytes, idx * bytesPerValue, items * bytesPerValue)
                     .CopyTo(chunkValBytes);
-                chunks.Add((idx, items, chunkValBytes));
+                chunks.Add(new PageChunk(idx, items, chunkValBytes));
                 idx += items;
             }
 
             var page = await BuildAndWritePageAsync(
-                encoding, numItems, chunks, validityBitmap: null, nullCount: 0, cancellationToken)
+                encoding, numItems, chunks,
+                new[] { RepDefLayer.RepdefAllValidItem }, cancellationToken)
                 .ConfigureAwait(false);
             pageProtos.Add(page);
         }
