@@ -671,7 +671,16 @@ internal static class MiniBlockLayoutDecoder
         ReadOnlySpan<byte> chunkData = context.PageBuffers[1].Span;
         var chunks = ParseChunkMetadata(chunkMeta, hasLargeChunk, numItems);
 
-        int valueBytesPerItem = ResolveFlatBytesPerValue(valueEnc, childType);
+        // InlineBitpacking variant: the chunk's value buffer holds a
+        // sizeof(T)-byte bit-width header + Fastlanes-packed values, not
+        // raw little-endian values. Detect up front so the per-chunk
+        // loop can route to DecodeInlineBitpackingChunk and the size of
+        // the on-disk value bytes is decoupled from the unpacked size.
+        bool inlineBitpacking = valueEnc.CompressionCase
+            == CompressiveEncoding.CompressionOneofCase.InlineBitpacking;
+        int valueBytesPerItem = inlineBitpacking
+            ? ResolveInlineBitpackingBytesPerValue(valueEnc.InlineBitpacking, childType)
+            : ResolveFlatBytesPerValue(valueEnc, childType);
 
         int visibleItems = checked((int)numItems);
         var valueBytes = new byte[visibleItems * valueBytesPerItem];
@@ -787,15 +796,30 @@ internal static class MiniBlockLayoutDecoder
                 cursor = AlignUp(cursor, MiniBlockAlignment);
             }
 
-            int chunkValueBytes = chunkVisibleItems * valueBytesPerItem;
-            if (valueBufSize < chunkValueBytes)
-                throw new LanceFormatException(
-                    $"Nested-leaf chunk value buffer {valueBufSize} < expected " +
-                    $"{chunkValueBytes} for {chunkVisibleItems} visible items.");
-            chunkBytes.Slice(cursor, chunkValueBytes)
-                .CopyTo(valueBytes.AsSpan(valueWritePos));
+            if (inlineBitpacking)
+            {
+                // Hand the chunk's packed buffer (header + packed bytes) to
+                // the existing fastlanes unpack helper; it writes
+                // chunkVisibleItems decompressed values into the global
+                // valueBytes array starting at valueWritePos / valueBytesPerItem.
+                DecodeInlineBitpackingChunk(
+                    chunkBytes.Slice(cursor, valueBufSize),
+                    chunkVisibleItems, valueBytesPerItem,
+                    valueBytes, valueWritePos / valueBytesPerItem);
+                valueWritePos += chunkVisibleItems * valueBytesPerItem;
+            }
+            else
+            {
+                int chunkValueBytes = chunkVisibleItems * valueBytesPerItem;
+                if (valueBufSize < chunkValueBytes)
+                    throw new LanceFormatException(
+                        $"Nested-leaf chunk value buffer {valueBufSize} < expected " +
+                        $"{chunkValueBytes} for {chunkVisibleItems} visible items.");
+                chunkBytes.Slice(cursor, chunkValueBytes)
+                    .CopyTo(valueBytes.AsSpan(valueWritePos));
+                valueWritePos += chunkValueBytes;
+            }
 
-            valueWritePos += chunkValueBytes;
             levelWritePos += numLevels;
             globalChunkByteOffset += (long)chunk.SizeBytes;
         }

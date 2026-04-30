@@ -136,6 +136,15 @@ def main() -> None:
               pa.table({"xs": pa.array([[1, 2], None, [3, 4]],
                                         type=pa.list_(pa.int32()))}),
               version="2.1")
+    # list<int32> with low-entropy values — pylance picks InlineBitpacking
+    # for the inner int32 leaf (not Flat). 50 outer rows × 20 small ints.
+    # Exercises the nested-leaf path's bitpacking branch.
+    write_one("list_int_bitpacked_v21",
+              pa.table({"x": pa.array(
+                  [list(range(i * 3, i * 3 + 20)) for i in range(50)],
+                  type=pa.list_(pa.int32()))}),
+              version="2.1")
+
     # ConstantLayout — pylance emits this for all-null columns.
     write_one("all_null_int32_v21",
               pa.table({"x": pa.array([None] * 10, type=pa.int32())}),

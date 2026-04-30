@@ -208,6 +208,30 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task List_Int32_Bitpacked()
+    {
+        // list<int32> with low-entropy values (range[i*3..i*3+20]).
+        // pylance picks InlineBitpacking for the leaf encoding rather
+        // than Flat; the nested-leaf path now decodes packed values
+        // chunk-by-chunk instead of just raw-copying bytes.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("list_int_bitpacked_v21.lance"));
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(50, outer.Length);
+        Assert.Equal(0, outer.NullCount);
+
+        var leaf = (Int32Array)outer.Values;
+        Assert.Equal(50 * 20, leaf.Length);
+        // Reconstruct expected: row i = [i*3, i*3+1, ..., i*3+19].
+        for (int i = 0; i < 50; i++)
+        {
+            Assert.Equal(i * 20, outer.ValueOffsets[i]);
+            for (int j = 0; j < 20; j++)
+                Assert.Equal(i * 3 + j, leaf.GetValue(i * 20 + j));
+        }
+    }
+
+    [Fact]
     public async Task ConstantLayout_AllNull_Int32()
     {
         // Pylance emits ConstantLayout for all-null columns: layers=
