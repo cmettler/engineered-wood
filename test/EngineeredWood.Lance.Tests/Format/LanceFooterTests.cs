@@ -47,9 +47,9 @@ public class LanceFooterTests
 
     [Theory]
     [InlineData(0, 2)]   // legacy v0.1
-    [InlineData(2, 2)]   // future v2.2
-    [InlineData(3, 0)]   // unknown future
-    public void Version_IsSupported_OnlyForV20AndV21(int major, int minor)
+    [InlineData(2, 3)]   // unknown future minor
+    [InlineData(3, 0)]   // unknown future major
+    public void Version_IsRejected(int major, int minor)
     {
         var version = new LanceVersion((ushort)major, (ushort)minor);
         Assert.False(version.IsSupported);
@@ -58,7 +58,8 @@ public class LanceFooterTests
     [Theory]
     [InlineData(2, 0)]
     [InlineData(2, 1)]
-    public void Version_IsSupported_ForV20AndV21(int major, int minor)
+    [InlineData(2, 2)]
+    public void Version_IsSupported_ForV20Through22(int major, int minor)
     {
         var version = new LanceVersion((ushort)major, (ushort)minor);
         Assert.True(version.IsSupported);

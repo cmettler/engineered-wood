@@ -79,18 +79,20 @@ public class LanceFileReaderTests
     }
 
     [Fact]
-    public async Task Rejects_FutureV22()
+    public async Task Rejects_FutureV23()
     {
+        // v2.2 is now accepted (it shares the v2.1 layout plus Map type
+        // support). v2.3 is still rejected as unknown.
         var builder = new MinimalLanceFileBuilder
         {
-            Version = new LanceVersion(2, 2),
+            Version = new LanceVersion(2, 3),
         };
         byte[] file = builder.Build();
 
         await using var backend = new InMemoryRandomAccessFile(file);
         var ex = await Assert.ThrowsAsync<LanceFormatException>(
             async () => await LanceFileReader.OpenAsync(backend));
-        Assert.Contains("2.2", ex.Message);
+        Assert.Contains("2.3", ex.Message);
     }
 
     [Fact]

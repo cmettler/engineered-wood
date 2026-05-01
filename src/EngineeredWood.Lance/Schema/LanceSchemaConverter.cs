@@ -23,6 +23,10 @@ internal static class LanceSchemaConverter
     private const string LargeListKind = "large_list";
     private const string ListStructKind = "list.struct";
     private const string LargeListStructKind = "large_list.struct";
+    // v2.2 Map: encoded structurally as List<Struct<key, value>> with
+    // logical_type "map" on the parent and "struct" on the intermediate
+    // "entries" child.
+    private const string MapKind = "map";
 
     public static Apache.Arrow.Schema ToArrowSchema(Proto.Schema schema)
     {
@@ -98,9 +102,38 @@ internal static class LanceSchemaConverter
             case ListStructKind:
             case LargeListStructKind:
                 return BuildListType(field, byParent, logical);
+            case MapKind:
+                return BuildMapType(field, byParent);
             default:
                 return (ParseLeafType(logical, field.Name), Array.Empty<Apache.Arrow.Field>());
         }
+    }
+
+    /// <summary>
+    /// Build an Apache Arrow <see cref="MapType"/>. Wire shape: parent
+    /// field's logical_type is "map" with exactly one child whose
+    /// logical_type is "struct" (named "entries" by pylance) carrying two
+    /// grandchildren — the key and the value.
+    /// </summary>
+    private static (IArrowType Type, IReadOnlyList<Apache.Arrow.Field> Children) BuildMapType(
+        Proto.Field field, Dictionary<int, List<Proto.Field>> byParent)
+    {
+        var children = BuildChildren(field.Id, byParent);
+        if (children.Length != 1)
+            throw new LanceFormatException(
+                $"Map field '{field.Name}' must have exactly one child (the entries struct), got {children.Length}.");
+        if (children[0].DataType is not StructType entries)
+            throw new LanceFormatException(
+                $"Map field '{field.Name}' child must be a struct, got {children[0].DataType}.");
+        if (entries.Fields.Count != 2)
+            throw new LanceFormatException(
+                $"Map field '{field.Name}' entries struct must have exactly 2 fields (key, value), got {entries.Fields.Count}.");
+
+        // Apache.Arrow's MapType ctor expects a StructType with 2 fields; the
+        // first is key (non-nullable), the second is value. Pylance respects
+        // this convention; we trust the schema as given.
+        var mapType = new MapType(entries);
+        return (mapType, new[] { children[0] });
     }
 
     private static (IArrowType Type, IReadOnlyList<Apache.Arrow.Field> Children) BuildListType(

@@ -2340,6 +2340,231 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task Map_StringInt32_RoundTrip_ViaOurReader()
+    {
+        // map<string, int32> with 3 rows: {"a":1,"b":2}, {}, {"c":3}.
+        // Mirrors pylance's v2.2 fixture so the writer's output should be
+        // structurally identical (modulo encoding choices).
+        var keys = new StringArray.Builder()
+            .Append("a").Append("b").Append("c").Build();
+        var values = new Int32Array.Builder()
+            .Append(1).Append(2).Append(3).Build();
+
+        // Build the entries struct directly (key + value).
+        var entriesType = new StructType(new[]
+        {
+            new Field("key", StringType.Default, nullable: false),
+            new Field("value", Int32Type.Default, nullable: true),
+        });
+        var entries = new StructArray(new ArrayData(
+            entriesType, length: 3, nullCount: 0, offset: 0,
+            new[] { ArrowBuffer.Empty },
+            new[] { keys.Data, values.Data }));
+
+        // Outer map: 3 rows, offsets [0, 2, 2, 3].
+        var offsetsBytes = new byte[4 * sizeof(int)];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(offsetsBytes.AsSpan(0, 4), 0);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(offsetsBytes.AsSpan(4, 4), 2);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(offsetsBytes.AsSpan(8, 4), 2);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(offsetsBytes.AsSpan(12, 4), 3);
+
+        var mapType = new MapType(entriesType);
+        var mapData = new ArrayData(
+            mapType, length: 3, nullCount: 0, offset: 0,
+            new[] { ArrowBuffer.Empty, new ArrowBuffer(offsetsBytes) },
+            new[] { entries.Data });
+        var mapArr = new MapArray(mapData);
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-map-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("kvs", mapArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            // Writer auto-bumped to v2.2 since a Map column was written.
+            Assert.Equal(EngineeredWood.Lance.Format.LanceVersion.V2_2, reader.Version);
+            Assert.IsType<MapType>(reader.Schema.FieldsList[0].DataType);
+
+            var read = (MapArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(3, read.Length);
+            Assert.Equal(0, read.NullCount);
+            Assert.Equal(0, read.ValueOffsets[0]);
+            Assert.Equal(2, read.ValueOffsets[1]);
+            Assert.Equal(2, read.ValueOffsets[2]);
+            Assert.Equal(3, read.ValueOffsets[3]);
+            var rk = (StringArray)read.Keys;
+            var rv = (Int32Array)read.Values;
+            Assert.Equal("a", rk.GetString(0));
+            Assert.Equal(1, rv.GetValue(0));
+            Assert.Equal("b", rk.GetString(1));
+            Assert.Equal(2, rv.GetValue(1));
+            Assert.Equal("c", rk.GetString(2));
+            Assert.Equal(3, rv.GetValue(2));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Map_NullableValues_RoundTrip_ViaOurReader()
+    {
+        // map<int64, double> with one null map row + one entry whose
+        // value is null. Combines NULLABLE_LIST + NULLABLE_ITEM cascades.
+        var keys = new Int64Array.Builder()
+            .Append(10L).Append(20L).Append(30L).Build();
+        var values = new DoubleArray.Builder()
+            .Append(1.5).AppendNull().Append(3.5).Build();
+
+        var entriesType = new StructType(new[]
+        {
+            new Field("key", Int64Type.Default, nullable: false),
+            new Field("value", DoubleType.Default, nullable: true),
+        });
+        var entries = new StructArray(new ArrayData(
+            entriesType, length: 3, nullCount: 0, offset: 0,
+            new[] { ArrowBuffer.Empty },
+            new[] { keys.Data, values.Data }));
+
+        // 4 outer rows: [k10:1.5], null, [k20:null, k30:3.5], []
+        var offsetsBytes = new byte[5 * sizeof(int)];
+        int[] offsets = { 0, 1, 1, 3, 3 };
+        for (int i = 0; i < offsets.Length; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                offsetsBytes.AsSpan(i * 4, 4), offsets[i]);
+        var validityBytes = new byte[1] { 0b1101 };  // outer row 1 = null
+
+        var mapType = new MapType(entriesType);
+        var mapData = new ArrayData(
+            mapType, length: 4, nullCount: 1, offset: 0,
+            new[] { new ArrowBuffer(validityBytes), new ArrowBuffer(offsetsBytes) },
+            new[] { entries.Data });
+        var mapArr = new MapArray(mapData);
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-mapnul-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("kvs", mapArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (MapArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(4, read.Length);
+            Assert.Equal(1, read.NullCount);
+            Assert.True(read.IsNull(1));
+            Assert.Equal(0, read.ValueOffsets[0]);
+            Assert.Equal(1, read.ValueOffsets[1]);
+            Assert.Equal(1, read.ValueOffsets[2]);
+            Assert.Equal(3, read.ValueOffsets[3]);
+            Assert.Equal(3, read.ValueOffsets[4]);
+            var rk = (Int64Array)read.Keys;
+            var rv = (DoubleArray)read.Values;
+            Assert.Equal(10L, rk.GetValue(0));
+            Assert.Equal(1.5, rv.GetValue(0));
+            Assert.Equal(20L, rk.GetValue(1));
+            Assert.True(rv.IsNull(1));
+            Assert.Equal(30L, rk.GetValue(2));
+            Assert.Equal(3.5, rv.GetValue(2));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Map_CrossValidatedAgainstPylance()
+    {
+        // Verify the writer's wire format against pylance v2.2 reader.
+        if (!IsPythonAvailable()) return;
+        var keys = new StringArray.Builder()
+            .Append("alpha").Append("beta").Append("gamma").Append("delta").Build();
+        var values = new Int32Array.Builder()
+            .Append(1).Append(2).Append(3).Append(4).Build();
+        var entriesType = new StructType(new[]
+        {
+            new Field("key", StringType.Default, nullable: false),
+            new Field("value", Int32Type.Default, nullable: true),
+        });
+        var entries = new StructArray(new ArrayData(
+            entriesType, length: 4, nullCount: 0, offset: 0,
+            new[] { ArrowBuffer.Empty },
+            new[] { keys.Data, values.Data }));
+
+        // 3 outer rows: [{alpha:1,beta:2}, {gamma:3}, {delta:4}]
+        int[] offsets = { 0, 2, 3, 4 };
+        var offsetsBytes = new byte[offsets.Length * sizeof(int)];
+        for (int i = 0; i < offsets.Length; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                offsetsBytes.AsSpan(i * 4, 4), offsets[i]);
+
+        var mapType = new MapType(entriesType);
+        var mapData = new ArrayData(
+            mapType, length: 3, nullCount: 0, offset: 0,
+            new[] { ArrowBuffer.Empty, new ArrowBuffer(offsetsBytes) },
+            new[] { entries.Data });
+        var mapArr = new MapArray(mapData);
+
+        string path = Path.Combine(Path.GetTempPath(),
+            $"ew-pylance-map-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("kvs", mapArr);
+                await writer.FinishAsync();
+            }
+
+            string script = "import sys, json\n" +
+                "from lance.file import LanceFileReader\n" +
+                $"r = LanceFileReader(r'{path}')\n" +
+                "t = r.read_all().to_table()\n" +
+                "data = t['kvs'].to_pylist()\n" +
+                "out = { 'rows': len(data), 'type': str(t.schema[0].type), " +
+                "'data': data }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(3, json.RootElement.GetProperty("rows").GetInt32());
+            Assert.StartsWith("map<string, int32",
+                json.RootElement.GetProperty("type").GetString());
+            var data = json.RootElement.GetProperty("data");
+            // Row 0: [["alpha", 1], ["beta", 2]]
+            Assert.Equal(2, data[0].GetArrayLength());
+            Assert.Equal("alpha", data[0][0][0].GetString());
+            Assert.Equal(1, data[0][0][1].GetInt32());
+            // Row 2: [["delta", 4]]
+            Assert.Equal(1, data[2].GetArrayLength());
+            Assert.Equal("delta", data[2][0][0].GetString());
+            Assert.Equal(4, data[2][0][1].GetInt32());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task Decimal128_RoundTrip_ViaOurReader()
     {
         // Decimal128(precision=18, scale=3): three values + one null. Apache

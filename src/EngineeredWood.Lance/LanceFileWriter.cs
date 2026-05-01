@@ -68,7 +68,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
 
     private readonly ISequentialFile _file;
     private readonly bool _ownsFile;
-    private readonly LanceVersion _version;
+    private LanceVersion _version;  // bumped to V2_2 if a Map column is written
     private readonly LanceCompressionScheme _compression;
     private readonly List<Proto.Field> _fields = new();
     private readonly List<ColumnMetadata> _columns = new();
@@ -350,6 +350,11 @@ public sealed class LanceFileWriter : IAsyncDisposable
             return WriteFixedWidthFlatColumnAsync(
                 name, $"fixed_size_binary:{width}", width, fsb, cancellationToken);
         }
+        // MapArray extends ListArray, so dispatch on it FIRST: a list-of-
+        // struct shape with 2 leaves (key + value), parent logical_type
+        // "map", v2.2 file version.
+        if (array is MapArray mapArr)
+            return WriteMapColumnAsync(name, mapArr, cancellationToken);
         if (array is ListArray list)
         {
             int[] offsets = list.ValueOffsets.Slice(0, list.Length + 1).ToArray();
@@ -1501,6 +1506,290 @@ public sealed class LanceFileWriter : IAsyncDisposable
             },
         };
         return (buf, enc, logicalType);
+    }
+
+    /// <summary>
+    /// Writes a v2.2 Map column. On disk this is exactly a
+    /// <c>List&lt;Struct&lt;key, value&gt;&gt;</c>: one column metadata
+    /// entry per leaf (2 total: key + value), each carrying the same rep
+    /// stream (= map outer list boundaries) but its own def stream
+    /// (combining the shared list-level cascade with the leaf's own
+    /// nulls). The schema records 4 fields — parent map → entries struct →
+    /// key + value. Bumps the file version to <see cref="LanceVersion.V2_2"/>
+    /// since pylance's writer only supports Map in v2.2+; pylance v2.2 is
+    /// the canonical reader for these files.
+    ///
+    /// <para>Scope: single-page columns, single-chunk per page; key &amp;
+    /// value leaves can be fixed-width primitives, FSB, Decimal, Date /
+    /// Time / Timestamp / Duration, String, or Binary. Bool / FSL / nested
+    /// map keys/values are not yet supported.</para>
+    /// </summary>
+    private async Task WriteMapColumnAsync(
+        string name, MapArray array, CancellationToken cancellationToken)
+    {
+        ThrowIfFinalized();
+        // Bump the file version — pylance won't read maps from a v2.1 file.
+        if (_version != LanceVersion.V2_2) _version = LanceVersion.V2_2;
+
+        var mapType = (MapType)array.Data.DataType;
+        var entriesField = mapType.Fields[0];  // typically "entries"
+        var entriesStruct = (StructType)entriesField.DataType;
+        if (entriesStruct.Fields.Count != 2)
+            throw new InvalidOperationException(
+                $"MapType entries struct must have exactly 2 fields; got {entriesStruct.Fields.Count}.");
+        var keyField = entriesStruct.Fields[0];
+        var valueField = entriesStruct.Fields[1];
+
+        // The MapArray's child (= entries StructArray) lives at
+        // Data.Children[0]. Its own children[0..1] are the key and value
+        // leaf arrays.
+        var entriesData = array.Data.Children[0];
+        var keyArr = ArrowArrayFactory.BuildArray(entriesData.Children[0]);
+        var valueArr = ArrowArrayFactory.BuildArray(entriesData.Children[1]);
+
+        int outerRows = array.Length;
+        if (_totalRows < 0) _totalRows = outerRows;
+        else if (_totalRows != outerRows)
+            throw new ArgumentException(
+                $"Column '{name}' has {outerRows} rows but earlier columns have {_totalRows}.",
+                nameof(name));
+
+        var outerOffsetsSpan = array.ValueOffsets;
+        var outerOffsets = new int[outerRows + 1];
+        for (int i = 0; i <= outerRows; i++) outerOffsets[i] = outerOffsetsSpan[i];
+        byte[]? outerValidity = ExtractValidityBitmap(array);
+
+        // Detect outer null/empty content so we pick the minimal list layer.
+        bool anyMapNull = array.NullCount > 0;
+        bool anyMapEmpty = false;
+        for (int i = 0; i < outerRows; i++)
+        {
+            bool isNull = anyMapNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
+            if (!isNull && outerOffsets[i + 1] == outerOffsets[i]) { anyMapEmpty = true; break; }
+        }
+        RepDefLayer listLayer = (anyMapNull, anyMapEmpty) switch
+        {
+            (true, true) => RepDefLayer.RepdefNullAndEmptyList,
+            (true, false) => RepDefLayer.RepdefNullableList,
+            (false, true) => RepDefLayer.RepdefEmptyableList,
+            _ => RepDefLayer.RepdefAllValidList,
+        };
+
+        // --- Register schema fields up front (parent → entries → key, value) ---
+        int parentId = _fields.Count;
+        _fields.Add(new Proto.Field
+        {
+            Name = name, Id = parentId, ParentId = -1,
+            LogicalType = "map", Nullable = true, Encoding = Proto.Encoding.Plain,
+        });
+        int entriesId = _fields.Count;
+        _fields.Add(new Proto.Field
+        {
+            Name = entriesField.Name, Id = entriesId, ParentId = parentId,
+            LogicalType = "struct", Nullable = false, Encoding = Proto.Encoding.Plain,
+        });
+
+        // Emit the two leaf columns.
+        await EmitMapLeafColumnAsync(
+            keyField.Name, keyArr, parentId: entriesId, isKey: true,
+            outerRows, outerOffsets, outerValidity, anyMapNull, anyMapEmpty,
+            listLayer, cancellationToken).ConfigureAwait(false);
+        await EmitMapLeafColumnAsync(
+            valueField.Name, valueArr, parentId: entriesId, isKey: false,
+            outerRows, outerOffsets, outerValidity, anyMapNull, anyMapEmpty,
+            listLayer, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Build and write one leaf column of a Map: rep stream identical to
+    /// the outer-list rep stream; def stream encodes the shared list
+    /// cascade plus this leaf's own nulls. Single chunk; multi-chunk +
+    /// multi-page deferred.
+    /// </summary>
+    private async Task EmitMapLeafColumnAsync(
+        string fieldName, IArrowArray leaf, int parentId, bool isKey,
+        int outerRows, int[] outerOffsets, byte[]? outerValidity,
+        bool anyMapNull, bool anyMapEmpty, RepDefLayer listLayer,
+        CancellationToken cancellationToken)
+    {
+        // Resolve leaf encoding + bytes.
+        byte[] leafBytes;
+        CompressiveEncoding leafEncoding;
+        string leafLogical;
+        bool isVariable = leaf is StringArray or BinaryArray;
+        if (leaf is StringArray sa)
+            (leafBytes, leafEncoding, leafLogical) = BuildVariableLeafSingleChunk(sa, "string");
+        else if (leaf is BinaryArray ba)
+            (leafBytes, leafEncoding, leafLogical) = BuildVariableLeafSingleChunk(ba, "binary");
+        else if (leaf is Decimal128Array d128)
+        {
+            var dt = (Decimal128Type)d128.Data.DataType;
+            (leafBytes, leafEncoding, leafLogical) = BuildFixedLeaf(
+                d128, dt.ByteWidth, $"decimal:128:{dt.Precision}:{dt.Scale}");
+        }
+        else if (leaf is Decimal256Array d256)
+        {
+            var dt = (Decimal256Type)d256.Data.DataType;
+            (leafBytes, leafEncoding, leafLogical) = BuildFixedLeaf(
+                d256, dt.ByteWidth, $"decimal:256:{dt.Precision}:{dt.Scale}");
+        }
+        else if (leaf is Apache.Arrow.Arrays.FixedSizeBinaryArray fsb)
+        {
+            int width = ((FixedSizeBinaryType)fsb.Data.DataType).ByteWidth;
+            (leafBytes, leafEncoding, leafLogical) = BuildFixedLeaf(
+                fsb, width, $"fixed_size_binary:{width}");
+        }
+        else
+        {
+            (leafBytes, leafEncoding, leafLogical) = BuildPrimitiveFlatLeaf(leaf);
+        }
+
+        bool leafNullable = leaf.NullCount > 0;
+        byte[]? leafValidity = leafNullable ? ExtractValidityBitmap(leaf) : null;
+
+        // Layers: [item, entries-struct, list]. The entries struct never
+        // has its own nullability in Apache.Arrow's Map model — it's
+        // ALL_VALID_ITEM (a marker layer that the cascade walker uses to
+        // build a StructArray of length = visibleItems with no own nulls).
+        // Slot positions assigned in cascade order (item first → list last).
+        var itemLayer = leafNullable
+            ? RepDefLayer.RepdefNullableItem
+            : RepDefLayer.RepdefAllValidItem;
+        var entriesLayer = RepDefLayer.RepdefAllValidItem;
+        var layers = new List<RepDefLayer> { itemLayer, entriesLayer, listLayer };
+
+        int next = 1;
+        int itemNullDef = leafNullable ? next++ : 0;
+        // entries layer is ALL_VALID — no slot bump.
+        int listNullDef = 0, listEmptyDef = 0;
+        switch (listLayer)
+        {
+            case RepDefLayer.RepdefNullAndEmptyList:
+                listNullDef = next++; listEmptyDef = next++;
+                break;
+            case RepDefLayer.RepdefNullableList:
+                listNullDef = next++;
+                break;
+            case RepDefLayer.RepdefEmptyableList:
+                listEmptyDef = next++;
+                break;
+        }
+        bool hasDef = leafNullable || anyMapNull || anyMapEmpty;
+
+        // Compute level count and visible items in one pass.
+        int totalLevels = 0;
+        int visibleItems = 0;
+        for (int i = 0; i < outerRows; i++)
+        {
+            bool isNull = anyMapNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
+            int len = isNull ? 0 : outerOffsets[i + 1] - outerOffsets[i];
+            if (isNull || len == 0) totalLevels += 1;
+            else { totalLevels += len; visibleItems += len; }
+        }
+
+        // Build rep + def streams.
+        var rep = new ushort[totalLevels];
+        var def = hasDef ? new ushort[totalLevels] : null;
+        var consumesPerLevel = new bool[totalLevels];
+        int writePos = 0;
+        for (int i = 0; i < outerRows; i++)
+        {
+            bool isNull = anyMapNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
+            int len = isNull ? 0 : outerOffsets[i + 1] - outerOffsets[i];
+            int rowStart = isNull ? 0 : outerOffsets[i];
+            if (isNull)
+            {
+                rep[writePos] = 1;
+                def![writePos] = (ushort)listNullDef;
+                consumesPerLevel[writePos] = false;
+                writePos++;
+            }
+            else if (len == 0)
+            {
+                rep[writePos] = 1;
+                if (hasDef) def![writePos] = (ushort)listEmptyDef;
+                consumesPerLevel[writePos] = false;
+                writePos++;
+            }
+            else
+            {
+                for (int j = 0; j < len; j++)
+                {
+                    rep[writePos] = (ushort)(j == 0 ? 1 : 0);
+                    if (hasDef)
+                    {
+                        bool itemValid = !leafNullable
+                            || (leafValidity![(rowStart + j) >> 3]
+                                & (1 << ((rowStart + j) & 7))) != 0;
+                        def![writePos] = itemValid ? (ushort)0 : (ushort)itemNullDef;
+                    }
+                    consumesPerLevel[writePos] = true;
+                    writePos++;
+                }
+            }
+        }
+
+        // For Variable inner: BuildVariableLeafSingleChunk built `leafBytes`
+        // assuming all leaf items are visible (= length-prefixed offsets +
+        // data for every row of the inner array). That matches when the
+        // inner array length == visibleItems, which is true here because
+        // there's no cascade-skipping (map-null rows simply don't appear in
+        // the inner array — the inner is laid out contiguously).
+        if (isVariable && leaf.Length != visibleItems)
+            throw new InvalidOperationException(
+                $"Map leaf '{fieldName}' length {leaf.Length} doesn't match visible-item " +
+                $"count {visibleItems}; the inner array must contain exactly the visible items.");
+
+        // Sanity: fixed-width leaves should likewise have leaf.Length = visibleItems.
+        if (!isVariable && leaf.Length != visibleItems)
+            throw new InvalidOperationException(
+                $"Map leaf '{fieldName}' length {leaf.Length} doesn't match visible-item " +
+                $"count {visibleItems}.");
+
+        // Single-chunk page only.
+        var chunk = new PageChunk(0, visibleItems, leafBytes,
+            RepLevels: rep, DefLevels: def);
+
+        // Repetition index (depth=1 = one list level).
+        byte[] repIndex = BuildRepetitionIndex(new[] { chunk }, consumesPerLevel);
+
+        var page = await BuildAndWritePageAsync(
+            leafEncoding, visibleItems, new[] { chunk }, layers, cancellationToken,
+            pageLength: outerRows,
+            repetitionIndexBytes: repIndex,
+            repetitionIndexDepth: 1)
+            .ConfigureAwait(false);
+
+        // Register column metadata + the leaf's schema field.
+        var columnEncodingProto = new ColumnEncoding { Values = new Empty() };
+        var columnAny = new Any
+        {
+            TypeUrl = "/lance.encodings.ColumnEncoding",
+            Value = columnEncodingProto.ToByteString(),
+        };
+        var columnEncoding = new Proto.V2.Encoding
+        {
+            Direct = new DirectEncoding { Encoding = columnAny.ToByteString() },
+        };
+        var columnMeta = new ColumnMetadata { Encoding = columnEncoding };
+        columnMeta.Pages.Add(page);
+        _columns.Add(columnMeta);
+
+        var fieldEncoding = leafEncoding.CompressionCase
+                == CompressiveEncoding.CompressionOneofCase.Variable
+            ? Proto.Encoding.VarBinary
+            : Proto.Encoding.Plain;
+        _fields.Add(new Proto.Field
+        {
+            Name = fieldName,
+            Id = _fields.Count,
+            ParentId = parentId,
+            LogicalType = leafLogical,
+            // Map keys are non-nullable in Apache Arrow's MapArray model;
+            // values are nullable. We respect that here.
+            Nullable = !isKey,
+            Encoding = fieldEncoding,
+        });
     }
 
     private async Task WriteListColumnCommonAsync(

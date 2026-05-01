@@ -1442,6 +1442,37 @@ public class PylanceV21Tests
         }
     }
 
+    [Fact]
+    public async Task Map_String_Int32_V22()
+    {
+        // Pylance v2.2 fixture: map<string, int32> with 3 rows.
+        // Row 0: {"a": 1, "b": 2}, row 1: {}, row 2: {"c": 3}.
+        // Schema: parent logical_type="map" → "entries" struct →
+        // {"key": string, "value": int32}.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("map_string_int32_v22.lance"));
+        Assert.Equal(LanceVersion.V2_2, reader.Version);
+        Assert.IsType<MapType>(reader.Schema.FieldsList[0].DataType);
+
+        var arr = (MapArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(3, arr.Length);
+        Assert.Equal(0, arr.NullCount);
+        Assert.Equal(0, arr.ValueOffsets[0]);
+        Assert.Equal(2, arr.ValueOffsets[1]);  // row 0: 2 entries
+        Assert.Equal(2, arr.ValueOffsets[2]);  // row 1: empty
+        Assert.Equal(3, arr.ValueOffsets[3]);  // row 2: 1 entry
+
+        var keys = (StringArray)arr.Keys;
+        var values = (Int32Array)arr.Values;
+        Assert.Equal(3, keys.Length);
+        Assert.Equal("a", keys.GetString(0));
+        Assert.Equal(1, values.GetValue(0));
+        Assert.Equal("b", keys.GetString(1));
+        Assert.Equal(2, values.GetValue(1));
+        Assert.Equal("c", keys.GetString(2));
+        Assert.Equal(3, values.GetValue(2));
+    }
+
     /// <summary>
     /// Mirror of generate_test_data.py's make_string: SHA-256 chain seeded
     /// with the row index, hex-encoded, truncated to <paramref name="size"/>.

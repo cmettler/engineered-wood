@@ -26,17 +26,27 @@ public readonly record struct LanceVersion(ushort Major, ushort Minor)
     public static LanceVersion V2_1 => new(2, 1);
 
     /// <summary>
+    /// v2.2 — adds Map type support and 64 KiB chunks
+    /// (<c>has_large_chunk</c>). On-disk encoding is otherwise compatible
+    /// with v2.1; our reader accepts both interchangeably and our writer
+    /// emits v2.2 only when it must (e.g. a Map column is present).
+    /// </summary>
+    public static LanceVersion V2_2 => new(2, 2);
+
+    /// <summary>
     /// Legacy v0.1 layout. Footer bytes are <c>(major, minor) = (0, 2)</c>
     /// for historical reasons; the on-disk format is entirely different and
     /// not supported by this reader.
     /// </summary>
     public static LanceVersion Legacy_V0_1 => new(0, 2);
 
-    public bool IsSupported => IsV2_0 || IsV2_1;
+    public bool IsSupported => IsV2_0 || IsV2_1 || IsV2_2;
 
     public bool IsV2_0 => this == V2_0 || this == V2_0_Legacy;
 
     public bool IsV2_1 => this == V2_1;
+
+    public bool IsV2_2 => this == V2_2;
 
     public override string ToString() => $"{Major}.{Minor}";
 }

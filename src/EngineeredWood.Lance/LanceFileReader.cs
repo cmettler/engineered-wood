@@ -189,11 +189,12 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
 
         FieldColumnRange[] fieldColumnRanges;
         int expectedColumns;
-        if (footer.Version.IsV2_1)
+        if (footer.Version.IsV2_1 || footer.Version.IsV2_2)
         {
             // v2.1 puts nested structure inside per-column rep/def buffers, so
             // a struct field does not claim an extra "parent column" like it
-            // does in v2.0. Phase 6 handled flat primitives; Phase 7 adds
+            // does in v2.0. v2.2 reuses the v2.1 layout and only adds Map type
+            // support plus 64 KiB chunks; we treat them identically here. Phase 6 handled flat primitives; Phase 7 adds
             // single-column lists (list<primitive>) and strings/binary. Structs
             // and list-of-struct still defer — they need multi-column shared
             // rep/def logic.
@@ -240,6 +241,9 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
 
     private static int LeafColumnCount(IArrowType type) => type switch
     {
+        // MapType extends ListType; check it BEFORE the ListType arm so we
+        // recurse into the entries struct (= 2 leaves: key + value).
+        MapType mt => LeafColumnCount(mt.KeyValueType),
         FixedWidthType => 1,
         StructType st => st.Fields.Sum(f => LeafColumnCount(f.DataType)),
         Apache.Arrow.Types.ListType lt => LeafColumnCount(lt.ValueDataType),
@@ -256,6 +260,10 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             case StringType:
             case BinaryType:
                 return 1;
+            case MapType mt:
+                // Map is structurally List<Struct<key, value>> on disk; recurse
+                // into the entries struct (always exactly 2 leaves).
+                return ValidateAndCountLeavesV21(mt.KeyValueType, $"{fieldPath}{{}}");
             case StructType st:
                 {
                     int total = 0;
@@ -424,7 +432,7 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         var range = _fieldColumnRanges[fieldIndex];
         var arrowField = Schema.FieldsList[fieldIndex];
 
-        if (Version.IsV2_1)
+        if (Version.IsV2_1 || Version.IsV2_2)
         {
             // Phase 7b: structs of primitives are now supported via
             // ReadV21StructAsync. List-of-struct (one Arrow row per top-level
@@ -436,7 +444,9 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             // walker — arbitrary depth, mixed-shape, list-of-struct,
             // struct-of-list all collapse into the same recursion. FSL and
             // top-level primitives stay on the single-column path.
-            if (arrowField.DataType is StructType
+            // MapType is checked first because it derives from ListType.
+            if (arrowField.DataType is MapType
+                or StructType
                 or Apache.Arrow.Types.ListType or LargeListType)
             {
                 var (arr, _, _) = await ReadV21NestedAsync(
@@ -587,10 +597,16 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                     "(only FixedSizeList of primitive items in v2.1).");
             return await ReadV21NestedLeafAsync(type, startColumn, cancellationToken).ConfigureAwait(false);
         }
+        if (type is MapType
+            || type is Apache.Arrow.Types.ListType
+            || type is LargeListType)
+        {
+            // MapType extends ListType; ReadV21NestedListAsync now
+            // dispatches on it and builds a MapArray when appropriate.
+            return await ReadV21NestedListAsync(type, startColumn, cancellationToken).ConfigureAwait(false);
+        }
         if (type is StructType st)
             return await ReadV21NestedStructAsync(st, startColumn, cancellationToken).ConfigureAwait(false);
-        if (type is Apache.Arrow.Types.ListType or LargeListType)
-            return await ReadV21NestedListAsync(type, startColumn, cancellationToken).ConfigureAwait(false);
         throw new NotImplementedException(
             $"Recursive walker for type {type} is not yet supported.");
     }
@@ -1204,12 +1220,16 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
     {
         IArrowType innerType = listType switch
         {
+            // MapType extends ListType, so the inner type is the
+            // entries StructType returned by MapType.KeyValueType.
+            MapType mt => mt.KeyValueType,
             Apache.Arrow.Types.ListType lt => lt.ValueDataType,
             LargeListType llt => llt.ValueDataType,
             _ => throw new LanceFormatException(
                 $"ReadV21NestedListAsync target {listType} is not a list type."),
         };
         bool isLarge = listType is LargeListType;
+        bool isMap = listType is MapType;
 
         var (innerArr, innerAncestors, _) = await ReadV21NestedAsync(
             innerType, startColumn, cancellationToken).ConfigureAwait(false);
@@ -1246,7 +1266,9 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             listType, numRows, listLevel.NullCount, 0,
             new[] { validity, new ArrowBuffer(offsetsBytes) },
             children: new[] { innerArr.Data });
-        IArrowArray listArr = isLarge ? new LargeListArray(listData) : new ListArray(listData);
+        IArrowArray listArr = isMap
+            ? new MapArray(listData)
+            : isLarge ? new LargeListArray(listData) : new ListArray(listData);
 
         var newAncestors = new LevelInfo[innerAncestors.Length - 1];
         System.Array.Copy(innerAncestors, 1, newAncestors, 0, newAncestors.Length);
