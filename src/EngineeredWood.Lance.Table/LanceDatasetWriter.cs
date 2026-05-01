@@ -807,6 +807,305 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     }
 
     /// <summary>
+    /// Updates rows matching <paramref name="predicate"/> by replacing the
+    /// columns named in <paramref name="assignments"/> with the result of
+    /// each assignment expression. Implementation is delete-and-rewrite:
+    /// for each fragment, evaluate the predicate, mark matching rows
+    /// deleted via a deletion file, then append a single new fragment
+    /// holding all updated rows (each row carries the assigned columns'
+    /// fresh values plus the original values for unassigned columns). All
+    /// of this lands in one new manifest version.
+    ///
+    /// <para>Returns <c>(rowsUpdated, version)</c>. <c>rowsUpdated == 0</c>
+    /// means no rows matched and the dataset is unchanged (current
+    /// version returned).</para>
+    ///
+    /// <para><b>Scope</b>: schemas of leaf columns only — primitives
+    /// (int / uint / float / double / etc.), strings, binary, and bool.
+    /// Nested types (struct / list / FSL / map) in the schema cause an
+    /// <see cref="NotSupportedException"/> because the row-by-row take
+    /// helper only handles leaf shapes today.</para>
+    /// </summary>
+    public static async ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
+        string datasetPath, Predicate predicate,
+        IReadOnlyDictionary<string, Expression> assignments,
+        CancellationToken cancellationToken = default)
+    {
+        if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
+        if (assignments is null) throw new ArgumentNullException(nameof(assignments));
+        if (assignments.Count == 0)
+            throw new ArgumentException(
+                "At least one assignment is required.", nameof(assignments));
+        if (!Directory.Exists(datasetPath)
+            || !Directory.Exists(Path.Combine(datasetPath, "_versions")))
+            throw new InvalidOperationException(
+                $"Path '{datasetPath}' does not contain a Lance dataset.");
+
+        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
+        var entry = await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
+            .ConfigureAwait(false);
+        var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
+            .ConfigureAwait(false);
+
+        var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
+        lanceSchema.Fields.AddRange(manifest.Fields);
+        var arrowSchema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
+
+        // Validate that every assignment column exists in the schema.
+        var nameToIdx = new Dictionary<string, int>(arrowSchema.FieldsList.Count, StringComparer.Ordinal);
+        for (int i = 0; i < arrowSchema.FieldsList.Count; i++)
+            nameToIdx[arrowSchema.FieldsList[i].Name] = i;
+        foreach (string col in assignments.Keys)
+        {
+            if (!nameToIdx.ContainsKey(col))
+                throw new ArgumentException(
+                    $"Assignment references unknown column '{col}'. " +
+                    $"Available: [{string.Join(", ", nameToIdx.Keys)}].",
+                    nameof(assignments));
+        }
+
+        var evaluator = new ArrowRowEvaluator();
+        var perFragmentDeletes = new Dictionary<ulong, List<int>>();
+        var perColumnSlices = new List<IArrowArray>[arrowSchema.FieldsList.Count];
+        for (int i = 0; i < perColumnSlices.Length; i++)
+            perColumnSlices[i] = new List<IArrowArray>();
+
+        long totalUpdated = 0;
+        foreach (var fragment in manifest.Fragments)
+        {
+            DataFile file = fragment.Files[0];
+            string relPath = "data/" + file.Path;
+            await using IRandomAccessFile raf = await fs.OpenReadAsync(relPath, cancellationToken)
+                .ConfigureAwait(false);
+            await using var reader = await EngineeredWood.Lance.LanceFileReader
+                .OpenAsync(raf, ownsReader: false, cancellationToken)
+                .ConfigureAwait(false);
+
+            int rowCount = checked((int)reader.NumberOfRows);
+            var arrays = new IArrowArray[arrowSchema.FieldsList.Count];
+            for (int i = 0; i < arrays.Length; i++)
+                arrays[i] = await reader.ReadColumnAsync(i, cancellationToken)
+                    .ConfigureAwait(false);
+            var batch = new RecordBatch(arrowSchema, arrays, rowCount);
+
+            DeletionMask? existing = null;
+            if (fragment.DeletionFile is not null && fragment.DeletionFile.NumDeletedRows > 0)
+            {
+                existing = await DeletionFileReader.ReadAsync(
+                    fs, fragment.Id, fragment.DeletionFile, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            BooleanArray mask = evaluator.EvaluatePredicate(predicate, batch);
+            var matching = new List<int>();
+            for (int i = 0; i < rowCount; i++)
+            {
+                if (existing is not null && existing.IsDeleted(i)) continue;
+                bool? v = mask.IsNull(i) ? (bool?)null : mask.GetValue(i);
+                if (v == true) matching.Add(i);
+            }
+            if (matching.Count == 0) continue;
+
+            // Evaluate each assigned expression once over the full batch;
+            // we'll take its values at matching indices below.
+            var assignedArrays = new Dictionary<int, IArrowArray>(assignments.Count);
+            foreach (var kv in assignments)
+            {
+                int colIdx = nameToIdx[kv.Key];
+                assignedArrays[colIdx] = evaluator.EvaluateExpression(kv.Value, batch);
+            }
+
+            // For each schema column, take the values at matching indices —
+            // assigned columns from the evaluated expression, the rest from
+            // the original column array.
+            for (int colIdx = 0; colIdx < arrays.Length; colIdx++)
+            {
+                IArrowArray source = assignedArrays.TryGetValue(colIdx, out var assigned)
+                    ? assigned
+                    : arrays[colIdx];
+                IArrowArray taken = TakeRows(
+                    source, matching, arrowSchema.FieldsList[colIdx].DataType);
+                perColumnSlices[colIdx].Add(taken);
+            }
+
+            perFragmentDeletes[fragment.Id] = matching;
+            totalUpdated += matching.Count;
+        }
+
+        if (totalUpdated == 0)
+            return (0, (long)manifest.Version);
+
+        // ── Concatenate per-column slices and write the new fragment ──
+        var newFragArrays = new IArrowArray[perColumnSlices.Length];
+        for (int i = 0; i < perColumnSlices.Length; i++)
+            newFragArrays[i] = perColumnSlices[i].Count == 1
+                ? perColumnSlices[i][0]
+                : ArrowArrayConcatenator.Concatenate(perColumnSlices[i]);
+
+        Directory.CreateDirectory(Path.Combine(datasetPath, "data"));
+        Directory.CreateDirectory(Path.Combine(datasetPath, "_deletions"));
+        Directory.CreateDirectory(Path.Combine(datasetPath, "_transactions"));
+        string newDataFileName = Guid.NewGuid().ToString("N") + ".lance";
+        string newDataFilePath = Path.Combine(datasetPath, "data", newDataFileName);
+        LanceVersion newFileVersion;
+        IReadOnlyList<LanceField> newFileFields;
+        await using (var w = await EngineeredWood.Lance.LanceFileWriter
+            .CreateAsync(newDataFilePath, cancellationToken).ConfigureAwait(false))
+        {
+            for (int i = 0; i < arrowSchema.FieldsList.Count; i++)
+            {
+                await w.WriteColumnAsync(
+                    arrowSchema.FieldsList[i].Name, newFragArrays[i], cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            await w.FinishAsync(cancellationToken).ConfigureAwait(false);
+            newFileVersion = w.Version;
+            newFileFields = w.SchemaFields.Select(f => f.Clone()).ToList();
+        }
+        long newDataFileSize = new FileInfo(newDataFilePath).Length;
+
+        // ── Write deletion files for affected fragments ──
+        ulong newVersion = manifest.Version + 1;
+        ulong newDeletionId = newVersion;
+
+        var newFragmentsList = new List<DataFragment>(manifest.Fragments.Count + 1);
+        ulong maxFragId = 0;
+        foreach (var oldFrag in manifest.Fragments)
+        {
+            if (oldFrag.Id > maxFragId) maxFragId = oldFrag.Id;
+
+            DataFragment newFrag;
+            if (perFragmentDeletes.TryGetValue(oldFrag.Id, out var matched))
+            {
+                var merged = new HashSet<int>();
+                if (oldFrag.DeletionFile is not null && oldFrag.DeletionFile.NumDeletedRows > 0)
+                {
+                    var existingMask = await DeletionFileReader.ReadAsync(
+                        fs, oldFrag.Id, oldFrag.DeletionFile, cancellationToken)
+                        .ConfigureAwait(false);
+                    foreach (int off in existingMask.DeletedOffsets) merged.Add(off);
+                }
+                foreach (int off in matched) merged.Add(off);
+
+                string deletionFileName = $"{oldFrag.Id}-{manifest.Version}-{newDeletionId}.arrow";
+                string deletionFilePath = Path.Combine(
+                    datasetPath, "_deletions", deletionFileName);
+                await WriteDeletionFileArrowAsync(deletionFilePath, merged, cancellationToken)
+                    .ConfigureAwait(false);
+
+                newFrag = oldFrag.Clone();
+                newFrag.DeletionFile = new DeletionFile
+                {
+                    FileType = DeletionFile.Types.DeletionFileType.ArrowArray,
+                    ReadVersion = manifest.Version,
+                    Id = newDeletionId,
+                    NumDeletedRows = (ulong)merged.Count,
+                };
+            }
+            else
+            {
+                newFrag = oldFrag.Clone();
+            }
+            newFragmentsList.Add(newFrag);
+        }
+
+        // ── Append the new fragment with the updated rows ──
+        var newDataFileProto = new DataFile
+        {
+            Path = newDataFileName,
+            FileMajorVersion = (uint)newFileVersion.Major,
+            FileMinorVersion = (uint)newFileVersion.Minor,
+            FileSizeBytes = (ulong)newDataFileSize,
+        };
+        for (int i = 0; i < newFileFields.Count; i++)
+        {
+            newDataFileProto.Fields.Add(newFileFields[i].Id);
+            newDataFileProto.ColumnIndices.Add(i);
+        }
+        var newFragmentForUpdates = new DataFragment
+        {
+            Id = maxFragId + 1,
+            PhysicalRows = (ulong)totalUpdated,
+        };
+        newFragmentForUpdates.Files.Add(newDataFileProto);
+        newFragmentsList.Add(newFragmentForUpdates);
+
+        // ── Build the new manifest ──
+        string txnUuid = Guid.NewGuid().ToString();
+        string txnFileName = $"{manifest.Version}-{txnUuid}.txn";
+        var transaction = new Transaction
+        {
+            ReadVersion = manifest.Version,
+            Uuid = txnUuid,
+        };
+        byte[] transactionBytes = transaction.ToByteArray();
+        await File.WriteAllBytesAsync(
+            Path.Combine(datasetPath, "_transactions", txnFileName),
+            transactionBytes, cancellationToken).ConfigureAwait(false);
+
+        var newManifest = new LanceManifest
+        {
+            Version = newVersion,
+            TransactionFile = txnFileName,
+            DataFormat = manifest.DataFormat?.Clone() ?? new LanceManifest.Types.DataStorageFormat
+            {
+                FileFormat = "lance",
+                Version = $"{newFileVersion.Major}.{newFileVersion.Minor}",
+            },
+        };
+        newManifest.Fields.AddRange(manifest.Fields);
+        newManifest.Fragments.AddRange(newFragmentsList);
+
+        await WriteManifestFileAsync(datasetPath, newManifest, transactionBytes, cancellationToken)
+            .ConfigureAwait(false);
+
+        return (totalUpdated, (long)newVersion);
+    }
+
+    /// <summary>
+    /// Build a new array containing values from <paramref name="source"/>
+    /// at the given row indices, in order. Used by
+    /// <see cref="UpdateAsync"/> when assembling the rewrite-fragment from
+    /// matching rows. Currently handles primitive numeric types, Bool,
+    /// String, and Binary; nested types throw <see cref="NotSupportedException"/>.
+    /// </summary>
+    private static IArrowArray TakeRows(
+        IArrowArray source, IReadOnlyList<int> indices, IArrowType expectedType)
+    {
+        switch (source)
+        {
+            case Int8Array a: { var b = new Int8Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
+            case UInt8Array a: { var b = new UInt8Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
+            case Int16Array a: { var b = new Int16Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
+            case UInt16Array a: { var b = new UInt16Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
+            case Int32Array a: { var b = new Int32Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
+            case UInt32Array a: { var b = new UInt32Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
+            case Int64Array a: { var b = new Int64Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
+            case UInt64Array a: { var b = new UInt64Array.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
+            case FloatArray a: { var b = new FloatArray.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
+            case DoubleArray a: { var b = new DoubleArray.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
+            case BooleanArray a: { var b = new BooleanArray.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); } return b.Build(); }
+            case StringArray a: { var b = new StringArray.Builder().Reserve(indices.Count); foreach (int i in indices) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetString(i)!); } return b.Build(); }
+            case BinaryArray a:
+            {
+                var b = new BinaryArray.Builder().Reserve(indices.Count);
+                foreach (int i in indices)
+                {
+                    if (a.IsNull(i)) b.AppendNull();
+                    else b.Append(a.GetBytes(i));
+                }
+                return b.Build();
+            }
+            default:
+                throw new NotSupportedException(
+                    $"UpdateAsync's row-take helper doesn't yet support column type " +
+                    $"'{expectedType}' (source array: {source.GetType().Name}). " +
+                    "Currently supported: Int / UInt / Float / Double / Bool / String / Binary.");
+        }
+    }
+
+    /// <summary>
     /// Write a Lance Arrow-IPC deletion file: a single record batch with
     /// one column of deleted row offsets in ascending order. The proto
     /// comment says "Int32Array" but pylance / lance-rs require a strict

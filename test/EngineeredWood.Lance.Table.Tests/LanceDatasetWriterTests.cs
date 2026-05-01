@@ -802,6 +802,267 @@ public class LanceDatasetWriterTests
     }
 
     [Fact]
+    public async Task Update_SetSingleColumn_ToLiteral()
+    {
+        // SET x = 99 WHERE x > 2 — over a 5-row dataset, rows 3 & 4 (values
+        // 3 and 4) should be replaced with 99 each.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 0, 1, 2, 3, 4 });
+                await ds.FinishAsync();
+            }
+
+            var pred = Expressions.Expressions.GreaterThan("x", LiteralValue.Of(2));
+            var assignments = new Dictionary<string, Expression>
+            {
+                ["x"] = new LiteralExpression(LiteralValue.Of(99)),
+            };
+            var (rowsUpdated, version) = await LanceDatasetWriter.UpdateAsync(path, pred, assignments);
+            Assert.Equal(2L, rowsUpdated);
+            Assert.Equal(2L, version);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            int[] survivors = await ReadInt32ColumnAsync(table, "x");
+            // Original survivors: 0, 1, 2; new fragment: 99, 99 (the rewritten rows).
+            // Reading via fragment order gives [0, 1, 2, 99, 99].
+            Assert.Equal(new[] { 0, 1, 2, 99, 99 }, survivors);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Update_NoMatches_NoOp()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+            var pred = Expressions.Expressions.GreaterThan("x", LiteralValue.Of(100));
+            var assignments = new Dictionary<string, Expression>
+            {
+                ["x"] = new LiteralExpression(LiteralValue.Of(0)),
+            };
+            var (rowsUpdated, version) = await LanceDatasetWriter.UpdateAsync(path, pred, assignments);
+            Assert.Equal(0L, rowsUpdated);
+            Assert.Equal(1L, version);  // current version
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Update_PreservesUnassignedColumns()
+    {
+        // Two columns, only one in the assignment. The other should
+        // round-trip its original values for the rewritten rows.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 1, 2, 3 });
+                var sb = new StringArray.Builder();
+                sb.Append("alice").Append("bob").Append("carol");
+                await ds.FileWriter.WriteColumnAsync("name", sb.Build());
+                await ds.FinishAsync();
+            }
+
+            var pred = Expressions.Expressions.GreaterThan("id", LiteralValue.Of(1));
+            var assignments = new Dictionary<string, Expression>
+            {
+                ["name"] = new LiteralExpression(LiteralValue.Of("UPDATED")),
+            };
+            await LanceDatasetWriter.UpdateAsync(path, pred, assignments);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            var ids = new List<int>();
+            var names = new List<string>();
+            await foreach (var batch in table.ReadAsync())
+            {
+                int idIdx = batch.Schema.GetFieldIndex("id");
+                int nameIdx = batch.Schema.GetFieldIndex("name");
+                var idArr = (Int32Array)batch.Column(idIdx);
+                var nameArr = (StringArray)batch.Column(nameIdx);
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    ids.Add(idArr.GetValue(i)!.Value);
+                    names.Add(nameArr.GetString(i)!);
+                }
+            }
+            // Order: original survivors (id=1) first, then rewrite fragment
+            // (id=2 and id=3, both with name "UPDATED").
+            Assert.Equal(new[] { 1, 2, 3 }, ids);
+            Assert.Equal(new[] { "alice", "UPDATED", "UPDATED" }, names);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Update_RejectsUnknownColumn()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1 });
+                await ds.FinishAsync();
+            }
+            var pred = Expressions.Expressions.Equal("x", LiteralValue.Of(1));
+            var assignments = new Dictionary<string, Expression>
+            {
+                ["nope"] = new LiteralExpression(LiteralValue.Of(0)),
+            };
+            await Assert.ThrowsAsync<ArgumentException>(async () =>
+                await LanceDatasetWriter.UpdateAsync(path, pred, assignments));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Update_PreviousVersionStillReadable()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 10, 20, 30 });
+                await ds.FinishAsync();
+            }
+
+            var pred = Expressions.Expressions.GreaterThanOrEqual("x", LiteralValue.Of(20));
+            var assignments = new Dictionary<string, Expression>
+            {
+                ["x"] = new LiteralExpression(LiteralValue.Of(0)),
+            };
+            await LanceDatasetWriter.UpdateAsync(path, pred, assignments);
+
+            await using var v1 = await LanceTable.OpenAsync(path, version: 1);
+            int[] before = await ReadInt32ColumnAsync(v1, "x");
+            Assert.Equal(new[] { 10, 20, 30 }, before);
+
+            await using var v2 = await LanceTable.OpenAsync(path, version: 2);
+            int[] after = await ReadInt32ColumnAsync(v2, "x");
+            Assert.Equal(new[] { 10, 0, 0 }, after);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Update_AcrossMultipleFragments()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+                await ds.NewFragmentAsync();
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 4, 5, 6 });
+                await ds.FinishAsync();
+            }
+            var pred = Expressions.Expressions.LessThan("x", LiteralValue.Of(5));
+            var assignments = new Dictionary<string, Expression>
+            {
+                ["x"] = new LiteralExpression(LiteralValue.Of(-1)),
+            };
+            var (rowsUpdated, _) = await LanceDatasetWriter.UpdateAsync(path, pred, assignments);
+            Assert.Equal(4L, rowsUpdated);  // fragment 0 all 3 rows + fragment 1 row 4 only
+
+            await using var table = await LanceTable.OpenAsync(path);
+            int[] survivors = await ReadInt32ColumnAsync(table, "x");
+            // Surviving originals: from frag0 nothing, from frag1: 5, 6.
+            // Rewrite fragment: -1 four times.
+            Assert.Equal(new[] { 5, 6, -1, -1, -1, -1 }, survivors);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Update_CrossValidatedAgainstPylance()
+    {
+        if (!IsPythonAvailable()) return;
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 1, 2, 3, 4 });
+                var sb = new StringArray.Builder();
+                sb.Append("a").Append("b").Append("c").Append("d");
+                await ds.FileWriter.WriteColumnAsync("tag", sb.Build());
+                await ds.FinishAsync();
+            }
+            var pred = Expressions.Expressions.GreaterThanOrEqual("id", LiteralValue.Of(3));
+            var assignments = new Dictionary<string, Expression>
+            {
+                ["tag"] = new LiteralExpression(LiteralValue.Of("ZZ")),
+            };
+            await LanceDatasetWriter.UpdateAsync(path, pred, assignments);
+
+            string script = "import sys, json, lance\n" +
+                $"ds = lance.dataset(r'{path}')\n" +
+                "t = ds.to_table()\n" +
+                "out = sorted(zip(t['id'].to_pylist(), t['tag'].to_pylist()))\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            // Sorted (id, tag) pairs: ids 1..4, tags a/b/ZZ/ZZ.
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            var pairs = json.RootElement.EnumerateArray().ToArray();
+            Assert.Equal(4, pairs.Length);
+            Assert.Equal(1, pairs[0][0].GetInt32());
+            Assert.Equal("a", pairs[0][1].GetString());
+            Assert.Equal(2, pairs[1][0].GetInt32());
+            Assert.Equal("b", pairs[1][1].GetString());
+            Assert.Equal(3, pairs[2][0].GetInt32());
+            Assert.Equal("ZZ", pairs[2][1].GetString());
+            Assert.Equal(4, pairs[3][0].GetInt32());
+            Assert.Equal("ZZ", pairs[3][1].GetString());
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task DeleteByPredicate_CrossValidatedAgainstPylance()
     {
         if (!IsPythonAvailable()) return;
