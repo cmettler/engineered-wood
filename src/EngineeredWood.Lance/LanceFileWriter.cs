@@ -69,6 +69,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
     private readonly ISequentialFile _file;
     private readonly bool _ownsFile;
     private readonly LanceVersion _version;
+    private readonly LanceCompressionScheme _compression;
     private readonly List<Proto.Field> _fields = new();
     private readonly List<ColumnMetadata> _columns = new();
     private long _totalRows = -1;
@@ -97,41 +98,77 @@ public sealed class LanceFileWriter : IAsyncDisposable
 
     internal LanceVersion Version => _version;
 
-    private LanceFileWriter(ISequentialFile file, bool ownsFile, LanceVersion version)
+    private LanceFileWriter(
+        ISequentialFile file, bool ownsFile, LanceVersion version,
+        LanceCompressionScheme compression)
     {
         _file = file;
         _ownsFile = ownsFile;
         _version = version;
+        _compression = compression;
     }
 
     /// <summary>
     /// Creates a writer over a caller-provided <see cref="ISequentialFile"/>.
     /// The caller controls the file's lifetime when <paramref name="ownsFile"/>
-    /// is <c>false</c>.
+    /// is <c>false</c>. <paramref name="compression"/> controls per-chunk
+    /// value-buffer compression; see <see cref="LanceCompressionScheme"/>.
     /// </summary>
-    public static LanceFileWriter Create(ISequentialFile file, bool ownsFile = false)
+    public static LanceFileWriter Create(
+        ISequentialFile file, bool ownsFile = false,
+        LanceCompressionScheme compression = LanceCompressionScheme.None)
     {
         if (file is null) throw new ArgumentNullException(nameof(file));
-        return new LanceFileWriter(file, ownsFile, LanceVersion.V2_1);
+        return new LanceFileWriter(file, ownsFile, LanceVersion.V2_1, compression);
     }
 
     /// <summary>
     /// Creates a writer that emits to <paramref name="path"/> on the local
     /// filesystem, overwriting any existing file. The returned writer owns
-    /// the underlying file handle.
+    /// the underlying file handle. <paramref name="compression"/> controls
+    /// per-chunk value-buffer compression; see <see cref="LanceCompressionScheme"/>.
     /// </summary>
     public static async ValueTask<LanceFileWriter> CreateAsync(
-        string path, CancellationToken cancellationToken = default)
+        string path, CancellationToken cancellationToken = default,
+        LanceCompressionScheme compression = LanceCompressionScheme.None)
     {
         var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(
             System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path))!);
         var seq = await fs.CreateAsync(
             System.IO.Path.GetFileName(path), overwrite: true, cancellationToken).ConfigureAwait(false);
-        return new LanceFileWriter(seq, ownsFile: true, LanceVersion.V2_1);
+        return new LanceFileWriter(seq, ownsFile: true, LanceVersion.V2_1, compression);
     }
 
     private static CompressiveEncoding FlatEncoding(int bitsPerValue) =>
         new() { Flat = new Proto.Encodings.V21.Flat { BitsPerValue = (ulong)bitsPerValue } };
+
+    /// <summary>
+    /// ZSTD-compress every chunk's value buffer in-place (as a new array
+    /// of <see cref="PageChunk"/>). Each chunk's <c>ValueBuf</c> is
+    /// replaced with a single ZSTD frame; the rep / def streams are
+    /// preserved verbatim. Used when wrapping a Flat value encoding in
+    /// <c>General(ZSTD, Flat(...))</c>.
+    /// </summary>
+    private static IReadOnlyList<PageChunk> CompressFlatChunksZstd(
+        IReadOnlyList<PageChunk> chunks)
+    {
+        var result = new PageChunk[chunks.Count];
+        for (int c = 0; c < chunks.Count; c++)
+        {
+            var src = chunks[c].ValueBuf;
+            int maxOut = EngineeredWood.Compression.Compressor
+                .GetMaxCompressedLength(EngineeredWood.Compression.CompressionCodec.Zstd, src.Length);
+            byte[] scratch = new byte[maxOut];
+            int actual = EngineeredWood.Compression.Compressor.Compress(
+                EngineeredWood.Compression.CompressionCodec.Zstd, src, scratch);
+            byte[] compressed = new byte[actual];
+            new ReadOnlySpan<byte>(scratch, 0, actual).CopyTo(compressed);
+            result[c] = new PageChunk(
+                chunks[c].ItemStart, chunks[c].ItemCount, compressed,
+                RepLevels: chunks[c].RepLevels, DefLevels: chunks[c].DefLevels);
+        }
+        return result;
+    }
 
     /// <summary>
     /// Test-only: write a non-nullable <see cref="int"/> column whose values
@@ -2277,6 +2314,33 @@ public sealed class LanceFileWriter : IAsyncDisposable
         int N = chunks.Count;
         bool hasRep = N > 0 && chunks[0].RepLevels is not null;
         bool hasDef = N > 0 && chunks[0].DefLevels is not null;
+
+        // Optionally wrap the value buffer in General(ZSTD, original) per
+        // chunk. The reader's DecodeFixedWidthMiniBlock unwraps this for
+        // fixed-width primitive Flat values; FSL, Bool, Variable, and
+        // nested cascades aren't yet supported on the reader's compressed
+        // path so we limit wrapping to the scope they accept.
+        if (_compression == LanceCompressionScheme.Zstd
+            && !hasRep
+            && layers.Count == 1
+            && valueEncoding.CompressionCase == CompressiveEncoding.CompressionOneofCase.Flat
+            && valueEncoding.Flat.BitsPerValue >= 8
+            && valueEncoding.Flat.BitsPerValue % 8 == 0)
+        {
+            chunks = CompressFlatChunksZstd(chunks);
+            valueEncoding = new CompressiveEncoding
+            {
+                General = new Proto.Encodings.V21.General
+                {
+                    Compression = new Proto.Encodings.V21.BufferCompression
+                    {
+                        Scheme = Proto.Encodings.V21.CompressionScheme.CompressionAlgorithmZstd,
+                    },
+                    Values = valueEncoding,
+                },
+            };
+        }
+
         // num_levels (u16) + optional rep_size (u16) + optional def_size (u16)
         // + value_buf_size (u16).
         int headerLen = 2 + (hasRep ? 2 : 0) + (hasDef ? 2 : 0) + 2;
@@ -2357,12 +2421,18 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 cursor += 2;
             }
             // Pylance writes valueBufSize ROUNDED UP to the 8-byte mini-block
-            // alignment, not the unpadded value length. Its lance.dataset()
+            // alignment for raw Flat / Variable encodings — its lance.dataset()
             // decoder reads the value buffer as a fixed-width slice and panics
             // when the declared size is not a multiple of the element width
-            // (e.g. 4-byte u32 offsets for Variable encoding). Match the
-            // convention so our datasets open in lance.dataset().
-            int valueBufLenOnDisk = AlignUp(valueBufLen, MiniBlockAlignment);
+            // (e.g. 4-byte u32 offsets for Variable). For General(ZSTD) wraps
+            // we write the EXACT compressed-frame length: the reader slices
+            // `valueBufSize` bytes and hands them straight to ZSTD, which
+            // rejects trailing padding bytes as "Src size is incorrect".
+            bool isZstdWrap = valueEncoding.CompressionCase
+                == CompressiveEncoding.CompressionOneofCase.General;
+            int valueBufLenOnDisk = isZstdWrap
+                ? valueBufLen
+                : AlignUp(valueBufLen, MiniBlockAlignment);
             BinaryPrimitives.WriteUInt16LittleEndian(
                 cb.AsSpan(cursor, 2), checked((ushort)valueBufLenOnDisk));
 
@@ -2755,4 +2825,21 @@ public sealed class LanceFileWriter : IAsyncDisposable
         if (_ownsFile)
             await _file.DisposeAsync().ConfigureAwait(false);
     }
+}
+
+/// <summary>
+/// Per-chunk value-buffer compression scheme applied by
+/// <see cref="LanceFileWriter"/>. Currently the writer only wraps fixed-
+/// width primitive Flat-encoded chunks (int / uint / float / double /
+/// Decimal128/256 / FixedSizeBinary / Date / Time / Timestamp / Duration)
+/// in a <c>General(scheme, Flat(...))</c> envelope. Bool, FSL, list inner
+/// values, and Variable string/binary stay uncompressed (the reader
+/// doesn't yet unwrap General(ZSTD) on those shapes).
+/// </summary>
+public enum LanceCompressionScheme
+{
+    /// <summary>No compression — raw Flat encoding (default).</summary>
+    None = 0,
+    /// <summary>ZSTD frame per chunk value buffer.</summary>
+    Zstd = 1,
 }

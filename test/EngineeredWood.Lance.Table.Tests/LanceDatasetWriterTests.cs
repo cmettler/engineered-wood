@@ -576,6 +576,50 @@ public class LanceDatasetWriterTests
     }
 
     [Fact]
+    public async Task Dataset_ZstdCompression_RoundTrip()
+    {
+        // Pass-through test: dataset writer threads the ZSTD scheme into
+        // every fragment's LanceFileWriter and reading via LanceTable still
+        // returns the same data. Larger column to see meaningful compression.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            const int N = 30_000;
+            var values = new int[N];
+            for (int i = 0; i < N; i++) values[i] = i % 100;
+
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path,
+                compression: LanceCompressionScheme.Zstd))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", values);
+                await ds.FinishAsync();
+            }
+
+            // The data file should have shrunk noticeably from raw 4×N bytes.
+            var dataFiles = Directory.GetFiles(Path.Combine(path, "data"), "*.lance");
+            Assert.Single(dataFiles);
+            long fileSize = new FileInfo(dataFiles[0]).Length;
+            Assert.True(fileSize < N * 4 / 2,
+                $"Expected compressed data file < half raw size; got {fileSize} vs {N * 4}.");
+
+            await using var table = await LanceTable.OpenAsync(path);
+            Assert.Equal((long)N, table.NumberOfRows);
+            int rowCursor = 0;
+            await foreach (var batch in table.ReadAsync())
+            {
+                var arr = (Int32Array)batch.Column(0);
+                for (int i = 0; i < arr.Length; i++)
+                    Assert.Equal(rowCursor++ % 100, arr.GetValue(i));
+            }
+            Assert.Equal(N, rowCursor);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task Append_CrossValidatedAgainstPylance()
     {
         // Write v1 + append v2 with our writer, then have pylance read

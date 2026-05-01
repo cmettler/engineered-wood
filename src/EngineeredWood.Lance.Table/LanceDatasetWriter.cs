@@ -60,6 +60,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
     private readonly string _datasetPath;
     private readonly LanceWriteMode _mode;
+    private readonly LanceCompressionScheme _compression;
     // For Append: the existing manifest (its fields are preserved, its
     // fragments are carried forward). For Create/Overwrite: null.
     private readonly LanceManifest? _baseManifest;
@@ -86,11 +87,13 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     public LanceFileWriter FileWriter => _currentFileWriter;
 
     private LanceDatasetWriter(
-        string datasetPath, LanceWriteMode mode, LanceManifest? baseManifest,
-        ulong readVersion, LanceFileWriter fileWriter, string dataFileName)
+        string datasetPath, LanceWriteMode mode, LanceCompressionScheme compression,
+        LanceManifest? baseManifest, ulong readVersion,
+        LanceFileWriter fileWriter, string dataFileName)
     {
         _datasetPath = datasetPath;
         _mode = mode;
+        _compression = compression;
         _baseManifest = baseManifest;
         _readVersion = readVersion;
         _currentFileWriter = fileWriter;
@@ -104,8 +107,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// <see cref="OverwriteAsync"/> for those cases.
     /// </summary>
     public static ValueTask<LanceDatasetWriter> CreateAsync(
-        string datasetPath, CancellationToken cancellationToken = default)
-        => OpenInternalAsync(datasetPath, LanceWriteMode.Create, cancellationToken);
+        string datasetPath, CancellationToken cancellationToken = default,
+        LanceCompressionScheme compression = LanceCompressionScheme.None)
+        => OpenInternalAsync(datasetPath, LanceWriteMode.Create, compression, cancellationToken);
 
     /// <summary>
     /// Opens an existing Lance dataset for appending new fragments. The
@@ -114,8 +118,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// at <paramref name="datasetPath"/>.
     /// </summary>
     public static ValueTask<LanceDatasetWriter> AppendAsync(
-        string datasetPath, CancellationToken cancellationToken = default)
-        => OpenInternalAsync(datasetPath, LanceWriteMode.Append, cancellationToken);
+        string datasetPath, CancellationToken cancellationToken = default,
+        LanceCompressionScheme compression = LanceCompressionScheme.None)
+        => OpenInternalAsync(datasetPath, LanceWriteMode.Append, compression, cancellationToken);
 
     /// <summary>
     /// Opens an existing Lance dataset (or creates a new one) and prepares
@@ -125,11 +130,14 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// for a future vacuum step to clean up.
     /// </summary>
     public static ValueTask<LanceDatasetWriter> OverwriteAsync(
-        string datasetPath, CancellationToken cancellationToken = default)
-        => OpenInternalAsync(datasetPath, LanceWriteMode.Overwrite, cancellationToken);
+        string datasetPath, CancellationToken cancellationToken = default,
+        LanceCompressionScheme compression = LanceCompressionScheme.None)
+        => OpenInternalAsync(datasetPath, LanceWriteMode.Overwrite, compression, cancellationToken);
 
     private static async ValueTask<LanceDatasetWriter> OpenInternalAsync(
-        string datasetPath, LanceWriteMode mode, CancellationToken cancellationToken)
+        string datasetPath, LanceWriteMode mode,
+        LanceCompressionScheme compression,
+        CancellationToken cancellationToken)
     {
         if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
 
@@ -193,11 +201,12 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
         string dataFileName = Guid.NewGuid().ToString("N") + ".lance";
         string dataFilePath = Path.Combine(datasetPath, "data", dataFileName);
-        var fileWriter = await LanceFileWriter.CreateAsync(dataFilePath, cancellationToken)
-            .ConfigureAwait(false);
+        var fileWriter = await LanceFileWriter.CreateAsync(
+            dataFilePath, cancellationToken, compression).ConfigureAwait(false);
 
         return new LanceDatasetWriter(
-            datasetPath, mode, baseManifest, readVersion, fileWriter, dataFileName);
+            datasetPath, mode, compression, baseManifest, readVersion,
+            fileWriter, dataFileName);
     }
 
     /// <summary>
@@ -224,8 +233,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         // Open the next fragment's writer.
         string newName = Guid.NewGuid().ToString("N") + ".lance";
         string newPath = Path.Combine(_datasetPath, "data", newName);
-        _currentFileWriter = await LanceFileWriter.CreateAsync(newPath, cancellationToken)
-            .ConfigureAwait(false);
+        _currentFileWriter = await LanceFileWriter.CreateAsync(
+            newPath, cancellationToken, _compression).ConfigureAwait(false);
         _currentDataFileName = newName;
     }
 

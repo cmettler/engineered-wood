@@ -981,6 +981,209 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task Int32_Zstd_RoundTrip_ViaOurReader()
+    {
+        // 50,000 redundant int32s — should compress dramatically.
+        // Validates: writer wraps in General(ZSTD, Flat(32)); reader
+        // unwraps in DecodeFixedWidthMiniBlock; values match.
+        const int N = 50_000;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < N; i++) b.Append(i % 100);
+        var arr = b.Build();
+
+        string compressedPath = Path.Combine(Path.GetTempPath(), $"ew-zstd-{Guid.NewGuid():N}.lance");
+        string rawPath = Path.Combine(Path.GetTempPath(), $"ew-raw-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var w = await LanceFileWriter.CreateAsync(compressedPath,
+                compression: LanceCompressionScheme.Zstd))
+            {
+                await w.WriteColumnAsync("x", arr);
+                await w.FinishAsync();
+            }
+            await using (var w = await LanceFileWriter.CreateAsync(rawPath))
+            {
+                await w.WriteColumnAsync("x", arr);
+                await w.FinishAsync();
+            }
+
+            // Compressed file should be substantially smaller than raw.
+            long compressedSize = new FileInfo(compressedPath).Length;
+            long rawSize = new FileInfo(rawPath).Length;
+            Assert.True(compressedSize < rawSize / 2,
+                $"Expected compressed file < half of raw; got {compressedSize} vs {rawSize}.");
+
+            await using var reader = await LanceFileReader.OpenAsync(compressedPath);
+            var read = (Int32Array)await reader.ReadColumnAsync(0);
+            Assert.Equal(N, read.Length);
+            for (int i = 0; i < N; i++)
+                Assert.Equal(i % 100, read.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(compressedPath)) File.Delete(compressedPath);
+            if (File.Exists(rawPath)) File.Delete(rawPath);
+        }
+    }
+
+    [Fact]
+    public async Task Int32_Zstd_WithNulls_RoundTrip_ViaOurReader()
+    {
+        // NULLABLE_ITEM cascade combined with ZSTD value-buffer wrap. The
+        // def buffer is NOT compressed — only the inner Flat values are.
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < 1000; i++)
+        {
+            if (i % 7 == 0) b.AppendNull();
+            else b.Append(i);
+        }
+        var arr = b.Build();
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-zstdnul-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var w = await LanceFileWriter.CreateAsync(path,
+                compression: LanceCompressionScheme.Zstd))
+            {
+                await w.WriteColumnAsync("x", arr);
+                await w.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (Int32Array)await reader.ReadColumnAsync(0);
+            Assert.Equal(1000, read.Length);
+            for (int i = 0; i < 1000; i++)
+            {
+                if (i % 7 == 0) Assert.True(read.IsNull(i));
+                else Assert.Equal(i, read.GetValue(i));
+            }
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Double_Zstd_RoundTrip_ViaOurReader()
+    {
+        // Float64 column (8 bytes per value) under ZSTD. Validates that
+        // BitsPerValue=64 also takes the wrap path.
+        var b = new DoubleArray.Builder();
+        for (int i = 0; i < 5_000; i++) b.Append((i % 50) * 0.5);
+        var arr = b.Build();
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-zstdd-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var w = await LanceFileWriter.CreateAsync(path,
+                compression: LanceCompressionScheme.Zstd))
+            {
+                await w.WriteColumnAsync("x", arr);
+                await w.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (DoubleArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(5_000, read.Length);
+            for (int i = 0; i < 5_000; i++)
+                Assert.Equal((i % 50) * 0.5, read.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Bool_Zstd_StaysUncompressed_RoundTrip()
+    {
+        // Bool / FSL / Variable / nested cascade pages are ineligible for
+        // ZSTD wrap (the reader doesn't unwrap them on those shapes).
+        // The writer should silently leave them uncompressed and they
+        // round-trip the same as without the option.
+        var b = new BooleanArray.Builder();
+        for (int i = 0; i < 100; i++) b.Append(i % 2 == 0);
+        var arr = b.Build();
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-zstdbool-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var w = await LanceFileWriter.CreateAsync(path,
+                compression: LanceCompressionScheme.Zstd))
+            {
+                await w.WriteColumnAsync("flag", arr);
+                await w.FinishAsync();
+            }
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (BooleanArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(100, read.Length);
+            for (int i = 0; i < 100; i++)
+                Assert.Equal(i % 2 == 0, read.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Int32_Zstd_CrossValidatedAgainstPylance()
+    {
+        if (!IsPythonAvailable()) return;
+        const int N = 20_000;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < N; i++) b.Append(i % 200);
+        var arr = b.Build();
+
+        string path = Path.Combine(Path.GetTempPath(),
+            $"ew-pylance-zstd-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var w = await LanceFileWriter.CreateAsync(path,
+                compression: LanceCompressionScheme.Zstd))
+            {
+                await w.WriteColumnAsync("x", arr);
+                await w.FinishAsync();
+            }
+
+            string script = "import sys, json\n" +
+                "from lance.file import LanceFileReader\n" +
+                $"r = LanceFileReader(r'{path}')\n" +
+                "t = r.read_all().to_table()\n" +
+                "data = t['x'].to_pylist()\n" +
+                "out = { 'rows': len(data), 'first': data[0], 'mid': data[10000], " +
+                "'last': data[19999], 'sum_first_200': sum(data[:200]) }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(N, json.RootElement.GetProperty("rows").GetInt32());
+            Assert.Equal(0, json.RootElement.GetProperty("first").GetInt32());
+            Assert.Equal(10000 % 200, json.RootElement.GetProperty("mid").GetInt32());
+            Assert.Equal(19999 % 200, json.RootElement.GetProperty("last").GetInt32());
+            // Sum of i%200 for i in 0..200 = 0+1+...+199 = 19900
+            Assert.Equal(19900, json.RootElement.GetProperty("sum_first_200").GetInt32());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task ListInt32_CrossValidatedAgainstPylance()
     {
         // Verifies our list writer's wire format against the upstream
