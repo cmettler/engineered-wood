@@ -1952,6 +1952,191 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task Int32_MultiPage_RoundTrip_ViaOurReader()
+    {
+        // Three Int32 batches → three pages in one column. Pylance happens
+        // to consolidate multi-batch writes into a single page, but the
+        // wire format supports multiple Page entries in ColumnMetadata —
+        // this test exercises that path.
+        var p0 = new Int32Array.Builder();
+        for (int i = 0; i < 100; i++) p0.Append(i);
+        var p1 = new Int32Array.Builder();
+        for (int i = 0; i < 50; i++) p1.AppendNull();  // page 1 is all-null
+        var p2 = new Int32Array.Builder();
+        for (int i = 0; i < 75; i++) p2.Append(1000 + i);
+
+        var pages = new IArrowArray[] { p0.Build(), p1.Build(), p2.Build() };
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-mp-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("x", pages);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(225, reader.NumberOfRows);
+            var arr = (Int32Array)await reader.ReadColumnAsync(0);
+            Assert.Equal(225, arr.Length);
+            Assert.Equal(50, arr.NullCount);
+            for (int i = 0; i < 100; i++) Assert.Equal(i, arr.GetValue(i));
+            for (int i = 0; i < 50; i++) Assert.True(arr.IsNull(100 + i));
+            for (int i = 0; i < 75; i++) Assert.Equal(1000 + i, arr.GetValue(150 + i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task String_MultiPage_RoundTrip_ViaOurReader()
+    {
+        var b0 = new StringArray.Builder();
+        b0.Append("alpha").Append("beta").Append("gamma");
+        var b1 = new StringArray.Builder();
+        b1.Append("delta").AppendNull().Append("epsilon");
+        var pages = new IArrowArray[] { b0.Build(), b1.Build() };
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-mpstr-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("words", pages);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var arr = (StringArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(6, arr.Length);
+            Assert.Equal(1, arr.NullCount);
+            Assert.Equal("alpha", arr.GetString(0));
+            Assert.Equal("gamma", arr.GetString(2));
+            Assert.Equal("delta", arr.GetString(3));
+            Assert.True(arr.IsNull(4));
+            Assert.Equal("epsilon", arr.GetString(5));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Bool_MultiPage_RoundTrip_ViaOurReader()
+    {
+        var b0 = new BooleanArray.Builder();
+        b0.Append(true).Append(false).Append(true);
+        var b1 = new BooleanArray.Builder();
+        b1.Append(false).AppendNull().Append(true);
+        var pages = new IArrowArray[] { b0.Build(), b1.Build() };
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-mpbool-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("flag", pages);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var arr = (BooleanArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(6, arr.Length);
+            Assert.Equal(1, arr.NullCount);
+            Assert.True(arr.GetValue(0));
+            Assert.False(arr.GetValue(1));
+            Assert.True(arr.GetValue(2));
+            Assert.False(arr.GetValue(3));
+            Assert.True(arr.IsNull(4));
+            Assert.True(arr.GetValue(5));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task MultiPage_RejectsNestedTypes()
+    {
+        // ListArray is nested → multi-page should refuse with a clear
+        // NotSupportedException instead of silently producing a malformed file.
+        var listArr = BuildListInt32(
+            new[] { new[] { 1, 2 }, new[] { 3 } },
+            nullMask: null);
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-mpneg-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using var writer = await LanceFileWriter.CreateAsync(path);
+            await Assert.ThrowsAsync<NotSupportedException>(async () =>
+                await writer.WriteColumnAsync("x", new IArrowArray[] { listArr, listArr }));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Int32_MultiPage_CrossValidatedAgainstPylance()
+    {
+        if (!IsPythonAvailable()) return;
+        var p0 = new Int32Array.Builder();
+        for (int i = 0; i < 100; i++) p0.Append(i);
+        var p1 = new Int32Array.Builder();
+        for (int i = 0; i < 50; i++) p1.Append(1000 + i);
+        var pages = new IArrowArray[] { p0.Build(), p1.Build() };
+
+        string path = Path.Combine(Path.GetTempPath(),
+            $"ew-lance-pylance-mp-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("x", pages);
+                await writer.FinishAsync();
+            }
+
+            string script = "import sys, json\n" +
+                "from lance.file import LanceFileReader\n" +
+                $"r = LanceFileReader(r'{path}')\n" +
+                "t = r.read_all().to_table()\n" +
+                "out = { 'rows': len(t), 'first': int(t['x'][0].as_py()), " +
+                "'mid': int(t['x'][99].as_py()), 'split': int(t['x'][100].as_py()), " +
+                "'last': int(t['x'][149].as_py()) }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(150, json.RootElement.GetProperty("rows").GetInt32());
+            Assert.Equal(0, json.RootElement.GetProperty("first").GetInt32());
+            Assert.Equal(99, json.RootElement.GetProperty("mid").GetInt32());
+            Assert.Equal(1000, json.RootElement.GetProperty("split").GetInt32());
+            Assert.Equal(1049, json.RootElement.GetProperty("last").GetInt32());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task Decimal128_RoundTrip_ViaOurReader()
     {
         // Decimal128(precision=18, scale=3): three values + one null. Apache

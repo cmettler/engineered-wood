@@ -380,6 +380,347 @@ public sealed class LanceFileWriter : IAsyncDisposable
             ExtractValidityBitmap(array), array.NullCount, cancellationToken);
     }
 
+    /// <summary>
+    /// Append an Apache Arrow column whose data is split into one or more
+    /// pages, with one page per entry of <paramref name="pageArrays"/>.
+    /// All entries must share the same Arrow type. Pages are stitched into
+    /// a single column-metadata entry; the column's row count is the sum
+    /// of all page lengths. Each page records its starting top-level row
+    /// number in <c>Page.priority</c>, matching the upstream Lance
+    /// convention used for deterministic page ordering.
+    ///
+    /// <para>Currently supports leaf-shaped types: fixed-width primitives,
+    /// Date/Time/Timestamp/Duration, FixedSizeBinary, Decimal128/256,
+    /// String, Binary, Bool. Nested types (Struct, FSL, List, LargeList)
+    /// remain single-page; calling this overload with a nested type
+    /// throws <see cref="NotSupportedException"/>.</para>
+    /// </summary>
+    public async Task WriteColumnAsync(
+        string name, IReadOnlyList<IArrowArray> pageArrays,
+        CancellationToken cancellationToken = default)
+    {
+        if (pageArrays is null) throw new ArgumentNullException(nameof(pageArrays));
+        if (pageArrays.Count == 0)
+            throw new ArgumentException(
+                "At least one Arrow array is required.", nameof(pageArrays));
+        if (pageArrays.Count == 1)
+        {
+            await WriteColumnAsync(name, pageArrays[0], cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var firstType = pageArrays[0].Data.DataType;
+        for (int i = 1; i < pageArrays.Count; i++)
+        {
+            if (!pageArrays[i].Data.DataType.Equals(firstType))
+                throw new ArgumentException(
+                    $"All page arrays must have the same Arrow type; pageArrays[0]={firstType}, " +
+                    $"pageArrays[{i}]={pageArrays[i].Data.DataType}.",
+                    nameof(pageArrays));
+        }
+        if (firstType is StructType
+            or FixedSizeListType
+            or Apache.Arrow.Types.ListType
+            or LargeListType)
+        {
+            throw new NotSupportedException(
+                $"Multi-page writing is not yet supported for nested types ({firstType}); " +
+                "pass a single array to WriteColumnAsync.");
+        }
+
+        int totalRows = 0;
+        foreach (var a in pageArrays) totalRows = checked(totalRows + a.Length);
+
+        ThrowIfFinalized();
+        if (_totalRows < 0) _totalRows = totalRows;
+        else if (_totalRows != totalRows)
+            throw new ArgumentException(
+                $"Column '{name}' has {totalRows} rows but earlier columns have {_totalRows}.",
+                nameof(name));
+
+        var pages = new List<ColumnMetadata.Types.Page>(pageArrays.Count);
+        string logicalType = string.Empty;
+        CompressiveEncoding? encoding = null;
+        long priority = 0;
+        foreach (var arr in pageArrays)
+        {
+            (var page, string lt, var enc) = await BuildLeafPageProtoAsync(
+                arr, cancellationToken).ConfigureAwait(false);
+            page.Priority = (ulong)priority;
+            priority += arr.Length;
+            pages.Add(page);
+            logicalType = lt;
+            encoding = enc;
+        }
+
+        RegisterColumn(name, logicalType, encoding!, pages);
+    }
+
+    /// <summary>
+    /// Build a Page proto for a single leaf-shaped Arrow array without
+    /// touching <see cref="_columns"/> or <see cref="_totalRows"/>. Used by
+    /// the multi-page <see cref="WriteColumnAsync(string, IReadOnlyList{IArrowArray}, CancellationToken)"/>
+    /// path; each call writes the page's payload buffers to the file
+    /// (BuildAndWritePageAsync side effect) and returns the proto so the
+    /// caller can register all pages in one column metadata entry at the
+    /// end.
+    /// </summary>
+    private async Task<(ColumnMetadata.Types.Page Page, string LogicalType, CompressiveEncoding Encoding)>
+        BuildLeafPageProtoAsync(IArrowArray array, CancellationToken cancellationToken)
+    {
+        if (array is BooleanArray ba)
+            return await BuildBoolPageProtoAsync(ba, cancellationToken).ConfigureAwait(false);
+        if (array is StringArray sa)
+            return await BuildVariablePageProtoAsync(sa, "string", cancellationToken).ConfigureAwait(false);
+        if (array is BinaryArray binArr)
+            return await BuildVariablePageProtoAsync(binArr, "binary", cancellationToken).ConfigureAwait(false);
+        if (array is Decimal128Array d128)
+        {
+            var dt = (Decimal128Type)d128.Data.DataType;
+            byte[] bytes = ExtractFsbStyleBytes(d128, dt.ByteWidth);
+            return await BuildFlatPageProtoAsync(
+                $"decimal:128:{dt.Precision}:{dt.Scale}", dt.ByteWidth,
+                d128.Length, bytes, ExtractValidityBitmap(d128), d128.NullCount,
+                cancellationToken).ConfigureAwait(false);
+        }
+        if (array is Decimal256Array d256)
+        {
+            var dt = (Decimal256Type)d256.Data.DataType;
+            byte[] bytes = ExtractFsbStyleBytes(d256, dt.ByteWidth);
+            return await BuildFlatPageProtoAsync(
+                $"decimal:256:{dt.Precision}:{dt.Scale}", dt.ByteWidth,
+                d256.Length, bytes, ExtractValidityBitmap(d256), d256.NullCount,
+                cancellationToken).ConfigureAwait(false);
+        }
+        if (array is Apache.Arrow.Arrays.FixedSizeBinaryArray fsb)
+        {
+            int width = ((FixedSizeBinaryType)fsb.Data.DataType).ByteWidth;
+            byte[] bytes = ExtractFsbStyleBytes(fsb, width);
+            return await BuildFlatPageProtoAsync(
+                $"fixed_size_binary:{width}", width,
+                fsb.Length, bytes, ExtractValidityBitmap(fsb), fsb.NullCount,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        // Fixed-width primitives and Date/Time/Timestamp/Duration.
+        var (logicalType, bytesPerValue, valueBytes) = ExtractPrimitiveBytes(array);
+        return await BuildFlatPageProtoAsync(
+            logicalType, bytesPerValue, array.Length, valueBytes,
+            ExtractValidityBitmap(array), array.NullCount, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static byte[] ExtractFsbStyleBytes(IArrowArray array, int bytesPerValue)
+    {
+        byte[] bytes = new byte[array.Length * bytesPerValue];
+        array.Data.Buffers[1].Span.Slice(0, array.Length * bytesPerValue).CopyTo(bytes);
+        return bytes;
+    }
+
+    private static (string LogicalType, int BytesPerValue, byte[] ValueBytes)
+        ExtractPrimitiveBytes(IArrowArray array)
+    {
+        return array switch
+        {
+            Int8Array a => ("int8", 1, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt8Array a => ("uint8", 1, a.Values.ToArray()),
+            Int16Array a => ("int16", 2, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt16Array a => ("uint16", 2, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Int32Array a => ("int32", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt32Array a => ("uint32", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Int64Array a => ("int64", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt64Array a => ("uint64", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            FloatArray a => ("float", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            DoubleArray a => ("double", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Date32Array a => ("date32:day", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Date64Array a => ("date64:ms", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Time32Array a => ($"time:{TimeUnitToString(((Time32Type)a.Data.DataType).Unit)}",
+                              4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Time64Array a => ($"time:{TimeUnitToString(((Time64Type)a.Data.DataType).Unit)}",
+                              8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            TimestampArray a => (TimestampLogicalType((TimestampType)a.Data.DataType),
+                                 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            DurationArray a => ($"duration:{TimeUnitToString(((DurationType)a.Data.DataType).Unit)}",
+                                8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            _ => throw new NotSupportedException(
+                $"LanceFileWriter doesn't yet support Arrow array type '{array.GetType().Name}'."),
+        };
+    }
+
+    private async Task<(ColumnMetadata.Types.Page, string, CompressiveEncoding)>
+        BuildFlatPageProtoAsync(
+            string logicalType, int bytesPerValue, int numItems, byte[] valueBytes,
+            byte[]? validityBitmap, int nullCount, CancellationToken cancellationToken)
+    {
+        bool hasDef = nullCount > 0 && validityBitmap is not null;
+        var encoding = FlatEncoding(bytesPerValue * 8);
+
+        // Build chunks via the same logic as the single-page path.
+        int chunkSize = LargestPow2FlatChunkSize(bytesPerValue, hasDef);
+        var pageChunks = new List<PageChunk>();
+        if (numItems > 0
+            && ChunkTotalBytes(numItems, numItems * bytesPerValue, hasDef) <= MaxChunkBytes)
+        {
+            byte[] chunkValBytes = new byte[numItems * bytesPerValue];
+            new ReadOnlySpan<byte>(valueBytes, 0, numItems * bytesPerValue)
+                .CopyTo(chunkValBytes);
+            pageChunks.Add(BuildPageChunkWithValidity(
+                0, numItems, chunkValBytes, validityBitmap, hasDef));
+        }
+        else
+        {
+            int idx = 0;
+            while (idx < numItems)
+            {
+                int items = Math.Min(numItems - idx, chunkSize);
+                byte[] chunkValBytes = new byte[items * bytesPerValue];
+                new ReadOnlySpan<byte>(valueBytes, idx * bytesPerValue, items * bytesPerValue)
+                    .CopyTo(chunkValBytes);
+                pageChunks.Add(BuildPageChunkWithValidity(
+                    idx, items, chunkValBytes, validityBitmap, hasDef));
+                idx += items;
+            }
+        }
+
+        var layers = new List<RepDefLayer>
+        {
+            hasDef ? RepDefLayer.RepdefNullableItem : RepDefLayer.RepdefAllValidItem,
+        };
+        var page = await BuildAndWritePageAsync(
+            encoding, numItems, pageChunks, layers, cancellationToken)
+            .ConfigureAwait(false);
+        return (page, logicalType, encoding);
+    }
+
+    private async Task<(ColumnMetadata.Types.Page, string, CompressiveEncoding)>
+        BuildVariablePageProtoAsync(
+            BinaryArray array, string logicalType, CancellationToken cancellationToken)
+    {
+        int numItems = array.Length;
+        bool hasDef = array.NullCount > 0;
+        byte[]? validityBitmap = hasDef ? ExtractValidityBitmap(array) : null;
+
+        var pageChunks = new List<PageChunk>();
+        int idx = 0;
+        while (idx < numItems)
+        {
+            int items = 0;
+            int dataBytes = 0;
+            while (idx + items < numItems)
+            {
+                int newCount = items + 1;
+                int newDataBytes = dataBytes + array.GetBytes(idx + items).Length;
+                int valueBufLen = (newCount + 1) * sizeof(uint) + newDataBytes;
+                int total = ChunkTotalBytes(newCount, valueBufLen, hasDef);
+                if (total > MaxChunkBytes) break;
+                items = newCount;
+                dataBytes = newDataBytes;
+            }
+            if (items == 0)
+                throw new InvalidOperationException(
+                    $"Variable item at index {idx} alone exceeds the {MaxChunkBytes}-byte chunk limit.");
+            bool isLast = idx + items == numItems;
+            int finalItems = isLast ? items : Pow2Floor(items);
+            byte[] valueBuf = BuildVariableChunkValueBuffer(array, idx, finalItems);
+            pageChunks.Add(BuildPageChunkWithValidity(
+                idx, finalItems, valueBuf, validityBitmap, hasDef));
+            idx += finalItems;
+        }
+
+        var encoding = new CompressiveEncoding
+        {
+            Variable = new Proto.Encodings.V21.Variable
+            {
+                Offsets = new CompressiveEncoding
+                {
+                    Flat = new Proto.Encodings.V21.Flat { BitsPerValue = 32 },
+                },
+            },
+        };
+        var layers = new List<RepDefLayer>
+        {
+            hasDef ? RepDefLayer.RepdefNullableItem : RepDefLayer.RepdefAllValidItem,
+        };
+        var page = await BuildAndWritePageAsync(
+            encoding, numItems, pageChunks, layers, cancellationToken)
+            .ConfigureAwait(false);
+        return (page, logicalType, encoding);
+    }
+
+    private async Task<(ColumnMetadata.Types.Page, string, CompressiveEncoding)>
+        BuildBoolPageProtoAsync(BooleanArray array, CancellationToken cancellationToken)
+    {
+        int len = array.Length;
+        int valueBytesLen = (len + 7) / 8;
+        byte[] valueBytes = new byte[valueBytesLen];
+        var srcBuf = array.Data.Buffers[1].Span;
+        int srcOffset = array.Data.Offset;
+        for (int i = 0; i < len; i++)
+        {
+            int srcIdx = srcOffset + i;
+            if ((srcBuf[srcIdx >> 3] & (1 << (srcIdx & 7))) != 0)
+                valueBytes[i >> 3] |= (byte)(1 << (i & 7));
+        }
+        bool hasDef = array.NullCount > 0;
+        byte[]? validity = hasDef ? ExtractValidityBitmap(array) : null;
+        ushort[]? def = null;
+        if (hasDef)
+        {
+            def = new ushort[len];
+            for (int i = 0; i < len; i++)
+            {
+                bool valid = (validity![i >> 3] & (1 << (i & 7))) != 0;
+                def[i] = valid ? (ushort)0 : (ushort)1;
+            }
+        }
+
+        int defByteLen = hasDef ? len * sizeof(ushort) : 0;
+        int chunkTotalBytes = AlignUp(
+            AlignUp(2 + (hasDef ? 2 : 0) + 2, MiniBlockAlignment)
+                + (hasDef ? AlignUp(defByteLen, MiniBlockAlignment) : 0)
+                + AlignUp(valueBytesLen, MiniBlockAlignment),
+            MiniBlockAlignment);
+        if (chunkTotalBytes > MaxChunkBytes)
+            throw new NotSupportedException(
+                $"Bool page with {len} items exceeds 32 KiB chunk budget; " +
+                "multi-chunk bool pages are not yet supported by the writer.");
+
+        var chunk = new PageChunk(0, len, valueBytes, RepLevels: null, DefLevels: def);
+        var encoding = FlatEncoding(1);
+        var layers = new List<RepDefLayer>
+        {
+            hasDef ? RepDefLayer.RepdefNullableItem : RepDefLayer.RepdefAllValidItem,
+        };
+        var page = await BuildAndWritePageAsync(
+            encoding, len, new[] { chunk }, layers, cancellationToken)
+            .ConfigureAwait(false);
+        return (page, "bool", encoding);
+    }
+
+    /// <summary>
+    /// Build a <see cref="PageChunk"/> for a fixed-width / variable / FSL
+    /// chunk with no rep stream, deriving per-chunk def levels from a
+    /// page-level validity bitmap. Shared by every leaf-shaped page builder
+    /// that needs item-level NULLABLE_ITEM / ALL_VALID_ITEM def encoding.
+    /// </summary>
+    private static PageChunk BuildPageChunkWithValidity(
+        int itemStart, int itemCount, byte[] valueBuf,
+        byte[]? validityBitmap, bool hasDef)
+    {
+        if (!hasDef)
+            return new PageChunk(itemStart, itemCount, valueBuf,
+                RepLevels: null, DefLevels: null);
+        var def = new ushort[itemCount];
+        for (int i = 0; i < itemCount; i++)
+        {
+            int globalIdx = itemStart + i;
+            bool valid = (validityBitmap![globalIdx >> 3] & (1 << (globalIdx & 7))) != 0;
+            def[i] = valid ? (ushort)0 : (ushort)1;
+        }
+        return new PageChunk(itemStart, itemCount, valueBuf,
+            RepLevels: null, DefLevels: def);
+    }
+
     private static string TimeUnitToString(Apache.Arrow.Types.TimeUnit unit) => unit switch
     {
         Apache.Arrow.Types.TimeUnit.Second => "s",
