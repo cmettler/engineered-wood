@@ -383,6 +383,290 @@ public class LanceDatasetWriterTests
     }
 
     [Fact]
+    public async Task Delete_RemovesRowsFromSingleFragment()
+    {
+        // Single fragment, 5 rows. Delete rows at offsets 1 and 3.
+        // Reading the new version should yield 3 surviving rows.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 10, 20, 30, 40, 50 });
+                await ds.FinishAsync();
+            }
+
+            long newVersion = await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>>
+                {
+                    [0] = new[] { 1, 3 },
+                });
+            Assert.Equal(2L, newVersion);
+
+            await using var table = await LanceTable.OpenAsync(path);
+            // NumberOfRows is logical = physical - deleted, so 5 - 2 = 3.
+            Assert.Equal(3L, table.NumberOfRows);
+            int[] survivors = await ReadInt32ColumnAsync(table, "x");
+            Assert.Equal(new[] { 10, 30, 50 }, survivors);
+
+            // _deletions/ should now have a single .arrow file.
+            var delFiles = Directory.GetFiles(
+                Path.Combine(path, "_deletions"), "*.arrow");
+            Assert.Single(delFiles);
+            string delName = Path.GetFileName(delFiles[0]);
+            Assert.StartsWith("0-1-2", delName);  // {fragId}-{readVersion}-{newId}
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Delete_AcrossMultipleFragments()
+    {
+        // Two-fragment dataset; delete rows from each independently.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+                await ds.NewFragmentAsync();
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 100, 200, 300 });
+                await ds.FinishAsync();
+            }
+
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>>
+                {
+                    [0] = new[] { 0 },         // delete the first row of fragment 0
+                    [1] = new[] { 1, 2 },      // delete the last two of fragment 1
+                });
+
+            await using var table = await LanceTable.OpenAsync(path);
+            int[] survivors = await ReadInt32ColumnAsync(table, "x");
+            Assert.Equal(new[] { 2, 3, 100 }, survivors);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Delete_MergesWithExistingDeletionFile()
+    {
+        // First delete rows {1, 3}, then in a second call delete {0, 2}.
+        // The second deletion file should reference all 4 rows.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 10, 20, 30, 40, 50 });
+                await ds.FinishAsync();
+            }
+
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>>
+                {
+                    [0] = new[] { 1, 3 },
+                });
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>>
+                {
+                    [0] = new[] { 0, 2 },
+                });
+
+            await using var table = await LanceTable.OpenAsync(path);
+            int[] survivors = await ReadInt32ColumnAsync(table, "x");
+            Assert.Equal(new[] { 50 }, survivors);
+
+            // _deletions/ has both files (each is referenced by its own version).
+            // The latest manifest references only the second file.
+            var delFiles = Directory.GetFiles(
+                Path.Combine(path, "_deletions"), "*.arrow");
+            Assert.Equal(2, delFiles.Length);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Delete_PreviousVersionStillReadable()
+    {
+        // After a delete bumps version 1 → 2, opening v1 explicitly should
+        // still see all original rows.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3, 4 });
+                await ds.FinishAsync();
+            }
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>>
+                {
+                    [0] = new[] { 0, 1 },
+                });
+
+            await using var v1 = await LanceTable.OpenAsync(path, version: 1);
+            int[] before = await ReadInt32ColumnAsync(v1, "x");
+            Assert.Equal(new[] { 1, 2, 3, 4 }, before);
+
+            await using var v2 = await LanceTable.OpenAsync(path, version: 2);
+            int[] after = await ReadInt32ColumnAsync(v2, "x");
+            Assert.Equal(new[] { 3, 4 }, after);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Delete_EmptyMap_NoOp()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2 });
+                await ds.FinishAsync();
+            }
+            long ver = await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>>());
+            Assert.Equal(1L, ver);  // unchanged
+
+            // No deletions directory contents.
+            string delDir = Path.Combine(path, "_deletions");
+            if (Directory.Exists(delDir))
+                Assert.Empty(Directory.GetFiles(delDir));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Delete_RejectsBadFragmentId()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1 });
+                await ds.FinishAsync();
+            }
+            await Assert.ThrowsAsync<ArgumentException>(async () =>
+                await LanceDatasetWriter.DeleteRowsAsync(path,
+                    new Dictionary<ulong, IReadOnlyList<int>>
+                    {
+                        [42] = new[] { 0 },  // fragment 42 doesn't exist
+                    }));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Delete_RejectsOffsetOutOfRange()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2 });
+                await ds.FinishAsync();
+            }
+            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () =>
+                await LanceDatasetWriter.DeleteRowsAsync(path,
+                    new Dictionary<ulong, IReadOnlyList<int>>
+                    {
+                        [0] = new[] { 5 },  // fragment has 2 rows; 5 is out of range
+                    }));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Delete_CrossValidatedAgainstPylance()
+    {
+        // Verify the deletion-file format against pylance: write 8 rows,
+        // delete rows 1, 3, 5; confirm pylance sees 5 surviving rows.
+        if (!IsPythonAvailable()) return;
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x",
+                    new[] { 10, 11, 12, 13, 14, 15, 16, 17 });
+                await ds.FinishAsync();
+            }
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>>
+                {
+                    [0] = new[] { 1, 3, 5 },
+                });
+
+            string script = "import sys, json, lance\n" +
+                $"ds = lance.dataset(r'{path}')\n" +
+                "out = { 'rows': ds.count_rows(), 'data': ds.to_table().to_pydict()['x'] }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(5, json.RootElement.GetProperty("rows").GetInt32());
+            int[] expected = { 10, 12, 14, 16, 17 };
+            int i = 0;
+            foreach (var v in json.RootElement.GetProperty("data").EnumerateArray())
+                Assert.Equal(expected[i++], v.GetInt32());
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    private static async Task<int[]> ReadInt32ColumnAsync(LanceTable table, string col)
+    {
+        var values = new List<int>();
+        await foreach (var batch in table.ReadAsync())
+        {
+            int idx = batch.Schema.GetFieldIndex(col);
+            var arr = (Int32Array)batch.Column(idx);
+            for (int i = 0; i < arr.Length; i++)
+                values.Add(arr.GetValue(i)!.Value);
+        }
+        return values.ToArray();
+    }
+
+    [Fact]
     public async Task Vacuum_NoOlderVersions_DeletesNothing()
     {
         // Single-version dataset → vacuum can't free anything (we always

@@ -2,8 +2,12 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers.Binary;
+using Apache.Arrow;
+using Apache.Arrow.Ipc;
+using Apache.Arrow.Types;
 using EngineeredWood.IO;
 using EngineeredWood.Lance.Format;
+using EngineeredWood.Lance.Table.Deletions;
 using EngineeredWood.Lance.Table.Manifest;
 using EngineeredWood.Lance.Table.Proto;
 using Google.Protobuf;
@@ -292,8 +296,24 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
         // --- Build the manifest proto ---
         LanceManifest manifest = BuildManifest(sessionFields, txnFileName);
+        await WriteManifestFileAsync(_datasetPath, manifest, transactionBytes, cancellationToken)
+            .ConfigureAwait(false);
+        _finished = true;
+    }
 
-        // --- Pack manifest body + footer (matches ManifestReader.Parse) ---
+    /// <summary>
+    /// Pack a manifest proto + its transaction proto into the on-disk
+    /// manifest file format (transaction-len + transaction + manifest-len
+    /// + manifest + 16-byte trailer with the manifest-len position, file
+    /// version, and "LANC" magic) and write it to
+    /// <c>_versions/{u64::MAX - version}.manifest</c>. Used by both the
+    /// regular write path and out-of-band ops like
+    /// <see cref="DeleteRowsAsync"/>.
+    /// </summary>
+    private static async Task WriteManifestFileAsync(
+        string datasetPath, LanceManifest manifest, byte[] transactionBytes,
+        CancellationToken cancellationToken)
+    {
         byte[] manifestBytes = manifest.ToByteArray();
         long bodySize = sizeof(uint) + transactionBytes.Length
                       + sizeof(uint) + manifestBytes.Length;
@@ -328,15 +348,12 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         buf[cursor++] = (byte)'N';
         buf[cursor++] = (byte)'C';
 
-        ulong newVersion = manifest.Version;
-        ulong encodedName = ulong.MaxValue - newVersion;
+        ulong encodedName = ulong.MaxValue - manifest.Version;
         string manifestFileName = encodedName.ToString(System.Globalization.CultureInfo.InvariantCulture)
                                 + ".manifest";
         await File.WriteAllBytesAsync(
-            Path.Combine(_datasetPath, "_versions", manifestFileName),
+            Path.Combine(datasetPath, "_versions", manifestFileName),
             buf, cancellationToken).ConfigureAwait(false);
-
-        _finished = true;
     }
 
     /// <summary>
@@ -476,6 +493,196 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         _disposed = true;
         // Dispose the current file writer (if not already finished).
         await _currentFileWriter.DisposeAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Marks a set of rows as deleted in the dataset at
+    /// <paramref name="datasetPath"/>. Writes a per-fragment deletion
+    /// file under <c>_deletions/</c> for each affected fragment, then
+    /// publishes a new manifest version where those fragments carry a
+    /// <c>deletion_file</c> reference. Returns the new version number.
+    ///
+    /// <para><paramref name="deletedOffsetsByFragment"/> maps a fragment
+    /// id to the per-fragment row offsets that should be deleted (0 ≤
+    /// offset &lt; fragment.PhysicalRows). Fragments not present in the
+    /// map are unchanged. If a fragment already has a deletion file from
+    /// a prior version, the new offsets are merged with the existing
+    /// ones.</para>
+    ///
+    /// <para>Returns the current version (no-op) when the map is empty.
+    /// All deletion files use the Arrow IPC format
+    /// (<c>DeletionFileType.ARROW_ARRAY</c>) — a single Int32 column of
+    /// row offsets — which is the simplest and most broadly compatible
+    /// shape; switching to Roaring bitmaps for dense deletes is a
+    /// follow-up.</para>
+    /// </summary>
+    public static async ValueTask<long> DeleteRowsAsync(
+        string datasetPath,
+        IReadOnlyDictionary<ulong, IReadOnlyList<int>> deletedOffsetsByFragment,
+        CancellationToken cancellationToken = default)
+    {
+        if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
+        if (deletedOffsetsByFragment is null)
+            throw new ArgumentNullException(nameof(deletedOffsetsByFragment));
+        if (!Directory.Exists(datasetPath)
+            || !Directory.Exists(Path.Combine(datasetPath, "_versions")))
+            throw new InvalidOperationException(
+                $"Path '{datasetPath}' does not contain a Lance dataset.");
+
+        // Read the current manifest to figure out what version we're
+        // building on top of and what fragments exist.
+        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
+        var entry = await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
+            .ConfigureAwait(false);
+        var baseManifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
+            .ConfigureAwait(false);
+        ulong readVersion = baseManifest.Version;
+
+        // Filter out empty work and validate fragment ids upfront.
+        var work = deletedOffsetsByFragment
+            .Where(kv => kv.Value is not null && kv.Value.Count > 0)
+            .ToDictionary(kv => kv.Key, kv => kv.Value);
+        if (work.Count == 0)
+            return (long)readVersion;
+
+        var fragById = baseManifest.Fragments.ToDictionary(f => f.Id);
+        foreach (var fragId in work.Keys)
+        {
+            if (!fragById.ContainsKey(fragId))
+                throw new ArgumentException(
+                    $"Fragment id {fragId} is not in the dataset (have ids: " +
+                    $"[{string.Join(", ", fragById.Keys)}]).",
+                    nameof(deletedOffsetsByFragment));
+        }
+
+        Directory.CreateDirectory(Path.Combine(datasetPath, "_deletions"));
+
+        ulong newVersion = readVersion + 1;
+        // The DeletionFile.id field is opaque per the proto comment ("used
+        // to differentiate this file from others written by concurrent
+        // writers"). Using newVersion is a stable, monotonic, unique-
+        // per-version choice — concurrent writers would conflict at the
+        // manifest filename level first anyway.
+        ulong newDeletionId = newVersion;
+
+        // Build the new fragments list — unaffected fragments cloned
+        // verbatim, affected ones get a fresh deletion_file reference.
+        var newFragments = new List<DataFragment>(baseManifest.Fragments.Count);
+        foreach (var oldFrag in baseManifest.Fragments)
+        {
+            if (!work.TryGetValue(oldFrag.Id, out var newOffsetsList))
+            {
+                newFragments.Add(oldFrag.Clone());
+                continue;
+            }
+
+            // Validate per-fragment offsets and merge with any existing
+            // deletion mask.
+            var merged = new HashSet<int>();
+            if (oldFrag.DeletionFile is not null && oldFrag.DeletionFile.NumDeletedRows > 0)
+            {
+                var existing = await DeletionFileReader.ReadAsync(
+                    fs, oldFrag.Id, oldFrag.DeletionFile, cancellationToken)
+                    .ConfigureAwait(false);
+                foreach (int off in existing.DeletedOffsets)
+                    merged.Add(off);
+            }
+            ulong physicalRows = oldFrag.PhysicalRows;
+            foreach (int off in newOffsetsList)
+            {
+                if (off < 0 || (ulong)off >= physicalRows)
+                    throw new ArgumentOutOfRangeException(
+                        nameof(deletedOffsetsByFragment),
+                        $"Row offset {off} out of range for fragment {oldFrag.Id} " +
+                        $"(physical_rows={physicalRows}).");
+                merged.Add(off);
+            }
+
+            // Write the deletion file. Path format matches the reader's
+            // expectation: _deletions/{fragmentId}-{readVersion}-{id}.arrow.
+            string deletionFileName =
+                $"{oldFrag.Id}-{readVersion}-{newDeletionId}.arrow";
+            string deletionFilePath = Path.Combine(
+                datasetPath, "_deletions", deletionFileName);
+            await WriteDeletionFileArrowAsync(
+                deletionFilePath, merged, cancellationToken).ConfigureAwait(false);
+
+            // Clone the fragment but replace the deletion_file ref.
+            var newFrag = oldFrag.Clone();
+            newFrag.DeletionFile = new DeletionFile
+            {
+                FileType = DeletionFile.Types.DeletionFileType.ArrowArray,
+                ReadVersion = readVersion,
+                Id = newDeletionId,
+                NumDeletedRows = (ulong)merged.Count,
+            };
+            newFragments.Add(newFrag);
+        }
+
+        // --- Build the new manifest ---
+        string txnUuid = Guid.NewGuid().ToString();
+        string txnFileName = $"{readVersion}-{txnUuid}.txn";
+        var transaction = new Transaction
+        {
+            ReadVersion = readVersion,
+            Uuid = txnUuid,
+        };
+        byte[] transactionBytes = transaction.ToByteArray();
+        await File.WriteAllBytesAsync(
+            Path.Combine(datasetPath, "_transactions", txnFileName),
+            transactionBytes, cancellationToken).ConfigureAwait(false);
+
+        var newManifest = new LanceManifest
+        {
+            Version = newVersion,
+            TransactionFile = txnFileName,
+            DataFormat = baseManifest.DataFormat?.Clone() ?? new LanceManifest.Types.DataStorageFormat
+            {
+                FileFormat = "lance",
+                Version = "2.1",
+            },
+        };
+        newManifest.Fields.AddRange(baseManifest.Fields);
+        newManifest.Fragments.AddRange(newFragments);
+
+        await WriteManifestFileAsync(datasetPath, newManifest, transactionBytes, cancellationToken)
+            .ConfigureAwait(false);
+
+        return (long)newVersion;
+    }
+
+    /// <summary>
+    /// Write a Lance Arrow-IPC deletion file: a single record batch with
+    /// one column of deleted row offsets in ascending order. The proto
+    /// comment says "Int32Array" but pylance / lance-rs require a strict
+    /// schema of <c>{ row_id: uint32 }</c> and reject anything else as a
+    /// "corrupt file". Match pylance.
+    /// </summary>
+    private static async Task WriteDeletionFileArrowAsync(
+        string path, IReadOnlyCollection<int> deletedOffsets,
+        CancellationToken cancellationToken)
+    {
+        // Sort for determinism; the reader doesn't require it but it
+        // makes the file byte-identical for a given input set.
+        var sorted = deletedOffsets.ToArray();
+        System.Array.Sort(sorted);
+
+        var builder = new UInt32Array.Builder().Reserve(sorted.Length);
+        foreach (int off in sorted) builder.Append(checked((uint)off));
+        var arr = builder.Build();
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("row_id", UInt32Type.Default, nullable: false),
+        }, metadata: null);
+        var batch = new RecordBatch(schema, new[] { (IArrowArray)arr }, sorted.Length);
+
+        await using var fs = File.Create(path);
+        using (var writer = new ArrowFileWriter(fs, schema))
+        {
+            await writer.WriteRecordBatchAsync(batch, cancellationToken)
+                .ConfigureAwait(false);
+            await writer.WriteEndAsync(cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <summary>

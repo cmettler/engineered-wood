@@ -23,4 +23,11 @@ internal sealed class DeletionMask
     public int DeletedCount => _deleted.Count;
 
     public bool IsDeleted(int rowOffset) => _deleted.Contains(rowOffset);
+
+    /// <summary>
+    /// Enumerates the deleted row offsets in arbitrary order. Used by the
+    /// writer when merging an existing deletion file with newly-deleted
+    /// rows.
+    /// </summary>
+    public IEnumerable<int> DeletedOffsets => _deleted;
 }
