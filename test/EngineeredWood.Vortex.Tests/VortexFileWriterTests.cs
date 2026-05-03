@@ -2278,6 +2278,157 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task RunEnd_LongRunsCompress()
+    {
+        // 5 distinct Int32 values × 10 000-row runs = 50 000 rows, 5 runs.
+        // Raw payload = 200 KB; runend payload = 5×(2+4) = 30 bytes plus a
+        // bounded amount of FB scaffolding. We expect well over 10× shrink
+        // even after file overhead. (Tested smaller n values inflate the
+        // ratio — at 1 000 rows the FB tables and stats dominate the
+        // compressed output.)
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int runLen = 10_000;
+        var palette = new[] { 7, -3, 100, 0, 42 };
+        const int n = runLen * 5;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(palette[i / runLen]);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize * 10 < rawSize,
+                $"RunEnd on a 5-run × {runLen}-row Int32 column should give >10x compression. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(palette[i / runLen], read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task RunEnd_UInt64WideEnds()
+    {
+        // > 65 536 rows forces ends_ptype = U32. Use a small-ish run pattern
+        // so we still get plenty of runs to encode. 8 distinct values cycled
+        // in 10 000-row runs = 80 000 rows, 8 runs.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int64Type.Default, nullable: false),
+        }, metadata: null);
+        const int runLen = 10_000;
+        var palette = new long[] { 1L, -2L, 3L, -4L, 5L, -6L, 7L, -8L };
+        const int n = runLen * 8;
+        var b = new Int64Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(palette[i / runLen]);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i += 1234) // sparse spot-check
+                Assert.Equal(palette[i / runLen], read.GetValue(i));
+            // Check exactly the run boundaries.
+            for (int r = 0; r < palette.Length; r++)
+            {
+                Assert.Equal(palette[r], read.GetValue(r * runLen)!.Value);
+                Assert.Equal(palette[r], read.GetValue((r + 1) * runLen - 1)!.Value);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task RunEnd_HighDistinctFallsThrough()
+    {
+        // Strictly-increasing column → every row is its own run → RunEnd
+        // rejects (numRuns == n). Dispatch should fall through to a smaller
+        // encoding (delta or bitpacked depending on the column shape) and the
+        // file must still round-trip.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 1_024;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(i);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++) Assert.Equal(i, read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task RunEnd_AllDistinctDoesNotApply()
+    {
+        // 4 fully-distinct values, 4 rows: numRuns == n. Encoder must reject;
+        // dispatch falls through to plain primitive. The decoder side never
+        // sees a runend node, but the data still needs to roundtrip.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var b = new Int32Array.Builder();
+        b.AppendRange(new[] { 1, 2, 3, 4 });
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, 4);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(new[] { 1, 2, 3, 4 }, new[] { read.GetValue(0), read.GetValue(1), read.GetValue(2), read.GetValue(3) }.Select(v => v!.Value).ToArray());
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Dict_RepetitiveStringsCompress()
     {
         // Highly repetitive string column — only 5 distinct values, 1000 rows.

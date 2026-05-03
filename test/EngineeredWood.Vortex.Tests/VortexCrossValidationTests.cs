@@ -580,6 +580,43 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenRunEndFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // 6 distinct Int32 values × 200-row runs → vortex.runend dispatches
+        // (no nulls, no slicing — matches writer's current scope).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int runLen = 200;
+        var palette = new[] { 1, 2, 3, 4, 5, 6 };
+        const int n = runLen * 6;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(palette[i / runLen]);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenAlpFile()
     {
         var validator = FindValidator();

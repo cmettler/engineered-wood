@@ -13,7 +13,7 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 internal readonly record struct EncodingIndices(
     ushort Primitive, ushort Bool, ushort VarBin, ushort List, ushort FixedSizeList,
     ushort BitPacked, ushort Decimal, ushort Constant, ushort For, ushort Delta,
-    ushort Dict, ushort Rle, ushort Struct_, ushort Alp);
+    ushort Dict, ushort Rle, ushort Struct_, ushort Alp, ushort RunEnd);
 
 /// <summary>
 /// Routes an Arrow array to its matching encoder's recursive <c>Emit</c>
@@ -25,18 +25,14 @@ internal static class ArrayEncoderDispatch
 {
     /// <summary>
     /// <param name="compress">When true, eligible columns auto-route through
-    /// compressing encodings in this order:
-    /// <list type="number">
-    ///   <item><c>vortex.constant</c> — fully-uniform columns (one ScalarValue, no buffers).</item>
-    ///   <item><c>fastlanes.delta</c> — strictly-sorted unsigned-integer columns
-    ///     (delta-encoded successive differences inside FastLanes-transposed lanes).</item>
-    ///   <item><c>fastlanes.for</c> — integer columns where shifting by min tightens
-    ///     the bit width (or is required because the column has negative values).</item>
-    ///   <item><c>fastlanes.bitpacked</c> — non-nullable integers with MaxBits &lt; native.</item>
-    /// </list>
-    /// Constant is checked first because it's strictly smaller. Delta is gated
-    /// on <c>stats.IsStrictSorted</c> — that tells us within-lane successive
-    /// differences will be small without an O(n) probe scan. FoR is checked
+    /// compressing encodings in dispatch order. The order matters: each gate
+    /// rejects the column if its niche doesn't fit, so cheaper / more
+    /// specialised encodings are checked first. Order:
+    /// constant > dict > alp > rle > runend > delta > FoR > bitpacked.
+    /// Constant strictly subsumes everything when the column is uniform.
+    /// Dict is StringArray-only. ALP and RLE are float-only. RunEnd handles
+    /// long-run integer columns that bitpacked alone wouldn't compress as
+    /// hard. Delta is gated on <c>stats.IsStrictSorted</c>. FoR is checked
     /// before plain bitpacked because it strictly subsumes bitpacked for
     /// columns where it applies (FoR with min=0 would be identical, but we
     /// only enable FoR when min != 0 or signed-with-negatives).</param>
@@ -57,6 +53,8 @@ internal static class ArrayEncoderDispatch
             return AlpArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && RleArrayEncoder.IsApplicable(array))
             return RleArrayEncoder.Emit(sb, array, idx, statsTicket);
+        if (compress && RunEndArrayEncoder.IsApplicable(array))
+            return RunEndArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && DeltaArrayEncoder.IsApplicable(array))
             return DeltaArrayEncoder.Emit(sb, array, idx.Delta, idx.Primitive, idx.BitPacked, idx.Bool, statsTicket);
         if (compress && ForArrayEncoder.IsApplicable(array))
