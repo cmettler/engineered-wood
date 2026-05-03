@@ -64,7 +64,6 @@ internal static class DeltaArrayEncoder
     {
         if (array is null) return false;
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0) return false;
         if (data.GetNullCount() > 0) return false;
         if (array.Length < ElementsPerChunk) return false;
         int? native = NativeBits(array);
@@ -95,17 +94,18 @@ internal static class DeltaArrayEncoder
     {
         var data = ((Apache.Arrow.Array)array).Data;
         int n = array.Length;
+        int off = data.Offset;
         int numChunks = (n + ElementsPerChunk - 1) / ElementsPerChunk;
 
         return array switch
         {
-            UInt8Array => ProbeMaxBitsTyped<byte>(data.Buffers[1].Span.Slice(0, n),
+            UInt8Array => ProbeMaxBitsTyped<byte>(data.Buffers[1].Span.Slice(off, n),
                 n, numChunks, Clast.FastLanes.Delta.LaneCount<byte>(), (a, b) => (byte)(a - b)),
-            UInt16Array => ProbeMaxBitsTyped<ushort>(MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(0, n * 2)),
+            UInt16Array => ProbeMaxBitsTyped<ushort>(MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(off * 2, n * 2)),
                 n, numChunks, Clast.FastLanes.Delta.LaneCount<ushort>(), (a, b) => (ushort)(a - b)),
-            UInt32Array => ProbeMaxBitsTyped<uint>(MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(0, n * 4)),
+            UInt32Array => ProbeMaxBitsTyped<uint>(MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(off * 4, n * 4)),
                 n, numChunks, Clast.FastLanes.Delta.LaneCount<uint>(), (a, b) => a - b),
-            UInt64Array => ProbeMaxBitsTyped<ulong>(MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(0, n * 8)),
+            UInt64Array => ProbeMaxBitsTyped<ulong>(MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(off * 8, n * 8)),
                 n, numChunks, Clast.FastLanes.Delta.LaneCount<ulong>(), (a, b) => a - b),
             _ => int.MaxValue,
         };
@@ -158,7 +158,7 @@ internal static class DeltaArrayEncoder
         if (array is null) throw new ArgumentNullException(nameof(array));
         if (!IsApplicable(array))
             throw new InvalidOperationException(
-                $"fastlanes.delta requires a non-nullable, non-sliced unsigned-int column with length ≥ {ElementsPerChunk}; {array.GetType().Name} doesn't qualify.");
+                $"fastlanes.delta requires a non-nullable unsigned-int column with length ≥ {ElementsPerChunk} and within-lane MaxBits ≤ native/2; {array.GetType().Name} doesn't qualify.");
 
         // 1. Run the FastLanes delta pipeline. Returns same-typed Arrow arrays
         //    for bases (numChunks × LANES) and deltas (numChunks × 1024).
@@ -223,7 +223,8 @@ internal static class DeltaArrayEncoder
         var data = ((Apache.Arrow.Array)array).Data;
         int n = array.Length;
         int elemSize = Marshal.SizeOf<T>();
-        var srcBytes = data.Buffers[1].Span.Slice(0, n * elemSize);
+        // Slice value bytes by data.Offset so src[i] is the logical row i.
+        var srcBytes = data.Buffers[1].Span.Slice(data.Offset * elemSize, n * elemSize);
         var src = MemoryMarshal.Cast<byte, T>(srcBytes);
 
         int numChunks = (n + ElementsPerChunk - 1) / ElementsPerChunk;

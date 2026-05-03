@@ -1436,6 +1436,147 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task BitPacked_SlicedInputRoundtrips()
+    {
+        // Build a 3000-row UInt32, slice [500..2500). Bitpacked must honor
+        // data.Offset for both the value buffer and (when nullable) the validity
+        // bitmap. Underlying values are narrow-range so bitpacking applies.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt32Type.Default, nullable: true),
+        }, metadata: null);
+        const int total = 3_000;
+        var b = new UInt32Array.Builder();
+        for (int i = 0; i < total; i++)
+        {
+            if (i % 11 == 0) b.AppendNull();
+            else b.Append((uint)(i % 256)); // 8-bit values
+        }
+        var full = b.Build();
+        var sliced = (UInt32Array)full.Slice(500, 2_000);
+        Assert.Equal(500, sliced.Offset);
+        Assert.Equal(2_000, sliced.Length);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, 2_000);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(2_000, read.Length);
+            for (int i = 0; i < 2_000; i++)
+            {
+                int srcRow = 500 + i;
+                if (srcRow % 11 == 0)
+                    Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    Assert.Equal((uint)(srcRow % 256), read.GetValue(i));
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task For_SlicedNegativeInt64Roundtrips()
+    {
+        // FoR over a sliced Int64 column with negative values. Bitpacked alone
+        // can't handle the negatives, but FoR shifts to non-negative residuals.
+        // The slice means data.Offset != 0; encoder must skip nulls and read
+        // from offset throughout.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int64Type.Default, nullable: true),
+        }, metadata: null);
+        const int total = 2_500;
+        var b = new Int64Array.Builder();
+        for (int i = 0; i < total; i++)
+        {
+            if (i % 7 == 0) b.AppendNull();
+            else b.Append(-100_000L + (i % 50));
+        }
+        var full = b.Build();
+        var sliced = (Int64Array)full.Slice(300, 1_500);
+        Assert.Equal(300, sliced.Offset);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, 1_500);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < 1_500; i++)
+            {
+                int srcRow = 300 + i;
+                if (srcRow % 7 == 0)
+                    Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    Assert.Equal(-100_000L + (srcRow % 50), read.GetValue(i));
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Delta_SlicedRoundtrips()
+    {
+        // Sliced input of a delta-friendly locally-constant column. Slice still
+        // ≥ 1024 rows so delta is structurally applicable; probe should accept
+        // since within-lane deltas remain near-zero.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt32Type.Default, nullable: false),
+        }, metadata: null);
+        const int total = 5_000;
+        var b = new UInt32Array.Builder();
+        for (int i = 0; i < total; i++) b.Append((uint)(i / 64) + 1_000_000u);
+        var full = b.Build();
+        var sliced = (UInt32Array)full.Slice(800, 4_096);
+        Assert.Equal(800, sliced.Offset);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, 4_096);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(4_096, read.Length);
+            for (int i = 0; i < 4_096; i++)
+            {
+                int srcRow = 800 + i;
+                Assert.Equal((uint)(srcRow / 64) + 1_000_000u, read.GetValue(i));
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Delta_LocallyConstantUInt32Compresses()
     {
         // input[i] = i / 64 — every 64 consecutive rows share a value. Within

@@ -36,11 +36,12 @@ internal static class BitPackedArrayEncoder
     /// <summary>
     /// Returns true iff <paramref name="array"/> is a supported shape AND
     /// bitpacking would actually save space (max bit width &lt; native).
+    /// Sliced inputs (<c>data.Offset != 0</c>) are supported — value buffer
+    /// reads honor the offset, validity bits index from <c>data.Offset + i</c>.
     /// </summary>
     public static bool IsApplicable(IArrowArray array)
     {
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0) return false;
         int? nativeBits = NativeBits(array);
         if (nativeBits is not int native) return false;
 
@@ -55,8 +56,6 @@ internal static class BitPackedArrayEncoder
     {
         if (array is null) throw new ArgumentNullException(nameof(array));
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0)
-            throw new NotSupportedException("fastlanes.bitpacked writer doesn't yet support sliced inputs.");
 
         int? nativeBits = NativeBits(array);
         if (nativeBits is not int native)
@@ -132,6 +131,7 @@ internal static class BitPackedArrayEncoder
         var data = ((Apache.Arrow.Array)array).Data;
         int n = array.Length;
         if (n == 0) return false;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
 
@@ -139,40 +139,40 @@ internal static class BitPackedArrayEncoder
         {
             case Int8Array:
                 {
-                    var span = MemoryMarshal.Cast<byte, sbyte>(data.Buffers[1].Span.Slice(0, n));
+                    var span = MemoryMarshal.Cast<byte, sbyte>(data.Buffers[1].Span.Slice(off, n));
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) continue;
+                        if (hasNulls && IsNullAt(validity, off + i)) continue;
                         if (span[i] < 0) return true;
                     }
                     return false;
                 }
             case Int16Array:
                 {
-                    var span = MemoryMarshal.Cast<byte, short>(data.Buffers[1].Span.Slice(0, n * 2));
+                    var span = MemoryMarshal.Cast<byte, short>(data.Buffers[1].Span.Slice(off * 2, n * 2));
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) continue;
+                        if (hasNulls && IsNullAt(validity, off + i)) continue;
                         if (span[i] < 0) return true;
                     }
                     return false;
                 }
             case Int32Array:
                 {
-                    var span = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span.Slice(0, n * 4));
+                    var span = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span.Slice(off * 4, n * 4));
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) continue;
+                        if (hasNulls && IsNullAt(validity, off + i)) continue;
                         if (span[i] < 0) return true;
                     }
                     return false;
                 }
             case Int64Array:
                 {
-                    var span = MemoryMarshal.Cast<byte, long>(data.Buffers[1].Span.Slice(0, n * 8));
+                    var span = MemoryMarshal.Cast<byte, long>(data.Buffers[1].Span.Slice(off * 8, n * 8));
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) continue;
+                        if (hasNulls && IsNullAt(validity, off + i)) continue;
                         if (span[i] < 0) return true;
                     }
                     return false;
@@ -195,6 +195,7 @@ internal static class BitPackedArrayEncoder
         var data = ((Apache.Arrow.Array)array).Data;
         int n = array.Length;
         if (n == 0) return 0;
+        int off = data.Offset;
 
         // For nullable inputs, MaxBits over the raw buffer might pick up
         // garbage at null positions. Build a clean view first when needed.
@@ -206,52 +207,53 @@ internal static class BitPackedArrayEncoder
         return array switch
         {
             UInt8Array or Int8Array => Clast.FastLanes.BitPacking.MaxBits<byte>(
-                data.Buffers[1].Span.Slice(0, n)),
+                data.Buffers[1].Span.Slice(off, n)),
             UInt16Array or Int16Array => Clast.FastLanes.BitPacking.MaxBits<ushort>(
-                MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(0, n * 2))),
+                MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(off * 2, n * 2))),
             UInt32Array or Int32Array => Clast.FastLanes.BitPacking.MaxBits<uint>(
-                MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(0, n * 4))),
+                MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(off * 4, n * 4))),
             UInt64Array or Int64Array => Clast.FastLanes.BitPacking.MaxBits<ulong>(
-                MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(0, n * 8))),
+                MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(off * 8, n * 8))),
             _ => throw new NotSupportedException(),
         };
     }
 
     private static int MaxBitsCleaned(IArrowArray array, ArrayData data, int n)
     {
+        int off = data.Offset;
         var validity = data.Buffers[0].Span;
         switch (array)
         {
             case UInt8Array or Int8Array:
                 {
-                    var src = data.Buffers[1].Span.Slice(0, n);
+                    var src = data.Buffers[1].Span.Slice(off, n);
                     var clean = new byte[n];
                     for (int i = 0; i < n; i++)
-                        clean[i] = IsNullAt(validity, i) ? (byte)0 : src[i];
+                        clean[i] = IsNullAt(validity, off + i) ? (byte)0 : src[i];
                     return Clast.FastLanes.BitPacking.MaxBits<byte>(clean);
                 }
             case UInt16Array or Int16Array:
                 {
-                    var src = MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(0, n * 2));
+                    var src = MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(off * 2, n * 2));
                     var clean = new ushort[n];
                     for (int i = 0; i < n; i++)
-                        clean[i] = IsNullAt(validity, i) ? (ushort)0 : src[i];
+                        clean[i] = IsNullAt(validity, off + i) ? (ushort)0 : src[i];
                     return Clast.FastLanes.BitPacking.MaxBits<ushort>(clean);
                 }
             case UInt32Array or Int32Array:
                 {
-                    var src = MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(0, n * 4));
+                    var src = MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(off * 4, n * 4));
                     var clean = new uint[n];
                     for (int i = 0; i < n; i++)
-                        clean[i] = IsNullAt(validity, i) ? 0u : src[i];
+                        clean[i] = IsNullAt(validity, off + i) ? 0u : src[i];
                     return Clast.FastLanes.BitPacking.MaxBits<uint>(clean);
                 }
             case UInt64Array or Int64Array:
                 {
-                    var src = MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(0, n * 8));
+                    var src = MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(off * 8, n * 8));
                     var clean = new ulong[n];
                     for (int i = 0; i < n; i++)
-                        clean[i] = IsNullAt(validity, i) ? 0UL : src[i];
+                        clean[i] = IsNullAt(validity, off + i) ? 0UL : src[i];
                     return Clast.FastLanes.BitPacking.MaxBits<ulong>(clean);
                 }
             default: throw new NotSupportedException();
@@ -274,31 +276,35 @@ internal static class BitPackedArrayEncoder
         }
 
         var data = ((Apache.Arrow.Array)array).Data;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
 
         return array switch
         {
             UInt8Array or Int8Array => PackTyped<byte>(
-                data.Buffers[1].Span, validity, hasNulls, rowCount, bitWidth, numChunks),
+                data.Buffers[1].Span, off, validity, hasNulls, rowCount, bitWidth, numChunks),
             UInt16Array or Int16Array => PackTyped<ushort>(
-                data.Buffers[1].Span, validity, hasNulls, rowCount, bitWidth, numChunks),
+                data.Buffers[1].Span, off, validity, hasNulls, rowCount, bitWidth, numChunks),
             UInt32Array or Int32Array => PackTyped<uint>(
-                data.Buffers[1].Span, validity, hasNulls, rowCount, bitWidth, numChunks),
+                data.Buffers[1].Span, off, validity, hasNulls, rowCount, bitWidth, numChunks),
             UInt64Array or Int64Array => PackTyped<ulong>(
-                data.Buffers[1].Span, validity, hasNulls, rowCount, bitWidth, numChunks),
+                data.Buffers[1].Span, off, validity, hasNulls, rowCount, bitWidth, numChunks),
             _ => throw new NotSupportedException($"PackToBytes doesn't support {array.GetType().Name}."),
         };
     }
 
     private static byte[] PackTyped<T>(
-        ReadOnlySpan<byte> rawBytes, ReadOnlySpan<byte> validity, bool hasNulls,
+        ReadOnlySpan<byte> rawBytes, int elementOffset,
+        ReadOnlySpan<byte> validity, bool hasNulls,
         int rowCount, int bitWidth, int numChunks)
         where T : unmanaged
     {
         int packedBytesPerChunk = Clast.FastLanes.BitPacking.PackedByteCount<T>(bitWidth);
         var output = new byte[(long)numChunks * packedBytesPerChunk];
-        var values = MemoryMarshal.Cast<byte, T>(rawBytes.Slice(0, rowCount * Marshal.SizeOf<T>()));
+        int elemSize = Marshal.SizeOf<T>();
+        // Slice value bytes by elementOffset so values[i] corresponds to logical row i.
+        var values = MemoryMarshal.Cast<byte, T>(rawBytes.Slice(elementOffset * elemSize, rowCount * elemSize));
 
         var chunkBuf = new T[ElementsPerChunk];
         for (int c = 0; c < numChunks; c++)
@@ -308,11 +314,12 @@ internal static class BitPackedArrayEncoder
             int globalBase = c * ElementsPerChunk;
             if (hasNulls)
             {
-                // Per-element: replace null positions with default(T)=0.
+                // Per-element: replace null positions with default(T)=0. Validity
+                // bits live at absolute index elementOffset + logical_row.
                 for (int i = 0; i < rowsInChunk; i++)
                 {
-                    int gi = globalBase + i;
-                    chunkBuf[i] = IsNullAt(validity, gi) ? default : values[gi];
+                    int logicalRow = globalBase + i;
+                    chunkBuf[i] = IsNullAt(validity, elementOffset + logicalRow) ? default : values[logicalRow];
                 }
             }
             else

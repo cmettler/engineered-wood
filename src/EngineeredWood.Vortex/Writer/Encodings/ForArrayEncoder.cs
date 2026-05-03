@@ -41,7 +41,6 @@ internal static class ForArrayEncoder
     {
         if (array is null) return false;
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0) return false;
         if (array.Length == 0) return false;
         int? nativeBits = NativeBits(array);
         if (nativeBits is not int native) return false;
@@ -66,8 +65,6 @@ internal static class ForArrayEncoder
     {
         if (array is null) throw new ArgumentNullException(nameof(array));
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0)
-            throw new NotSupportedException("fastlanes.for writer doesn't yet support sliced inputs.");
 
         // 1. Build residuals array (same Arrow dtype as parent) + serialize the
         //    reference scalar's protobuf bytes for the metadata field.
@@ -123,36 +120,37 @@ internal static class ForArrayEncoder
     {
         var data = ((Apache.Arrow.Array)array).Data;
         int n = array.Length;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
         switch (array)
         {
             case Int8Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, sbyte>(data.Buffers[1].Span.Slice(0, n));
+                    var s = MemoryMarshal.Cast<byte, sbyte>(data.Buffers[1].Span.Slice(off, n));
                     for (int i = 0; i < n; i++)
-                        if (!(hasNulls && IsNullAt(validity, i)) && s[i] < 0) return true;
+                        if (!(hasNulls && IsNullAt(validity, off + i)) && s[i] < 0) return true;
                     return false;
                 }
             case Int16Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, short>(data.Buffers[1].Span.Slice(0, n * 2));
+                    var s = MemoryMarshal.Cast<byte, short>(data.Buffers[1].Span.Slice(off * 2, n * 2));
                     for (int i = 0; i < n; i++)
-                        if (!(hasNulls && IsNullAt(validity, i)) && s[i] < 0) return true;
+                        if (!(hasNulls && IsNullAt(validity, off + i)) && s[i] < 0) return true;
                     return false;
                 }
             case Int32Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span.Slice(0, n * 4));
+                    var s = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span.Slice(off * 4, n * 4));
                     for (int i = 0; i < n; i++)
-                        if (!(hasNulls && IsNullAt(validity, i)) && s[i] < 0) return true;
+                        if (!(hasNulls && IsNullAt(validity, off + i)) && s[i] < 0) return true;
                     return false;
                 }
             case Int64Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, long>(data.Buffers[1].Span.Slice(0, n * 8));
+                    var s = MemoryMarshal.Cast<byte, long>(data.Buffers[1].Span.Slice(off * 8, n * 8));
                     for (int i = 0; i < n; i++)
-                        if (!(hasNulls && IsNullAt(validity, i)) && s[i] < 0) return true;
+                        if (!(hasNulls && IsNullAt(validity, off + i)) && s[i] < 0) return true;
                     return false;
                 }
             default: return false;
@@ -171,49 +169,50 @@ internal static class ForArrayEncoder
     {
         var data = ((Apache.Arrow.Array)array).Data;
         int n = array.Length;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
         switch (array)
         {
             case Int8Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, sbyte>(data.Buffers[1].Span.Slice(0, n));
-                    return ScanMinSigned<sbyte>(s, n, hasNulls, validity, v => v);
+                    var s = MemoryMarshal.Cast<byte, sbyte>(data.Buffers[1].Span.Slice(off, n));
+                    return ScanMinSigned<sbyte>(s, n, off, hasNulls, validity, v => v);
                 }
             case Int16Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, short>(data.Buffers[1].Span.Slice(0, n * 2));
-                    return ScanMinSigned<short>(s, n, hasNulls, validity, v => v);
+                    var s = MemoryMarshal.Cast<byte, short>(data.Buffers[1].Span.Slice(off * 2, n * 2));
+                    return ScanMinSigned<short>(s, n, off, hasNulls, validity, v => v);
                 }
             case Int32Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span.Slice(0, n * 4));
-                    return ScanMinSigned<int>(s, n, hasNulls, validity, v => v);
+                    var s = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span.Slice(off * 4, n * 4));
+                    return ScanMinSigned<int>(s, n, off, hasNulls, validity, v => v);
                 }
             case Int64Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, long>(data.Buffers[1].Span.Slice(0, n * 8));
-                    return ScanMinSigned<long>(s, n, hasNulls, validity, v => v);
+                    var s = MemoryMarshal.Cast<byte, long>(data.Buffers[1].Span.Slice(off * 8, n * 8));
+                    return ScanMinSigned<long>(s, n, off, hasNulls, validity, v => v);
                 }
             case UInt8Array:
                 {
-                    var s = data.Buffers[1].Span.Slice(0, n);
-                    return ScanMinUnsigned(s, n, hasNulls, validity, v => (long)v);
+                    var s = data.Buffers[1].Span.Slice(off, n);
+                    return ScanMinUnsigned(s, n, off, hasNulls, validity, v => (long)v);
                 }
             case UInt16Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(0, n * 2));
-                    return (long)ScanMinUnsignedSpan<ushort>(s, n, hasNulls, validity);
+                    var s = MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(off * 2, n * 2));
+                    return (long)ScanMinUnsignedSpan<ushort>(s, n, off, hasNulls, validity);
                 }
             case UInt32Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(0, n * 4));
-                    return (long)ScanMinUnsignedSpan<uint>(s, n, hasNulls, validity);
+                    var s = MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(off * 4, n * 4));
+                    return (long)ScanMinUnsignedSpan<uint>(s, n, off, hasNulls, validity);
                 }
             case UInt64Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(0, n * 8));
-                    var min = ScanMinUnsignedSpan<ulong>(s, n, hasNulls, validity);
+                    var s = MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(off * 8, n * 8));
+                    var min = ScanMinUnsignedSpan<ulong>(s, n, off, hasNulls, validity);
                     // Caller only uses == 0 comparison; cast preserves that semantically.
                     return unchecked((long)min);
                 }
@@ -221,39 +220,39 @@ internal static class ForArrayEncoder
         }
     }
 
-    private static long ScanMinSigned<T>(ReadOnlySpan<T> span, int n, bool hasNulls, ReadOnlySpan<byte> validity, Func<T, long> toLong)
+    private static long ScanMinSigned<T>(ReadOnlySpan<T> span, int n, int off, bool hasNulls, ReadOnlySpan<byte> validity, Func<T, long> toLong)
         where T : unmanaged, IComparable<T>
     {
         long min = long.MaxValue;
         for (int i = 0; i < n; i++)
         {
-            if (hasNulls && IsNullAt(validity, i)) continue;
+            if (hasNulls && IsNullAt(validity, off + i)) continue;
             long v = toLong(span[i]);
             if (v < min) min = v;
         }
         return min;
     }
 
-    private static long ScanMinUnsigned(ReadOnlySpan<byte> span, int n, bool hasNulls, ReadOnlySpan<byte> validity, Func<byte, long> toLong)
+    private static long ScanMinUnsigned(ReadOnlySpan<byte> span, int n, int off, bool hasNulls, ReadOnlySpan<byte> validity, Func<byte, long> toLong)
     {
         long min = long.MaxValue;
         for (int i = 0; i < n; i++)
         {
-            if (hasNulls && IsNullAt(validity, i)) continue;
+            if (hasNulls && IsNullAt(validity, off + i)) continue;
             long v = toLong(span[i]);
             if (v < min) min = v;
         }
         return min;
     }
 
-    private static T ScanMinUnsignedSpan<T>(ReadOnlySpan<T> span, int n, bool hasNulls, ReadOnlySpan<byte> validity)
+    private static T ScanMinUnsignedSpan<T>(ReadOnlySpan<T> span, int n, int off, bool hasNulls, ReadOnlySpan<byte> validity)
         where T : unmanaged, IComparable<T>
     {
         bool found = false;
         T min = default;
         for (int i = 0; i < n; i++)
         {
-            if (hasNulls && IsNullAt(validity, i)) continue;
+            if (hasNulls && IsNullAt(validity, off + i)) continue;
             if (!found) { min = span[i]; found = true; }
             else if (span[i].CompareTo(min) < 0) min = span[i];
         }
@@ -269,6 +268,7 @@ internal static class ForArrayEncoder
     {
         var data = ((Apache.Arrow.Array)array).Data;
         int n = array.Length;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
         ulong maxResidual = 0;
@@ -276,66 +276,66 @@ internal static class ForArrayEncoder
         {
             case Int8Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, sbyte>(data.Buffers[1].Span.Slice(0, n));
+                    var s = MemoryMarshal.Cast<byte, sbyte>(data.Buffers[1].Span.Slice(off, n));
                     sbyte min = sbyte.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (s[i] < min) min = s[i]; }
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; ulong r = (ulong)(s[i] - min); if (r > maxResidual) maxResidual = r; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (s[i] < min) min = s[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; ulong r = (ulong)(s[i] - min); if (r > maxResidual) maxResidual = r; }
                     break;
                 }
             case Int16Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, short>(data.Buffers[1].Span.Slice(0, n * 2));
+                    var s = MemoryMarshal.Cast<byte, short>(data.Buffers[1].Span.Slice(off * 2, n * 2));
                     short min = short.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (s[i] < min) min = s[i]; }
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; ulong r = (ulong)(s[i] - min); if (r > maxResidual) maxResidual = r; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (s[i] < min) min = s[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; ulong r = (ulong)(s[i] - min); if (r > maxResidual) maxResidual = r; }
                     break;
                 }
             case Int32Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span.Slice(0, n * 4));
+                    var s = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span.Slice(off * 4, n * 4));
                     int min = int.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (s[i] < min) min = s[i]; }
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; ulong r = (ulong)((long)s[i] - min); if (r > maxResidual) maxResidual = r; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (s[i] < min) min = s[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; ulong r = (ulong)((long)s[i] - min); if (r > maxResidual) maxResidual = r; }
                     break;
                 }
             case Int64Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, long>(data.Buffers[1].Span.Slice(0, n * 8));
+                    var s = MemoryMarshal.Cast<byte, long>(data.Buffers[1].Span.Slice(off * 8, n * 8));
                     long min = long.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (s[i] < min) min = s[i]; }
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; ulong r = unchecked((ulong)(s[i] - min)); if (r > maxResidual) maxResidual = r; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (s[i] < min) min = s[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; ulong r = unchecked((ulong)(s[i] - min)); if (r > maxResidual) maxResidual = r; }
                     break;
                 }
             case UInt8Array:
                 {
-                    var s = data.Buffers[1].Span.Slice(0, n);
+                    var s = data.Buffers[1].Span.Slice(off, n);
                     byte min = byte.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (s[i] < min) min = s[i]; }
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; ulong r = (ulong)(s[i] - min); if (r > maxResidual) maxResidual = r; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (s[i] < min) min = s[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; ulong r = (ulong)(s[i] - min); if (r > maxResidual) maxResidual = r; }
                     break;
                 }
             case UInt16Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(0, n * 2));
+                    var s = MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(off * 2, n * 2));
                     ushort min = ushort.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (s[i] < min) min = s[i]; }
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; ulong r = (ulong)(s[i] - min); if (r > maxResidual) maxResidual = r; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (s[i] < min) min = s[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; ulong r = (ulong)(s[i] - min); if (r > maxResidual) maxResidual = r; }
                     break;
                 }
             case UInt32Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(0, n * 4));
+                    var s = MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(off * 4, n * 4));
                     uint min = uint.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (s[i] < min) min = s[i]; }
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; ulong r = s[i] - min; if (r > maxResidual) maxResidual = r; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (s[i] < min) min = s[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; ulong r = s[i] - min; if (r > maxResidual) maxResidual = r; }
                     break;
                 }
             case UInt64Array:
                 {
-                    var s = MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(0, n * 8));
+                    var s = MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(off * 8, n * 8));
                     ulong min = ulong.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (s[i] < min) min = s[i]; }
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; ulong r = s[i] - min; if (r > maxResidual) maxResidual = r; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (s[i] < min) min = s[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; ulong r = s[i] - min; if (r > maxResidual) maxResidual = r; }
                     break;
                 }
             default: throw new NotSupportedException();
@@ -355,23 +355,31 @@ internal static class ForArrayEncoder
     {
         var data = ((Apache.Arrow.Array)array).Data;
         int n = array.Length;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
-        var validityBuf = hasNulls ? data.Buffers[0] : ArrowBuffer.Empty;
+        // For sliced inputs, extract a fresh bit-aligned validity bitmap so the
+        // residuals array can have offset=0 with its own values buffer of
+        // length n. Re-using the source's validity buffer at offset=0 would
+        // misindex when off > 0; passing it with offset would require a
+        // matching values buffer of length off+n, which is wasteful.
+        ArrowBuffer validityBuf = hasNulls
+            ? new ArrowBuffer(EncoderHelpers.ExtractValidityBitmap(validity, srcBitOffset: off, rowCount: n))
+            : ArrowBuffer.Empty;
         int nullCount = hasNulls ? data.GetNullCount() : 0;
 
         switch (array)
         {
             case Int8Array:
                 {
-                    var src = MemoryMarshal.Cast<byte, sbyte>(data.Buffers[1].Span.Slice(0, n));
+                    var src = MemoryMarshal.Cast<byte, sbyte>(data.Buffers[1].Span.Slice(off, n));
                     sbyte min = sbyte.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (src[i] < min) min = src[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (src[i] < min) min = src[i]; }
                     var bytes = new byte[n];
                     var dst = MemoryMarshal.Cast<byte, sbyte>(bytes.AsSpan());
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) { dst[i] = 0; continue; }
+                        if (hasNulls && IsNullAt(validity, off + i)) { dst[i] = 0; continue; }
                         dst[i] = (sbyte)(src[i] - min);
                     }
                     return (new Int8Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
@@ -379,14 +387,14 @@ internal static class ForArrayEncoder
                 }
             case Int16Array:
                 {
-                    var src = MemoryMarshal.Cast<byte, short>(data.Buffers[1].Span.Slice(0, n * 2));
+                    var src = MemoryMarshal.Cast<byte, short>(data.Buffers[1].Span.Slice(off * 2, n * 2));
                     short min = short.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (src[i] < min) min = src[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (src[i] < min) min = src[i]; }
                     var bytes = new byte[n * 2];
                     var dst = MemoryMarshal.Cast<byte, short>(bytes.AsSpan());
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) { dst[i] = 0; continue; }
+                        if (hasNulls && IsNullAt(validity, off + i)) { dst[i] = 0; continue; }
                         dst[i] = (short)(src[i] - min);
                     }
                     return (new Int16Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
@@ -394,14 +402,14 @@ internal static class ForArrayEncoder
                 }
             case Int32Array:
                 {
-                    var src = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span.Slice(0, n * 4));
+                    var src = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span.Slice(off * 4, n * 4));
                     int min = int.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (src[i] < min) min = src[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (src[i] < min) min = src[i]; }
                     var bytes = new byte[n * 4];
                     var dst = MemoryMarshal.Cast<byte, int>(bytes.AsSpan());
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) { dst[i] = 0; continue; }
+                        if (hasNulls && IsNullAt(validity, off + i)) { dst[i] = 0; continue; }
                         dst[i] = src[i] - min;
                     }
                     return (new Int32Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
@@ -409,14 +417,14 @@ internal static class ForArrayEncoder
                 }
             case Int64Array:
                 {
-                    var src = MemoryMarshal.Cast<byte, long>(data.Buffers[1].Span.Slice(0, n * 8));
+                    var src = MemoryMarshal.Cast<byte, long>(data.Buffers[1].Span.Slice(off * 8, n * 8));
                     long min = long.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (src[i] < min) min = src[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (src[i] < min) min = src[i]; }
                     var bytes = new byte[n * 8];
                     var dst = MemoryMarshal.Cast<byte, long>(bytes.AsSpan());
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) { dst[i] = 0; continue; }
+                        if (hasNulls && IsNullAt(validity, off + i)) { dst[i] = 0; continue; }
                         dst[i] = src[i] - min;
                     }
                     return (new Int64Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
@@ -424,13 +432,13 @@ internal static class ForArrayEncoder
                 }
             case UInt8Array:
                 {
-                    var src = data.Buffers[1].Span.Slice(0, n);
+                    var src = data.Buffers[1].Span.Slice(off, n);
                     byte min = byte.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (src[i] < min) min = src[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (src[i] < min) min = src[i]; }
                     var bytes = new byte[n];
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) { bytes[i] = 0; continue; }
+                        if (hasNulls && IsNullAt(validity, off + i)) { bytes[i] = 0; continue; }
                         bytes[i] = (byte)(src[i] - min);
                     }
                     return (new UInt8Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
@@ -438,14 +446,14 @@ internal static class ForArrayEncoder
                 }
             case UInt16Array:
                 {
-                    var src = MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(0, n * 2));
+                    var src = MemoryMarshal.Cast<byte, ushort>(data.Buffers[1].Span.Slice(off * 2, n * 2));
                     ushort min = ushort.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (src[i] < min) min = src[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (src[i] < min) min = src[i]; }
                     var bytes = new byte[n * 2];
                     var dst = MemoryMarshal.Cast<byte, ushort>(bytes.AsSpan());
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) { dst[i] = 0; continue; }
+                        if (hasNulls && IsNullAt(validity, off + i)) { dst[i] = 0; continue; }
                         dst[i] = (ushort)(src[i] - min);
                     }
                     return (new UInt16Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
@@ -453,14 +461,14 @@ internal static class ForArrayEncoder
                 }
             case UInt32Array:
                 {
-                    var src = MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(0, n * 4));
+                    var src = MemoryMarshal.Cast<byte, uint>(data.Buffers[1].Span.Slice(off * 4, n * 4));
                     uint min = uint.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (src[i] < min) min = src[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (src[i] < min) min = src[i]; }
                     var bytes = new byte[n * 4];
                     var dst = MemoryMarshal.Cast<byte, uint>(bytes.AsSpan());
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) { dst[i] = 0; continue; }
+                        if (hasNulls && IsNullAt(validity, off + i)) { dst[i] = 0; continue; }
                         dst[i] = src[i] - min;
                     }
                     return (new UInt32Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
@@ -468,14 +476,14 @@ internal static class ForArrayEncoder
                 }
             case UInt64Array:
                 {
-                    var src = MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(0, n * 8));
+                    var src = MemoryMarshal.Cast<byte, ulong>(data.Buffers[1].Span.Slice(off * 8, n * 8));
                     ulong min = ulong.MaxValue;
-                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, i)) continue; if (src[i] < min) min = src[i]; }
+                    for (int i = 0; i < n; i++) { if (hasNulls && IsNullAt(validity, off + i)) continue; if (src[i] < min) min = src[i]; }
                     var bytes = new byte[n * 8];
                     var dst = MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan());
                     for (int i = 0; i < n; i++)
                     {
-                        if (hasNulls && IsNullAt(validity, i)) { dst[i] = 0; continue; }
+                        if (hasNulls && IsNullAt(validity, off + i)) { dst[i] = 0; continue; }
                         dst[i] = src[i] - min;
                     }
                     return (new UInt64Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
