@@ -24,15 +24,19 @@ public class VortexCrossValidationTests
 {
     private static string? FindValidator()
     {
-        // Test data dir is at .../EngineeredWood.Vortex.Tests/TestData; the Rust
-        // crate is at .../EngineeredWood.Vortex.Tests/Rust/target/release/.
-        var testDataDir = TestDataPath.Resolve("struct_int_3rows.vortex");
-        var rustTargetDir = Path.Combine(
-            Path.GetDirectoryName(testDataDir)!, "..", "Rust", "target", "release");
+        // TestDataPath.Resolve returns bin/.../TestData/<file>; walk up until
+        // we land on the EngineeredWood.Vortex.Tests project dir (sibling to
+        // the Rust crate at Rust/target/release/vortex-validator).
         var exeName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
             ? "vortex-validator.exe" : "vortex-validator";
-        var path = Path.GetFullPath(Path.Combine(rustTargetDir, exeName));
-        return File.Exists(path) ? path : null;
+        var dir = Path.GetDirectoryName(TestDataPath.Resolve("struct_int_3rows.vortex"));
+        for (int i = 0; i < 8 && dir is not null; i++)
+        {
+            var candidate = Path.Combine(dir, "Rust", "target", "release", exeName);
+            if (File.Exists(candidate)) return candidate;
+            dir = Path.GetDirectoryName(dir);
+        }
+        return null;
     }
 
     private static (int ExitCode, string Stdout, string Stderr) RunValidator(string validator, string fileArg)
@@ -562,6 +566,49 @@ public class VortexCrossValidationTests
         {
             using (var fs = File.Create(path))
                 VortexFileWriter.Write(fs, batch);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public void RustReader_OpensDotNetWrittenAlpFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Decimal-like f64 column → vortex.alp dispatches. Mix in a couple of
+        // non-decimal values (PI, NaN) to exercise the patches path.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("price", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 1_000;
+        var b = new DoubleArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            switch (i)
+            {
+                case 100: b.Append(Math.PI); break;
+                case 500: b.Append(double.NaN); break;
+                default: b.Append(1.5 + (i % 100) * 0.01); break;
+            }
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
 
             var (code, stdout, stderr) = RunValidator(validator, path);
             Assert.True(code == 0,

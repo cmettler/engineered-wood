@@ -51,6 +51,7 @@ public sealed class VortexFileWriter : IDisposable
     private const ushort DictEncodingIdx = 10;
     private const ushort RleEncodingIdx = 11;
     private const ushort StructEncodingIdx = 12;
+    private const ushort AlpEncodingIdx = 13;
     private static readonly EncodingIndices Indices = new(
         Primitive: PrimitiveEncodingIdx,
         Bool: BoolEncodingIdx,
@@ -64,7 +65,8 @@ public sealed class VortexFileWriter : IDisposable
         Delta: DeltaEncodingIdx,
         Dict: DictEncodingIdx,
         Rle: RleEncodingIdx,
-        Struct_: StructEncodingIdx);
+        Struct_: StructEncodingIdx,
+        Alp: AlpEncodingIdx);
 
     // Layout-spec registry constants.
     private const ushort FlatLayoutIdx = 0;
@@ -195,6 +197,7 @@ public sealed class VortexFileWriter : IDisposable
                 VortexArrayEncodings.Dict,
                 VortexArrayEncodings.FastlanesRle,
                 VortexArrayEncodings.Struct_,
+                VortexArrayEncodings.Alp,
             },
             layoutSpecs: new[] { VortexLayoutEncodings.Flat, VortexLayoutEncodings.Struct, VortexLayoutEncodings.Chunked },
             segmentSpecs: _sw.SegmentSpecs);

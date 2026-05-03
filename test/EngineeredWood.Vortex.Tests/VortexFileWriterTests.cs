@@ -2030,6 +2030,147 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Alp_DecimalLikeF64Compresses()
+    {
+        // 2000 doubles representing prices ($X.YY style) — bit-irregular but
+        // each fits exactly as integer × 10^-2. ALP picks (e=2, f=0) and
+        // encodes as int×100, which bitpacks to a fraction of native width.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("price", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 2_000;
+        var b = new DoubleArray.Builder();
+        for (int i = 0; i < n; i++) b.Append(10.0 + (i % 500) * 0.01); // 10.00..14.99
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize < rawSize / 2,
+                $"ALP on decimal-like doubles should give >2x compression. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(10.0 + (i % 500) * 0.01, read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Alp_F32WithPatchesRoundtrips()
+    {
+        // Mostly decimal-like Float32 with a few non-decimal outliers (PI, E,
+        // NaN, ±Infinity) — outliers get patched and the bulk encodes tightly.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", FloatType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 1_500;
+        var b = new FloatArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            switch (i)
+            {
+                case 100: b.Append((float)Math.PI); break;
+                case 500: b.Append((float)Math.E); break;
+                case 800: b.Append(float.NaN); break;
+                case 1000: b.Append(float.PositiveInfinity); break;
+                case 1200: b.Append(float.NegativeInfinity); break;
+                default: b.Append(1.5f + (i % 100) * 0.01f); break;
+            }
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<FloatArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+            {
+                float expected = i switch
+                {
+                    100 => (float)Math.PI,
+                    500 => (float)Math.E,
+                    800 => float.NaN,
+                    1000 => float.PositiveInfinity,
+                    1200 => float.NegativeInfinity,
+                    _ => 1.5f + (i % 100) * 0.01f,
+                };
+                float actual = read.GetValue(i)!.Value;
+                if (float.IsNaN(expected))
+                    Assert.True(float.IsNaN(actual), $"row {i}: expected NaN, got {actual}");
+                else
+                    Assert.Equal(expected, actual);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Alp_NullableF64Roundtrips()
+    {
+        // Nullable doubles: ALP encoded child carries the validity bitmap.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 1_000;
+        var b = new DoubleArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 7 == 0) b.AppendNull();
+            else b.Append(123.45 + (i % 200) * 0.01);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+            {
+                if (i % 7 == 0)
+                    Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    Assert.Equal(123.45 + (i % 200) * 0.01, read.GetValue(i));
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Rle_RepetitiveDoublesCompress()
     {
         // Float64 column with 5 distinct values cycling in 64-row runs.

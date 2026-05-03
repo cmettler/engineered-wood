@@ -525,8 +525,10 @@ internal static class ArrayStatsComputer
     {
         bool hasNulls = data.GetNullCount() > 0;
         var bitmap = hasNulls ? data.Buffers[0].Span : default;
-        // Accumulate in double to reduce precision loss across many summands;
-        // cast back to float at the end to match the input dtype.
+        // Vortex's Sum stat for primitive types is always the 64-bit variant
+        // (i64 / u64 / f64) regardless of the column's native width — see
+        // upstream stats_set.rs ("Sum stats for primitive types are always the
+        // 64-bit version"). Accumulate in double, emit as f64 ScalarValue.
         double sum = 0;
         bool any = false;
         for (int i = 0; i < n; i++)
@@ -541,7 +543,7 @@ internal static class ArrayStatsComputer
             sum += v;
             any = true;
         }
-        return any ? ScalarValueSerializer.FromFloat32((float)sum) : null;
+        return any ? ScalarValueSerializer.FromFloat64(sum) : null;
     }
 
     private static byte[]? SumFloat64(ReadOnlySpan<double> span, ArrayData data, int n)
