@@ -190,6 +190,66 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenListOfStructFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // List<Struct<id: int32, name: string>> — exercises both list and
+        // struct array-level encodings cascading.
+        var elemType = new StructType(new[]
+        {
+            new Field("id", Int32Type.Default, nullable: false),
+            new Field("name", StringType.Default, nullable: false),
+        });
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("rows", new ListType(new Field("item", elemType, nullable: false)), nullable: false),
+        }, metadata: null);
+
+        const int n = 50;
+        var idB = new Int32Array.Builder();
+        var nameB = new StringArray.Builder();
+        var listOffsets = new int[n + 1];
+        int totalElems = 0;
+        for (int i = 0; i < n; i++)
+        {
+            listOffsets[i] = totalElems;
+            int len = (i % 3) + 1;
+            for (int j = 0; j < len; j++) { idB.Append(i * 100 + j); nameB.Append($"r{i}_{j}"); }
+            totalElems += len;
+        }
+        listOffsets[n] = totalElems;
+        var elemsStruct = new StructArray(elemType, totalElems,
+            new IArrowArray[] { idB.Build(), nameB.Build() }, ArrowBuffer.Empty, 0);
+        var offsetsBytes = new byte[(n + 1) * 4];
+        for (int i = 0; i <= n; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                offsetsBytes.AsSpan(i * 4, 4), listOffsets[i]);
+        var listArr = new ListArray(
+            new ListType(new Field("item", elemType, nullable: false)),
+            n, new ArrowBuffer(offsetsBytes), elemsStruct, ArrowBuffer.Empty, 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { listArr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenStructOfStructFile()
     {
         var validator = FindValidator();

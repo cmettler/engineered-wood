@@ -1436,6 +1436,287 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task NestedComposite_ListOfStructRoundtrips()
+    {
+        // Top-level field: List<Struct<id: int32, name: string>>. Encoder
+        // walks list → sliced struct elements → recursive struct encode.
+        var elemType = new StructType(new[]
+        {
+            new Field("id", Int32Type.Default, nullable: false),
+            new Field("name", StringType.Default, nullable: false),
+        });
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("rows", new ListType(new Field("item", elemType, nullable: false)), nullable: false),
+        }, metadata: null);
+
+        const int n = 25; // n list rows
+        // Build lists of struct elements: row i has (i % 3) + 1 elements,
+        // each with id=i*100+j, name="row{i}_{j}".
+        var idB = new Int32Array.Builder();
+        var nameB = new StringArray.Builder();
+        var listOffsets = new int[n + 1];
+        int totalElems = 0;
+        for (int i = 0; i < n; i++)
+        {
+            listOffsets[i] = totalElems;
+            int len = (i % 3) + 1;
+            for (int j = 0; j < len; j++)
+            {
+                idB.Append(i * 100 + j);
+                nameB.Append($"row{i}_{j}");
+            }
+            totalElems += len;
+        }
+        listOffsets[n] = totalElems;
+        var idArr = idB.Build();
+        var nameArr = nameB.Build();
+        var elemsStruct = new StructArray(elemType, totalElems,
+            new IArrowArray[] { idArr, nameArr }, ArrowBuffer.Empty, 0);
+        var offsetsBytes = new byte[(n + 1) * 4];
+        for (int i = 0; i <= n; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                offsetsBytes.AsSpan(i * 4, 4), listOffsets[i]);
+        var listArr = new ListArray(
+            new ListType(new Field("item", elemType, nullable: false)),
+            n,
+            new ArrowBuffer(offsetsBytes),
+            elemsStruct,
+            ArrowBuffer.Empty,
+            nullCount: 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { listArr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<ListArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            var readElems = (StructArray)read.Values;
+            var readIds = (Int32Array)readElems.Fields[0];
+            var readNames = (StringArray)readElems.Fields[1];
+            for (int i = 0; i < n; i++)
+            {
+                int len = (i % 3) + 1;
+                int start = read.ValueOffsets[i];
+                int end = read.ValueOffsets[i + 1];
+                Assert.Equal(len, end - start);
+                for (int j = 0; j < len; j++)
+                {
+                    Assert.Equal(i * 100 + j, readIds.GetValue(start + j));
+                    Assert.Equal($"row{i}_{j}", readNames.GetString(start + j));
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task NestedComposite_StructWithListRoundtrips()
+    {
+        // Top-level field: Struct<scalar: int32, items: List<int32>>. Encoder
+        // walks struct → fields[1] is a list → recursive list encode.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("rec", new StructType(new[]
+            {
+                new Field("scalar", Int32Type.Default, nullable: false),
+                new Field("items", new ListType(Int32Type.Default), nullable: false),
+            }), nullable: false),
+        }, metadata: null);
+
+        const int n = 30;
+        var scalarB = new Int32Array.Builder();
+        var itemsB = new ListArray.Builder(Int32Type.Default);
+        var inner = (Int32Array.Builder)itemsB.ValueBuilder;
+        for (int i = 0; i < n; i++)
+        {
+            scalarB.Append(i * 7);
+            itemsB.Append();
+            int len = (i % 4) + 1;
+            for (int j = 0; j < len; j++) inner.Append(i + j * 1000);
+        }
+        var structArr = new StructArray(
+            (StructType)schema.FieldsList[0].DataType, n,
+            new IArrowArray[] { scalarB.Build(), itemsB.Build() }, ArrowBuffer.Empty, 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { structArr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StructArray>(await reader.ReadColumnAsync(0));
+            var readScalar = (Int32Array)read.Fields[0];
+            var readItems = (ListArray)read.Fields[1];
+            var readInner = (Int32Array)readItems.Values;
+            for (int i = 0; i < n; i++)
+            {
+                Assert.Equal(i * 7, readScalar.GetValue(i));
+                int len = (i % 4) + 1;
+                int start = readItems.ValueOffsets[i];
+                int end = readItems.ValueOffsets[i + 1];
+                Assert.Equal(len, end - start);
+                for (int j = 0; j < len; j++)
+                    Assert.Equal(i + j * 1000, readInner.GetValue(start + j));
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task NestedComposite_ListOfListRoundtrips()
+    {
+        // List<List<int32>>: each row is a list whose elements are themselves
+        // lists. Encoder cascades list → list → primitive.
+        var inner = new ListType(new Field("item", Int32Type.Default, nullable: false));
+        var outer = new ListType(new Field("item", inner, nullable: false));
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("matrix", outer, nullable: false),
+        }, metadata: null);
+
+        const int n = 12;
+        // Row i has (i % 3) + 1 inner-lists; inner list j has (j + 1) elements.
+        var leafB = new Int32Array.Builder();
+        var innerOffsets = new List<int>();
+        var outerOffsets = new int[n + 1];
+        int innerCount = 0;
+        int leafTotal = 0;
+        for (int i = 0; i < n; i++)
+        {
+            outerOffsets[i] = innerCount;
+            int innerLen = (i % 3) + 1;
+            for (int j = 0; j < innerLen; j++)
+            {
+                innerOffsets.Add(leafTotal);
+                int leafLen = j + 1;
+                for (int k = 0; k < leafLen; k++) leafB.Append(i * 1000 + j * 100 + k);
+                leafTotal += leafLen;
+                innerCount++;
+            }
+        }
+        outerOffsets[n] = innerCount;
+        innerOffsets.Add(leafTotal);
+
+        var leafArr = leafB.Build();
+        var innerOffsetBytes = new byte[innerOffsets.Count * 4];
+        for (int i = 0; i < innerOffsets.Count; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                innerOffsetBytes.AsSpan(i * 4, 4), innerOffsets[i]);
+        var innerListArr = new ListArray(inner, innerCount,
+            new ArrowBuffer(innerOffsetBytes), leafArr, ArrowBuffer.Empty, 0);
+        var outerOffsetBytes = new byte[(n + 1) * 4];
+        for (int i = 0; i <= n; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                outerOffsetBytes.AsSpan(i * 4, 4), outerOffsets[i]);
+        var outerListArr = new ListArray(outer, n,
+            new ArrowBuffer(outerOffsetBytes), innerListArr, ArrowBuffer.Empty, 0);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { outerListArr }, n);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<ListArray>(await reader.ReadColumnAsync(0));
+            var readInner = (ListArray)read.Values;
+            var readLeaf = (Int32Array)readInner.Values;
+            int innerIdx = 0;
+            for (int i = 0; i < n; i++)
+            {
+                int innerLen = (i % 3) + 1;
+                int outerStart = read.ValueOffsets[i];
+                int outerEnd = read.ValueOffsets[i + 1];
+                Assert.Equal(innerLen, outerEnd - outerStart);
+                for (int j = 0; j < innerLen; j++)
+                {
+                    int leafLen = j + 1;
+                    int leafStart = readInner.ValueOffsets[outerStart + j];
+                    int leafEnd = readInner.ValueOffsets[outerStart + j + 1];
+                    Assert.Equal(leafLen, leafEnd - leafStart);
+                    for (int k = 0; k < leafLen; k++)
+                        Assert.Equal(i * 1000 + j * 100 + k, readLeaf.GetValue(leafStart + k));
+                    innerIdx++;
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task NestedComposite_FSLOfStructRoundtrips()
+    {
+        // FixedSizeList<Struct<a: int32, b: string>, 2>: each row has exactly
+        // 2 struct elements.
+        var elemType = new StructType(new[]
+        {
+            new Field("a", Int32Type.Default, nullable: false),
+            new Field("b", StringType.Default, nullable: false),
+        });
+        const int listSize = 2;
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("pair", new FixedSizeListType(
+                new Field("e", elemType, nullable: false), listSize), nullable: false),
+        }, metadata: null);
+
+        const int n = 20;
+        var aB = new Int32Array.Builder();
+        var bB = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+        for (int j = 0; j < listSize; j++)
+        {
+            aB.Append(i * 10 + j);
+            bB.Append($"x{i}.{j}");
+        }
+        var elemsStruct = new StructArray(elemType, n * listSize,
+            new IArrowArray[] { aB.Build(), bB.Build() }, ArrowBuffer.Empty, 0);
+        var fslType = (FixedSizeListType)schema.FieldsList[0].DataType;
+        var fslArr = new FixedSizeListArray(fslType, n, elemsStruct, ArrowBuffer.Empty, 0);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { fslArr }, n);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<FixedSizeListArray>(await reader.ReadColumnAsync(0));
+            var readElems = (StructArray)read.Values;
+            var readA = (Int32Array)readElems.Fields[0];
+            var readB = (StringArray)readElems.Fields[1];
+            for (int i = 0; i < n; i++)
+            for (int j = 0; j < listSize; j++)
+            {
+                Assert.Equal(i * 10 + j, readA.GetValue(i * listSize + j));
+                Assert.Equal($"x{i}.{j}", readB.GetString(i * listSize + j));
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Struct_FlatRoundtrips()
     {
         // Top-level field is a Struct with 3 leaf fields. Encoder dispatches
