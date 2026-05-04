@@ -1287,6 +1287,66 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task PreserveStats_FloatColumnRoundtrips()
+    {
+        // Phase C adds float stats: min, max, sum, null_count, nan_count.
+        // The reader still skips zones, so we just verify the file remains
+        // valid round-trip and cross-val succeeds (the more meaningful
+        // assertion lives in the cross-val test for float zoned stats).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: true),
+        }, metadata: null);
+        var sizes = new[] { 200, 200, 100 };
+
+        DoubleArray BuildBatch(int batchIdx, int n)
+        {
+            var b = new DoubleArray.Builder();
+            for (int i = 0; i < n; i++)
+            {
+                if (i == 0 && batchIdx == 1) b.Append(double.NaN);
+                else if (i % 11 == 0) b.AppendNull();
+                else b.Append(batchIdx + i * 0.5);
+            }
+            return b.Build();
+        }
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                for (int batchIdx = 0; batchIdx < sizes.Length; batchIdx++)
+                {
+                    int sz = sizes[batchIdx];
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { BuildBatch(batchIdx, sz) }, sz));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            int idx = 0;
+            for (int batchIdx = 0; batchIdx < sizes.Length; batchIdx++)
+            {
+                for (int i = 0; i < sizes[batchIdx]; i++)
+                {
+                    if (i == 0 && batchIdx == 1)
+                        Assert.True(double.IsNaN(read.GetValue(idx)!.Value));
+                    else if (i % 11 == 0) Assert.False(read.IsValid(idx));
+                    else Assert.Equal(batchIdx + i * 0.5, read.GetValue(idx)!.Value);
+                    idx++;
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task PreserveStats_AllNullIntegerBatchClearsMinMaxValidity()
     {
         // Edge case: one batch is entirely null. The min/max columns in

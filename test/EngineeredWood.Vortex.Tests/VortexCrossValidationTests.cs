@@ -864,6 +864,61 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenZonedStatsFloatFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Float column with Phase C's full stat set: max, max_is_truncated,
+        // min, min_is_truncated, sum, null_count, nan_count. Cross-val is
+        // the strongest signal that we got the wire format right — the
+        // Rust reader parses the zones table struct and validates each
+        // field's dtype against the present_stats bitset.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: true),
+        }, metadata: null);
+        var sizes = new[] { 200, 200, 200, 100 };
+
+        DoubleArray BuildBatch(int batchIdx, int n)
+        {
+            var b = new DoubleArray.Builder();
+            for (int i = 0; i < n; i++)
+            {
+                if (i % 13 == 0) b.AppendNull();
+                else if (i == 7 && batchIdx == 2) b.Append(double.NaN);
+                else b.Append(batchIdx * 100.0 + i * 0.5);
+            }
+            return b.Build();
+        }
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                for (int batchIdx = 0; batchIdx < sizes.Length; batchIdx++)
+                    w.WriteBatch(new RecordBatch(schema,
+                        new IArrowArray[] { BuildBatch(batchIdx, sizes[batchIdx]) },
+                        sizes[batchIdx]));
+                w.Close();
+            }
+
+            int total = sizes.Sum();
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={total}", stdout);
+            Assert.Contains($"DONE total={total}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenZonedStatsFile()
     {
         var validator = FindValidator();

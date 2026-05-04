@@ -89,14 +89,10 @@ public sealed class VortexFileWriter : IDisposable
     private readonly SegmentWriter _sw;
     /// <summary>One per column; each entry collects (segment_idx) per WriteBatch call.</summary>
     private readonly List<uint>[] _columnSegmentsByBatch;
-    /// <summary>One per column; per-batch null counts for the zoned-stats layout.</summary>
-    private readonly List<ulong>[] _columnNullCountsByBatch;
     /// <summary>One per column; the zones-table schema scheme for this column's type.</summary>
     private readonly ZoneStatScheme[] _columnStatScheme;
-    /// <summary>For IntMinMaxNull columns: per-batch min/max bytes (column-width raw bytes)
-    /// plus a has-value flag (false when the batch was all-null).</summary>
-    private readonly List<byte[]?>[] _columnMinByBatch;
-    private readonly List<byte[]?>[] _columnMaxByBatch;
+    /// <summary>One per column; per-batch stats blob accumulator.</summary>
+    private readonly List<BatchStats>[] _columnBatchStats;
     private readonly List<ulong> _batchRowCounts = new();
     private readonly bool _compress;
     private readonly bool _preferVarBinView;
@@ -104,10 +100,44 @@ public sealed class VortexFileWriter : IDisposable
     private bool _closed;
 
     /// <summary>
+    /// Per-batch stats captured during <see cref="WriteBatch"/> for the
+    /// zones-table emission at <see cref="Close"/>. Fields are populated
+    /// based on the column's <see cref="ZoneStatScheme"/>:
+    /// <list type="bullet">
+    ///   <item>NullCountOnly: just <see cref="NullCount"/>.</item>
+    ///   <item>IntFull: <see cref="IsConstant"/>, <see cref="IsSorted"/>,
+    ///     <see cref="IsStrictSorted"/>, <see cref="MinBytes"/>,
+    ///     <see cref="MaxBytes"/>, <see cref="SumBytes"/>,
+    ///     <see cref="NullCount"/>.</item>
+    ///   <item>FloatStandard: <see cref="MinBytes"/>, <see cref="MaxBytes"/>,
+    ///     <see cref="SumBytes"/>, <see cref="NullCount"/>,
+    ///     <see cref="NaNCount"/>. Sortedness flags are skipped — NaN
+    ///     ordering would make them unreliable.</item>
+    /// </list>
+    /// Byte-array fields are LE-encoded raw values of the column's natural
+    /// width (Min/Max) or a 64-bit accumulator (Sum: i64 / u64 / f64). A
+    /// <c>null</c> byte array means "no value in this batch" and the
+    /// corresponding zones-table cell will have its validity bit cleared.
+    /// </summary>
+    private readonly struct BatchStats
+    {
+        public ulong NullCount { get; init; }
+        public ulong NaNCount { get; init; }
+        public byte[]? MinBytes { get; init; }
+        public byte[]? MaxBytes { get; init; }
+        public byte[]? SumBytes { get; init; }
+        public bool? IsConstant { get; init; }
+        public bool? IsSorted { get; init; }
+        public bool? IsStrictSorted { get; init; }
+    }
+
+    /// <summary>
     /// Stat schema for a column's per-zone table. Determines the column set
     /// in the auxiliary zones array AND the bitset that lands in the
     /// vortex.stats layout's metadata. Per upstream's `present_stats` rules
-    /// the order is sorted ascending by Stat enum value.
+    /// the order is sorted ascending by Stat enum value:
+    /// IsConstant=0, IsSorted=1, IsStrictSorted=2, Max=3, Min=4, Sum=5,
+    /// NullCount=6, UncompressedSizeInBytes=7, NaNCount=8.
     /// </summary>
     private enum ZoneStatScheme
     {
@@ -118,14 +148,27 @@ public sealed class VortexFileWriter : IDisposable
         NullCountOnly,
 
         /// <summary>
-        /// bitset = [0x58, 0x00] — bits 3 (Max), 4 (Min), 6 (NullCount).
-        /// zones struct = { max: T?, max_is_truncated: bool,
-        ///                  min: T?, min_is_truncated: bool,
+        /// bitset = [0x7F, 0x00] — bits 0..6 (IsConstant, IsSorted,
+        /// IsStrictSorted, Max, Min, Sum, NullCount).
+        /// zones struct = { is_constant: bool?, is_sorted: bool?,
+        ///                  is_strict_sorted: bool?, max: T?,
+        ///                  max_is_truncated: bool, min: T?,
+        ///                  min_is_truncated: bool, sum: i64?/u64?,
         ///                  null_count: u64 }.
-        /// Used for non-nullable / nullable integer columns where Min/Max
-        /// are well-defined and cheap to capture per batch.
         /// </summary>
-        IntMinMaxNull,
+        IntFull,
+
+        /// <summary>
+        /// bitset = [0x78, 0x01] — bits 3, 4, 5, 6 (Max, Min, Sum,
+        /// NullCount) plus bit 8 (NaNCount).
+        /// zones struct = { max: T?, max_is_truncated: bool,
+        ///                  min: T?, min_is_truncated: bool, sum: f64?,
+        ///                  null_count: u64, nan_count: u64 }.
+        /// Sortedness flags are excluded for floats — NaN comparisons
+        /// would make them unreliable, matching upstream's
+        /// <c>ComputeIntOrdering</c> short-circuit on float types.
+        /// </summary>
+        FloatStandard,
     }
 
     /// <summary>
@@ -161,16 +204,12 @@ public sealed class VortexFileWriter : IDisposable
         _sw = new SegmentWriter(_stream);
         int nFields = schema.FieldsList.Count;
         _columnSegmentsByBatch = new List<uint>[nFields];
-        _columnNullCountsByBatch = new List<ulong>[nFields];
-        _columnMinByBatch = new List<byte[]?>[nFields];
-        _columnMaxByBatch = new List<byte[]?>[nFields];
+        _columnBatchStats = new List<BatchStats>[nFields];
         _columnStatScheme = new ZoneStatScheme[nFields];
         for (int i = 0; i < nFields; i++)
         {
             _columnSegmentsByBatch[i] = new List<uint>();
-            _columnNullCountsByBatch[i] = new List<ulong>();
-            _columnMinByBatch[i] = new List<byte[]?>();
-            _columnMaxByBatch[i] = new List<byte[]?>();
+            _columnBatchStats[i] = new List<BatchStats>();
             _columnStatScheme[i] = SchemeForType(schema.FieldsList[i].DataType);
         }
 
@@ -207,23 +246,10 @@ public sealed class VortexFileWriter : IDisposable
             byte[] bytes = sb.FinishSegment(rootTicket);
             uint segIdx = _sw.AppendSegment(bytes, alignmentExponent: 0);
             _columnSegmentsByBatch[i].Add(segIdx);
-            // Capture this batch's null_count so we can build a per-zone stats
-            // table at Close. Apache.Arrow's typed array exposes NullCount via
-            // the underlying Data; using GetNullCount handles the lazy-count
-            // case for sliced columns even though we don't slice at the
-            // top-level here.
-            _columnNullCountsByBatch[i].Add((ulong)((Apache.Arrow.Array)col).Data.GetNullCount());
-
-            // For integer columns, also capture per-batch min/max for the
-            // zones table. Phase B emits these alongside null_count so the
-            // reader (when it grows pruning) can skip whole zones via
-            // predicate evaluation against the min/max bounds.
-            if (_columnStatScheme[i] == ZoneStatScheme.IntMinMaxNull)
-            {
-                var (minBytes, maxBytes) = ComputeIntMinMax(col);
-                _columnMinByBatch[i].Add(minBytes);
-                _columnMaxByBatch[i].Add(maxBytes);
-            }
+            // Capture this batch's stats blob so we can build a per-zone
+            // stats table at Close. Different schemes populate different
+            // fields — see ComputeBatchStats / ZoneStatScheme.
+            _columnBatchStats[i].Add(ComputeBatchStats(col, _columnStatScheme[i]));
         }
         _batchRowCounts.Add(checked((ulong)batch.Length));
     }
@@ -251,7 +277,9 @@ public sealed class VortexFileWriter : IDisposable
             or Apache.Arrow.Types.Int32Type or Apache.Arrow.Types.Int64Type
             or Apache.Arrow.Types.UInt8Type or Apache.Arrow.Types.UInt16Type
             or Apache.Arrow.Types.UInt32Type or Apache.Arrow.Types.UInt64Type
-            => ZoneStatScheme.IntMinMaxNull,
+            => ZoneStatScheme.IntFull,
+        Apache.Arrow.Types.FloatType or Apache.Arrow.Types.DoubleType
+            => ZoneStatScheme.FloatStandard,
         _ => ZoneStatScheme.NullCountOnly,
     };
 
@@ -262,10 +290,12 @@ public sealed class VortexFileWriter : IDisposable
     /// </summary>
     private static byte[] BitsetForScheme(ZoneStatScheme scheme) => scheme switch
     {
-        // Bit 6 (NullCount) only.
+        // Bit 6 (NullCount).
         ZoneStatScheme.NullCountOnly => new byte[] { 0x40, 0x00 },
-        // Bits 3 (Max) | 4 (Min) | 6 (NullCount) = 0x58 in byte 0.
-        ZoneStatScheme.IntMinMaxNull => new byte[] { 0x58, 0x00 },
+        // Bits 0..6 (IsConstant, IsSorted, IsStrictSorted, Max, Min, Sum, NullCount) = 0x7F.
+        ZoneStatScheme.IntFull => new byte[] { 0x7F, 0x00 },
+        // Bits 3..6 (Max, Min, Sum, NullCount) = 0x78, plus bit 8 (NaNCount) = 0x01.
+        ZoneStatScheme.FloatStandard => new byte[] { 0x78, 0x01 },
         _ => throw new NotSupportedException(),
     };
 
@@ -279,28 +309,50 @@ public sealed class VortexFileWriter : IDisposable
     };
 
     /// <summary>
-    /// Computes (min, max) over an integer column's non-null rows. Returns
-    /// the raw bytes (column-width LE) for each, or <c>null</c> when the
-    /// column is empty / all-null in this batch — the zones-table cell
-    /// for that batch then has its validity bit cleared.
+    /// Computes a per-batch <see cref="BatchStats"/> blob for the given
+    /// column based on its <see cref="ZoneStatScheme"/>. Walks the column
+    /// once for integer / float schemes; NullCountOnly just reads the
+    /// already-computed null count from <c>Data</c>.
     /// </summary>
-    private static (byte[]? Min, byte[]? Max) ComputeIntMinMax(Apache.Arrow.IArrowArray col)
+    private static BatchStats ComputeBatchStats(Apache.Arrow.IArrowArray col, ZoneStatScheme scheme)
     {
         var data = ((Apache.Arrow.Array)col).Data;
+        ulong nullCount = (ulong)data.GetNullCount();
+        if (scheme == ZoneStatScheme.NullCountOnly)
+            return new BatchStats { NullCount = nullCount };
+        if (scheme == ZoneStatScheme.IntFull)
+            return ComputeIntStats(col, data, nullCount);
+        if (scheme == ZoneStatScheme.FloatStandard)
+            return ComputeFloatStats(col, data, nullCount);
+        throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// Single-pass compute of {Min, Max, Sum, IsConstant, IsSorted,
+    /// IsStrictSorted, NullCount} for an integer column. Sum widens to i64
+    /// (signed) or u64 (unsigned); arithmetic is unchecked, matching
+    /// upstream's "sum may wrap silently" convention. Empty/all-null
+    /// batches return null Min/Max/Sum bytes — the zones-table cells get
+    /// their validity bit cleared.
+    /// </summary>
+    private static BatchStats ComputeIntStats(
+        Apache.Arrow.IArrowArray col, Apache.Arrow.ArrayData data, ulong nullCount)
+    {
         int n = col.Length;
-        if (n == 0) return (null, null);
-        bool hasNulls = data.GetNullCount() > 0;
+        bool hasNulls = nullCount > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
         int off = data.Offset;
-
         bool isSigned = col is Apache.Arrow.Int8Array or Apache.Arrow.Int16Array
             or Apache.Arrow.Int32Array or Apache.Arrow.Int64Array;
-        int byteWidth = ByteWidthForIntType(((Apache.Arrow.Array)col).Data.DataType);
+        int byteWidth = ByteWidthForIntType(data.DataType);
         var src = data.Buffers[1].Span.Slice(off * byteWidth, n * byteWidth);
 
         bool any = false;
-        long sMin = long.MaxValue, sMax = long.MinValue;
-        ulong uMin = ulong.MaxValue, uMax = ulong.MinValue;
+        long sMin = long.MaxValue, sMax = long.MinValue, sSum = 0;
+        ulong uMin = ulong.MaxValue, uMax = ulong.MinValue, uSum = 0;
+        long sFirst = 0, sPrev = 0;
+        ulong uFirst = 0, uPrev = 0;
+        bool isConstant = true, isSorted = true, isStrictSorted = true;
 
         for (int i = 0; i < n; i++)
         {
@@ -320,8 +372,21 @@ public sealed class VortexFileWriter : IDisposable
                     8 => System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(src.Slice(p, 8)),
                     _ => throw new NotSupportedException(),
                 };
-                if (!any) { sMin = sMax = v; any = true; }
-                else { if (v < sMin) sMin = v; if (v > sMax) sMax = v; }
+                unchecked { sSum += v; }
+                if (!any)
+                {
+                    sMin = sMax = sFirst = sPrev = v;
+                    any = true;
+                }
+                else
+                {
+                    if (v < sMin) sMin = v;
+                    if (v > sMax) sMax = v;
+                    if (v != sFirst) isConstant = false;
+                    if (v < sPrev) { isSorted = false; isStrictSorted = false; }
+                    else if (v == sPrev) isStrictSorted = false;
+                    sPrev = v;
+                }
             }
             else
             {
@@ -333,26 +398,136 @@ public sealed class VortexFileWriter : IDisposable
                     8 => System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(src.Slice(p, 8)),
                     _ => throw new NotSupportedException(),
                 };
-                if (!any) { uMin = uMax = v; any = true; }
-                else { if (v < uMin) uMin = v; if (v > uMax) uMax = v; }
+                unchecked { uSum += v; }
+                if (!any)
+                {
+                    uMin = uMax = uFirst = uPrev = v;
+                    any = true;
+                }
+                else
+                {
+                    if (v < uMin) uMin = v;
+                    if (v > uMax) uMax = v;
+                    if (v != uFirst) isConstant = false;
+                    if (v < uPrev) { isSorted = false; isStrictSorted = false; }
+                    else if (v == uPrev) isStrictSorted = false;
+                    uPrev = v;
+                }
             }
         }
 
-        if (!any) return (null, null);
+        if (!any)
+        {
+            // Empty / all-null batch: Min/Max/Sum cells are null. Sortedness
+            // and is_constant for an empty range are vacuously "true" but
+            // we set them null since there's no data to characterise.
+            return new BatchStats { NullCount = nullCount };
+        }
 
         var minBytes = new byte[byteWidth];
         var maxBytes = new byte[byteWidth];
+        var sumBytes = new byte[8];
         if (isSigned)
         {
             WriteIntLE(minBytes, sMin, byteWidth);
             WriteIntLE(maxBytes, sMax, byteWidth);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(sumBytes, sSum);
         }
         else
         {
             WriteIntLE(minBytes, unchecked((long)uMin), byteWidth);
             WriteIntLE(maxBytes, unchecked((long)uMax), byteWidth);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(sumBytes, uSum);
         }
-        return (minBytes, maxBytes);
+        return new BatchStats
+        {
+            NullCount = nullCount,
+            MinBytes = minBytes,
+            MaxBytes = maxBytes,
+            SumBytes = sumBytes,
+            IsConstant = isConstant,
+            IsSorted = isSorted,
+            IsStrictSorted = isStrictSorted,
+        };
+    }
+
+    /// <summary>
+    /// Single-pass compute of {Min, Max, Sum, NullCount, NaNCount} for a
+    /// float column. NaNs are excluded from Min/Max/Sum but counted in
+    /// NaNCount. Sum is accumulated in f64 regardless of input width.
+    /// Sortedness flags are skipped — NaN ordering would make them
+    /// unreliable, matching upstream's behavior.
+    /// </summary>
+    private static BatchStats ComputeFloatStats(
+        Apache.Arrow.IArrowArray col, Apache.Arrow.ArrayData data, ulong nullCount)
+    {
+        int n = col.Length;
+        bool hasNulls = nullCount > 0;
+        var validity = hasNulls ? data.Buffers[0].Span : default;
+        int off = data.Offset;
+        bool isF32 = col is Apache.Arrow.FloatArray;
+        int byteWidth = isF32 ? 4 : 8;
+        var src = data.Buffers[1].Span.Slice(off * byteWidth, n * byteWidth);
+
+        bool any = false;
+        double dMin = 0, dMax = 0, dSum = 0;
+        ulong nanCount = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (hasNulls)
+            {
+                int gb = off + i;
+                if ((validity[gb >> 3] & (1 << (gb & 7))) == 0) continue;
+            }
+            double v;
+            if (isF32)
+            {
+                int bits = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(
+                    src.Slice(i * 4, 4));
+                v = Int32BitsToSingle(bits);
+            }
+            else
+            {
+                long bits = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(
+                    src.Slice(i * 8, 8));
+                v = BitConverter.Int64BitsToDouble(bits);
+            }
+            if (double.IsNaN(v)) { nanCount++; continue; }
+            dSum += v;
+            if (!any) { dMin = dMax = v; any = true; }
+            else { if (v < dMin) dMin = v; if (v > dMax) dMax = v; }
+        }
+
+        if (!any)
+            return new BatchStats { NullCount = nullCount, NaNCount = nanCount };
+
+        var minBytes = new byte[byteWidth];
+        var maxBytes = new byte[byteWidth];
+        var sumBytes = new byte[8];
+        if (isF32)
+        {
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                minBytes, SingleToInt32Bits((float)dMin));
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                maxBytes, SingleToInt32Bits((float)dMax));
+        }
+        else
+        {
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(
+                minBytes, BitConverter.DoubleToInt64Bits(dMin));
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(
+                maxBytes, BitConverter.DoubleToInt64Bits(dMax));
+        }
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(
+            sumBytes, BitConverter.DoubleToInt64Bits(dSum));
+        return new BatchStats
+        {
+            NullCount = nullCount,
+            NaNCount = nanCount,
+            MinBytes = minBytes,
+            MaxBytes = maxBytes,
+            SumBytes = sumBytes,
+        };
     }
 
     private static void WriteIntLE(Span<byte> dest, long value, int byteWidth)
@@ -367,135 +542,205 @@ public sealed class VortexFileWriter : IDisposable
         }
     }
 
+    /// <summary>netstandard2.0-compat shims for the f32 ↔ i32 bitcast.</summary>
+    private static int SingleToInt32Bits(float f)
+    {
+#if NET6_0_OR_GREATER
+        return BitConverter.SingleToInt32Bits(f);
+#else
+        return BitConverter.ToInt32(BitConverter.GetBytes(f), 0);
+#endif
+    }
+
+    private static float Int32BitsToSingle(int bits)
+    {
+#if NET6_0_OR_GREATER
+        return BitConverter.Int32BitsToSingle(bits);
+#else
+        return BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
+#endif
+    }
+
     /// <summary>
     /// Builds and appends a per-column zones segment. Dispatches on the
-    /// column's <see cref="ZoneStatScheme"/> — NullCountOnly emits a
-    /// 1-field struct, IntMinMaxNull emits 5 fields.
+    /// column's <see cref="ZoneStatScheme"/>:
+    /// <list type="bullet">
+    ///   <item>NullCountOnly: 1-field struct.</item>
+    ///   <item>IntFull: 9-field struct (sorted [IsConstant, IsSorted,
+    ///     IsStrictSorted, Max, MaxIsTruncated, Min, MinIsTruncated, Sum,
+    ///     NullCount]).</item>
+    ///   <item>FloatStandard: 7-field struct ([Max, MaxIsTruncated, Min,
+    ///     MinIsTruncated, Sum, NullCount, NaNCount]).</item>
+    /// </list>
     /// </summary>
     private uint EmitZonesSegment(int columnIdx)
     {
+        var stats = _columnBatchStats[columnIdx];
         return _columnStatScheme[columnIdx] switch
         {
-            ZoneStatScheme.NullCountOnly => EmitZonesSegmentNullCountOnly(columnIdx),
-            ZoneStatScheme.IntMinMaxNull => EmitZonesSegmentIntMinMaxNull(columnIdx),
+            ZoneStatScheme.NullCountOnly => EmitZonesSegmentNullCountOnly(stats),
+            ZoneStatScheme.IntFull => EmitZonesSegmentIntFull(stats, columnIdx),
+            ZoneStatScheme.FloatStandard => EmitZonesSegmentFloatStandard(stats, columnIdx),
             _ => throw new NotSupportedException(),
         };
     }
 
-    private uint EmitZonesSegmentNullCountOnly(int columnIdx)
+    private uint EmitZonesSegmentNullCountOnly(List<BatchStats> stats)
     {
-        var counts = _columnNullCountsByBatch[columnIdx];
-        int numZones = counts.Count;
-        var bytes = new byte[(long)numZones * 8];
-        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan());
-        for (int i = 0; i < numZones; i++) span[i] = counts[i];
-
+        int numZones = stats.Count;
         var sb = new SegmentBuilder();
-        ushort u64BufIdx = sb.AddBuffer(bytes, alignmentExponent: 3);
-        int u64Ticket = ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, u64BufIdx);
+        int ncTicket = EmitNullCountChild(sb, stats);
         int structTicket = ArrayNodeEmitter.EmitWithChildrenOnly(
-            sb.Builder, StructEncodingIdx, new[] { u64Ticket });
-        byte[] segBytes = sb.FinishSegment(structTicket);
-        return _sw.AppendSegment(segBytes, alignmentExponent: 0);
+            sb.Builder, StructEncodingIdx, new[] { ncTicket });
+        return _sw.AppendSegment(sb.FinishSegment(structTicket), alignmentExponent: 0);
     }
 
-    /// <summary>
-    /// Builds the zones segment for an integer column carrying
-    /// <c>{ max: T?, max_is_truncated: bool, min: T?, min_is_truncated: bool,
-    /// null_count: u64 }</c>. Field order matches upstream's
-    /// <c>stats_table_dtype</c> for present_stats = [Max, Min, NullCount].
-    /// </summary>
-    private uint EmitZonesSegmentIntMinMaxNull(int columnIdx)
+    private uint EmitZonesSegmentIntFull(List<BatchStats> stats, int columnIdx)
     {
-        var nullCounts = _columnNullCountsByBatch[columnIdx];
-        var minByBatch = _columnMinByBatch[columnIdx];
-        var maxByBatch = _columnMaxByBatch[columnIdx];
-        int numZones = nullCounts.Count;
         int byteWidth = ByteWidthForIntType(_schema.FieldsList[columnIdx].DataType);
-
-        // Build min/max buffers with validity (null when batch was all-null
-        // → has-value flag is false → minByBatch[i] / maxByBatch[i] is null).
-        var minBytes = new byte[(long)numZones * byteWidth];
-        var maxBytes = new byte[(long)numZones * byteWidth];
-        int validityByteCount = (numZones + 7) / 8;
-        var minMaxValidity = new byte[validityByteCount];
-        // Pre-fill validity to all-1s (most batches have data); clear for null entries.
-        for (int i = 0; i < validityByteCount; i++) minMaxValidity[i] = 0xFF;
-        // Mask trailing garbage bits in the last byte.
-        if ((numZones & 7) != 0)
-            minMaxValidity[validityByteCount - 1] &= (byte)((1 << (numZones & 7)) - 1);
-        int minMaxNullCount = 0;
-        for (int i = 0; i < numZones; i++)
-        {
-            if (minByBatch[i] is null)
-            {
-                minMaxValidity[i >> 3] &= (byte)~(1 << (i & 7));
-                minMaxNullCount++;
-            }
-            else
-            {
-                minByBatch[i].AsSpan().CopyTo(minBytes.AsSpan(i * byteWidth, byteWidth));
-                maxByBatch[i]!.AsSpan().CopyTo(maxBytes.AsSpan(i * byteWidth, byteWidth));
-            }
-        }
-
-        // null_count column (always non-null).
-        var ncBytes = new byte[(long)numZones * 8];
-        var ncSpan = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(ncBytes.AsSpan());
-        for (int i = 0; i < numZones; i++) ncSpan[i] = nullCounts[i];
-
-        // *_is_truncated columns are always all-false here — we never
-        // truncate. Build a numZones-bit zero bitmap.
-        var truncatedBytes = new byte[(numZones + 7) / 8];
-
-        // Now emit the 5-field struct: max, max_is_truncated, min,
-        // min_is_truncated, null_count. Each field is its own ArrayNode.
+        bool isSigned = _schema.FieldsList[columnIdx].DataType is Apache.Arrow.Types.Int8Type
+            or Apache.Arrow.Types.Int16Type or Apache.Arrow.Types.Int32Type
+            or Apache.Arrow.Types.Int64Type;
         var sb = new SegmentBuilder();
 
-        // 1. max: vortex.primitive with value buffer + validity child.
-        int maxTicket = EmitNullablePrimitive(sb, maxBytes, byteWidth, minMaxValidity, minMaxNullCount);
-
-        // 2. max_is_truncated: vortex.bool with the all-zero bitmap.
-        int maxTruncTicket = EmitBoolBitmap(sb, truncatedBytes);
-
-        // 3. min: same shape as max (shares the same min/max validity).
-        int minTicket = EmitNullablePrimitive(sb, minBytes, byteWidth, minMaxValidity, minMaxNullCount);
-
-        // 4. min_is_truncated: bool bitmap (all-zero).
-        int minTruncTicket = EmitBoolBitmap(sb, truncatedBytes);
-
-        // 5. null_count: vortex.primitive (non-nullable u64).
-        ushort ncBufIdx = sb.AddBuffer(ncBytes, alignmentExponent: 3);
-        int ncTicket = ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, ncBufIdx);
+        // Order: is_constant, is_sorted, is_strict_sorted, max, max_is_truncated,
+        //        min, min_is_truncated, sum, null_count.
+        int isConstantTicket = EmitNullableBool(sb, stats, s => s.IsConstant);
+        int isSortedTicket = EmitNullableBool(sb, stats, s => s.IsSorted);
+        int isStrictSortedTicket = EmitNullableBool(sb, stats, s => s.IsStrictSorted);
+        int maxTicket = EmitNullablePrimitiveColumn(sb, stats, s => s.MaxBytes, byteWidth);
+        int maxTruncTicket = EmitAllFalseBool(sb, stats.Count);
+        int minTicket = EmitNullablePrimitiveColumn(sb, stats, s => s.MinBytes, byteWidth);
+        int minTruncTicket = EmitAllFalseBool(sb, stats.Count);
+        // Sum is i64 (signed) or u64 (unsigned); both are 8-byte primitives.
+        // The dtype proto distinction lives in the layout's column_dtype, not
+        // the array layout — they share wire shape.
+        _ = isSigned;
+        int sumTicket = EmitNullablePrimitiveColumn(sb, stats, s => s.SumBytes, 8);
+        int nullCountTicket = EmitNullCountChild(sb, stats);
 
         int structTicket = ArrayNodeEmitter.EmitWithChildrenOnly(
             sb.Builder, StructEncodingIdx,
-            new[] { maxTicket, maxTruncTicket, minTicket, minTruncTicket, ncTicket });
-        byte[] segBytes = sb.FinishSegment(structTicket);
-        return _sw.AppendSegment(segBytes, alignmentExponent: 0);
+            new[] { isConstantTicket, isSortedTicket, isStrictSortedTicket,
+                    maxTicket, maxTruncTicket, minTicket, minTruncTicket,
+                    sumTicket, nullCountTicket });
+        return _sw.AppendSegment(sb.FinishSegment(structTicket), alignmentExponent: 0);
     }
 
-    private int EmitNullablePrimitive(
-        SegmentBuilder sb, byte[] valueBytes, int byteWidth,
-        byte[] validity, int nullCount)
+    private uint EmitZonesSegmentFloatStandard(List<BatchStats> stats, int columnIdx)
     {
-        // Pick alignment per width: 8 → 3, 4 → 2, 2 → 1, 1 → 0.
-        byte alignExp = byteWidth switch { 1 => 0, 2 => 1, 4 => 2, 8 => 3, _ => 0 };
-        ushort valBuf = sb.AddBuffer(valueBytes, alignmentExponent: alignExp);
-        if (nullCount == 0)
+        int byteWidth = _schema.FieldsList[columnIdx].DataType is Apache.Arrow.Types.FloatType ? 4 : 8;
+        var sb = new SegmentBuilder();
+
+        int maxTicket = EmitNullablePrimitiveColumn(sb, stats, s => s.MaxBytes, byteWidth);
+        int maxTruncTicket = EmitAllFalseBool(sb, stats.Count);
+        int minTicket = EmitNullablePrimitiveColumn(sb, stats, s => s.MinBytes, byteWidth);
+        int minTruncTicket = EmitAllFalseBool(sb, stats.Count);
+        int sumTicket = EmitNullablePrimitiveColumn(sb, stats, s => s.SumBytes, 8);
+        int nullCountTicket = EmitNullCountChild(sb, stats);
+        int nanCountTicket = EmitNanCountChild(sb, stats);
+
+        int structTicket = ArrayNodeEmitter.EmitWithChildrenOnly(
+            sb.Builder, StructEncodingIdx,
+            new[] { maxTicket, maxTruncTicket, minTicket, minTruncTicket,
+                    sumTicket, nullCountTicket, nanCountTicket });
+        return _sw.AppendSegment(sb.FinishSegment(structTicket), alignmentExponent: 0);
+    }
+
+    /// <summary>
+    /// Emits the per-zone <c>null_count: u64</c> child (always non-null).
+    /// </summary>
+    private static int EmitNullCountChild(SegmentBuilder sb, List<BatchStats> stats)
+    {
+        int n = stats.Count;
+        var bytes = new byte[(long)n * 8];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan());
+        for (int i = 0; i < n; i++) span[i] = stats[i].NullCount;
+        ushort buf = sb.AddBuffer(bytes, alignmentExponent: 3);
+        return ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, buf);
+    }
+
+    /// <summary>
+    /// Emits the per-zone <c>nan_count: u64</c> child (always non-null;
+    /// 0 for batches with no NaNs).
+    /// </summary>
+    private static int EmitNanCountChild(SegmentBuilder sb, List<BatchStats> stats)
+    {
+        int n = stats.Count;
+        var bytes = new byte[(long)n * 8];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan());
+        for (int i = 0; i < n; i++) span[i] = stats[i].NaNCount;
+        ushort buf = sb.AddBuffer(bytes, alignmentExponent: 3);
+        return ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, buf);
+    }
+
+    /// <summary>
+    /// Emits a nullable bool child. Each cell's validity bit is cleared
+    /// when <paramref name="getter"/> returns null for that batch (e.g.
+    /// empty/all-null batch's IsConstant is undefined).
+    /// </summary>
+    private static int EmitNullableBool(
+        SegmentBuilder sb, List<BatchStats> stats, Func<BatchStats, bool?> getter)
+    {
+        int n = stats.Count;
+        var values = new byte[(n + 7) / 8];
+        var validity = new byte[(n + 7) / 8];
+        int nullCount = 0;
+        for (int i = 0; i < n; i++)
         {
-            return ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, valBuf);
+            var v = getter(stats[i]);
+            if (v is null) { nullCount++; continue; }
+            validity[i >> 3] |= (byte)(1 << (i & 7));
+            if (v.Value) values[i >> 3] |= (byte)(1 << (i & 7));
         }
+        ushort valBuf = sb.AddBuffer(values, alignmentExponent: 0);
+        if (nullCount == 0)
+            return ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, BoolEncodingIdx, valBuf);
+        ushort validityBuf = sb.AddBuffer(validity, alignmentExponent: 0);
+        int validityNode = ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, BoolEncodingIdx, validityBuf);
+        return ArrayNodeEmitter.EmitWithBufferAndChildren(
+            sb.Builder, BoolEncodingIdx, valBuf, new[] { validityNode });
+    }
+
+    /// <summary>
+    /// Emits a non-nullable bool child whose values are all <c>false</c>.
+    /// Used for <c>min_is_truncated</c> / <c>max_is_truncated</c>: the
+    /// writer never truncates min/max so these are always all-zero.
+    /// </summary>
+    private static int EmitAllFalseBool(SegmentBuilder sb, int n)
+    {
+        var bytes = new byte[(n + 7) / 8];
+        ushort buf = sb.AddBuffer(bytes, alignmentExponent: 0);
+        return ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, BoolEncodingIdx, buf);
+    }
+
+    /// <summary>
+    /// Emits a nullable typed-primitive column. For each zone, when
+    /// <paramref name="getter"/> returns null the value slot is zeroed and
+    /// the validity bit is cleared.
+    /// </summary>
+    private static int EmitNullablePrimitiveColumn(
+        SegmentBuilder sb, List<BatchStats> stats, Func<BatchStats, byte[]?> getter, int byteWidth)
+    {
+        int n = stats.Count;
+        var values = new byte[(long)n * byteWidth];
+        var validity = new byte[(n + 7) / 8];
+        int nullCount = 0;
+        for (int i = 0; i < n; i++)
+        {
+            var v = getter(stats[i]);
+            if (v is null) { nullCount++; continue; }
+            validity[i >> 3] |= (byte)(1 << (i & 7));
+            v.AsSpan().CopyTo(values.AsSpan(i * byteWidth, byteWidth));
+        }
+        byte alignExp = byteWidth switch { 1 => 0, 2 => 1, 4 => 2, 8 => 3, _ => 0 };
+        ushort valBuf = sb.AddBuffer(values, alignmentExponent: alignExp);
+        if (nullCount == 0)
+            return ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, valBuf);
         ushort validityBuf = sb.AddBuffer(validity, alignmentExponent: 0);
         int validityNode = ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, BoolEncodingIdx, validityBuf);
         return ArrayNodeEmitter.EmitWithBufferAndChildren(
             sb.Builder, PrimitiveEncodingIdx, valBuf, new[] { validityNode });
-    }
-
-    private int EmitBoolBitmap(SegmentBuilder sb, byte[] bitmap)
-    {
-        ushort bufIdx = sb.AddBuffer(bitmap, alignmentExponent: 0);
-        return ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, BoolEncodingIdx, bufIdx);
     }
 
     /// <summary>
