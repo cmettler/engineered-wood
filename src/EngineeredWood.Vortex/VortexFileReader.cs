@@ -315,9 +315,10 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Reads and decodes one top-level column from the file as an Apache Arrow
-    /// array. For multi-chunk columns this currently throws — the
-    /// stream API <see cref="ReadAllAsync"/> is the way to consume chunked files.
+    /// Reads and decodes one top-level column from the file as a single
+    /// Apache Arrow array. For multi-chunk columns each chunk is read in
+    /// order and the results are concatenated via
+    /// <see cref="Apache.Arrow.ArrowArrayConcatenator"/>.
     /// </summary>
     internal async Task<Apache.Arrow.IArrowArray> ReadColumnAsync(
         int fieldIndex, CancellationToken cancellationToken = default)
@@ -330,11 +331,13 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         if (plan.ChunkCount == 0)
             throw new VortexFormatException(
                 $"Column {fieldIndex} ({Schema.FieldsList[fieldIndex].Name}) has no chunks.");
-        if (plan.ChunkCount > 1)
-            throw new NotSupportedException(
-                "Multi-chunk single-column read is not yet supported. Use ReadAllAsync to stream RecordBatches.");
+        if (plan.ChunkCount == 1)
+            return await ReadPlanChunkAsync(plan, chunkIndex: 0, cancellationToken).ConfigureAwait(false);
 
-        return await ReadPlanChunkAsync(plan, chunkIndex: 0, cancellationToken).ConfigureAwait(false);
+        var pieces = new Apache.Arrow.IArrowArray[plan.ChunkCount];
+        for (int i = 0; i < plan.ChunkCount; i++)
+            pieces[i] = await ReadPlanChunkAsync(plan, i, cancellationToken).ConfigureAwait(false);
+        return Apache.Arrow.ArrowArrayConcatenator.Concatenate(pieces);
     }
 
     /// <summary>

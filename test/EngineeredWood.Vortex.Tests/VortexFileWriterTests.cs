@@ -1135,6 +1135,77 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task ReadColumnAsync_ConcatenatesMultipleChunks()
+    {
+        // Three batches of different sizes. ReadColumnAsync should now read
+        // each chunk and concatenate the results into a single array — used
+        // to throw NotSupportedException for ChunkCount > 1.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("id", Int32Type.Default, nullable: false),
+            new Field("name", StringType.Default, nullable: true),
+        }, metadata: null);
+        var sizes = new[] { 100, 250, 50 };
+
+        Int32Array BuildIds(int startRow, int n)
+        {
+            var b = new Int32Array.Builder();
+            for (int i = 0; i < n; i++) b.Append(startRow + i);
+            return b.Build();
+        }
+        StringArray BuildNames(int startRow, int n)
+        {
+            var b = new StringArray.Builder();
+            for (int i = 0; i < n; i++)
+            {
+                int orig = startRow + i;
+                if (orig % 4 == 0) b.AppendNull();
+                else b.Append($"name-{orig}");
+            }
+            return b.Build();
+        }
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema))
+            {
+                int rowsSoFar = 0;
+                foreach (var sz in sizes)
+                {
+                    w.WriteBatch(new RecordBatch(schema,
+                        new IArrowArray[] { BuildIds(rowsSoFar, sz), BuildNames(rowsSoFar, sz) }, sz));
+                    rowsSoFar += sz;
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            int totalRows = sizes.Sum();
+            Assert.Equal(sizes.Length, reader.ColumnPlans[0].ChunkCount);
+
+            // Read each column as a single contiguous array.
+            var ids = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            var names = Assert.IsType<StringArray>(await reader.ReadColumnAsync(1));
+            Assert.Equal(totalRows, ids.Length);
+            Assert.Equal(totalRows, names.Length);
+            for (int i = 0; i < totalRows; i++)
+            {
+                Assert.Equal(i, ids.GetValue(i));
+                if (i % 4 == 0)
+                    Assert.False(names.IsValid(i));
+                else
+                    Assert.Equal($"name-{i}", names.GetString(i));
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task SelfRoundtrip_SlicedInputs()
     {
         // Build full-length arrays, then slice each by [20, 80) before writing.
