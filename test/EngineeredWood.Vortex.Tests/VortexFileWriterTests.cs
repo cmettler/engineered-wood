@@ -2893,6 +2893,171 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Sparse_NullableMostlyZeroRoundtrips()
+    {
+        // Nullable Int32 column where most rows are 0 (the mode and fill),
+        // some rows are non-zero, and some rows are null. Null rows become
+        // patches with the validity bit cleared; non-zero rows become patches
+        // with the value preserved. Verify all three groups round-trip.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 5_000;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 100 == 0) b.AppendNull();           // ~1% null
+            else if (i % 50 == 0) b.Append(i);           // ~1% non-zero (with collisions on i%100==0 already null)
+            else b.Append(0);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (i % 100 == 0)
+                    Assert.False(read.IsValid(i), $"row {i} should be null");
+                else if (i % 50 == 0)
+                    Assert.Equal(i, read.GetValue(i)!.Value);
+                else
+                    Assert.Equal(0, read.GetValue(i)!.Value);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Sparse_NullableModeIsNonZeroRoundtrips()
+    {
+        // Mode is 42 (non-zero), some rows are null, some rows have other
+        // values. Verifies the writer picks the mode from non-null values
+        // only and emits null patches plus value patches.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt16Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 3_000;
+        var b = new UInt16Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 75 == 0) b.AppendNull();
+            else if (i % 40 == 0) b.Append((ushort)(i % 1000));
+            else b.Append((ushort)42);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<UInt16Array>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+            {
+                if (i % 75 == 0)
+                    Assert.False(read.IsValid(i));
+                else if (i % 40 == 0)
+                    Assert.Equal((ushort)(i % 1000), read.GetValue(i)!.Value);
+                else
+                    Assert.Equal((ushort)42, read.GetValue(i)!.Value);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Fsst_NullableUrlsRoundtrip()
+    {
+        // Nullable URL-shaped string column. Null rows become empty entries
+        // in codes_offsets (offsets[i] == offsets[i+1]) and clear bits in
+        // the validity bitmap (a third vortex.bool child appended after
+        // uncompressed_lengths and codes_offsets).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("u", StringType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 600;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 13 == 0) b.AppendNull();
+            else b.Append($"https://www.example.com/path/to/resource/{i:D6}?token=abc123");
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (i % 13 == 0)
+                    Assert.False(read.IsValid(i), $"row {i} should be null");
+                else
+                    Assert.Equal($"https://www.example.com/path/to/resource/{i:D6}?token=abc123", read.GetString(i));
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Fsst_AllNullColumnFallsThrough()
+    {
+        // 100% null string column → IsApplicable rejects (nothing to train),
+        // dispatch falls through to plain varbin. All rows must round-trip
+        // as null.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 200;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++) b.AppendNull();
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++) Assert.False(read.IsValid(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Fsst_RepetitiveSubstringsCompress()
     {
         // 1000 mostly-unique long strings sharing common substrings — dict

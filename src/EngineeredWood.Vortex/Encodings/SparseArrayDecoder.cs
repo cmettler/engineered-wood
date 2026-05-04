@@ -66,48 +66,64 @@ internal static class SparseArrayDecoder
         return (type, fill.Kind, values) switch
         {
             (Int8Type, ScalarValueKind.Int64, Int8Array v) => Build<sbyte>(rowCount,
-                (sbyte)fill.Int64Value, indices, i => v.GetValue(i)!.Value, patchesOffset,
-                (data, len) => new Int8Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+                (sbyte)fill.Int64Value, indices, v, k => v.GetValue(k) ?? default, patchesOffset,
+                (data, val, len, nc) => new Int8Array(new ArrowBuffer(data), val, len, nc, 0)),
             (Int16Type, ScalarValueKind.Int64, Int16Array v) => Build<short>(rowCount,
-                (short)fill.Int64Value, indices, i => v.GetValue(i)!.Value, patchesOffset,
-                (data, len) => new Int16Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+                (short)fill.Int64Value, indices, v, k => v.GetValue(k) ?? default, patchesOffset,
+                (data, val, len, nc) => new Int16Array(new ArrowBuffer(data), val, len, nc, 0)),
             (Int32Type, ScalarValueKind.Int64, Int32Array v) => Build<int>(rowCount,
-                (int)fill.Int64Value, indices, i => v.GetValue(i)!.Value, patchesOffset,
-                (data, len) => new Int32Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+                (int)fill.Int64Value, indices, v, k => v.GetValue(k) ?? default, patchesOffset,
+                (data, val, len, nc) => new Int32Array(new ArrowBuffer(data), val, len, nc, 0)),
             (Int64Type, ScalarValueKind.Int64, Int64Array v) => Build<long>(rowCount,
-                fill.Int64Value, indices, i => v.GetValue(i)!.Value, patchesOffset,
-                (data, len) => new Int64Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+                fill.Int64Value, indices, v, k => v.GetValue(k) ?? default, patchesOffset,
+                (data, val, len, nc) => new Int64Array(new ArrowBuffer(data), val, len, nc, 0)),
             (UInt8Type, ScalarValueKind.UInt64, UInt8Array v) => Build<byte>(rowCount,
-                (byte)fill.UInt64Value, indices, i => v.GetValue(i)!.Value, patchesOffset,
-                (data, len) => new UInt8Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+                (byte)fill.UInt64Value, indices, v, k => v.GetValue(k) ?? default, patchesOffset,
+                (data, val, len, nc) => new UInt8Array(new ArrowBuffer(data), val, len, nc, 0)),
             (UInt16Type, ScalarValueKind.UInt64, UInt16Array v) => Build<ushort>(rowCount,
-                (ushort)fill.UInt64Value, indices, i => v.GetValue(i)!.Value, patchesOffset,
-                (data, len) => new UInt16Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+                (ushort)fill.UInt64Value, indices, v, k => v.GetValue(k) ?? default, patchesOffset,
+                (data, val, len, nc) => new UInt16Array(new ArrowBuffer(data), val, len, nc, 0)),
             (UInt32Type, ScalarValueKind.UInt64, UInt32Array v) => Build<uint>(rowCount,
-                (uint)fill.UInt64Value, indices, i => v.GetValue(i)!.Value, patchesOffset,
-                (data, len) => new UInt32Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+                (uint)fill.UInt64Value, indices, v, k => v.GetValue(k) ?? default, patchesOffset,
+                (data, val, len, nc) => new UInt32Array(new ArrowBuffer(data), val, len, nc, 0)),
             (UInt64Type, ScalarValueKind.UInt64, UInt64Array v) => Build<ulong>(rowCount,
-                fill.UInt64Value, indices, i => v.GetValue(i)!.Value, patchesOffset,
-                (data, len) => new UInt64Array(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+                fill.UInt64Value, indices, v, k => v.GetValue(k) ?? default, patchesOffset,
+                (data, val, len, nc) => new UInt64Array(new ArrowBuffer(data), val, len, nc, 0)),
             (FloatType, ScalarValueKind.F32, FloatArray v) => Build<float>(rowCount,
-                fill.F32Value, indices, i => v.GetValue(i)!.Value, patchesOffset,
-                (data, len) => new FloatArray(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+                fill.F32Value, indices, v, k => v.GetValue(k) ?? default, patchesOffset,
+                (data, val, len, nc) => new FloatArray(new ArrowBuffer(data), val, len, nc, 0)),
             (DoubleType, ScalarValueKind.F64, DoubleArray v) => Build<double>(rowCount,
-                fill.F64Value, indices, i => v.GetValue(i)!.Value, patchesOffset,
-                (data, len) => new DoubleArray(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0)),
+                fill.F64Value, indices, v, k => v.GetValue(k) ?? default, patchesOffset,
+                (data, val, len, nc) => new DoubleArray(new ArrowBuffer(data), val, len, nc, 0)),
             _ => throw new NotSupportedException(
                 $"vortex.sparse: unsupported (type={type}, fill={fill.Kind}, values={values.GetType().Name})."),
         };
     }
 
     private static IArrowArray Build<T>(
-        int rowCount, T fill, IArrowArray indices, Func<int, T> getValue,
-        int patchesOffset, Func<byte[], int, IArrowArray> ctor)
+        int rowCount, T fill, IArrowArray indices, IArrowArray values,
+        Func<int, T> getValue, int patchesOffset,
+        Func<byte[], ArrowBuffer, int, int, IArrowArray> ctor)
         where T : unmanaged
     {
         var bytes = new byte[(long)rowCount * Marshal.SizeOf<T>()];
         var span = MemoryMarshal.Cast<byte, T>(bytes.AsSpan());
         for (int i = 0; i < rowCount; i++) span[i] = fill;
+
+        // If patch values carry validity, we need to mark the corresponding
+        // output rows null. The fill scalar is non-null in this writer's
+        // case-A strategy (most-common non-null value), so unpatched rows
+        // stay valid.
+        var valuesData = ((Apache.Arrow.Array)values).Data;
+        bool valuesHaveNulls = valuesData.GetNullCount() > 0;
+        var valuesValidity = valuesHaveNulls ? valuesData.Buffers[0].Span : default;
+        int valuesOffset = valuesData.Offset;
+
+        byte[]? outValidity = valuesHaveNulls ? new byte[(rowCount + 7) / 8] : null;
+        // Initialize all rows valid; we'll clear bits at null patch positions.
+        if (outValidity is not null)
+            for (int i = 0; i < outValidity.Length; i++) outValidity[i] = 0xFF;
+        int outNullCount = 0;
 
         for (int k = 0; k < indices.Length; k++)
         {
@@ -116,9 +132,24 @@ internal static class SparseArrayDecoder
                 throw new VortexFormatException(
                     $"vortex.sparse: patch index {rowIdx} out of range [0, {rowCount}).");
             span[rowIdx] = getValue(k);
+            if (outValidity is not null)
+            {
+                int srcBit = valuesOffset + k;
+                bool patchValid = (valuesValidity[srcBit >> 3] & (1 << (srcBit & 7))) != 0;
+                if (!patchValid)
+                {
+                    outValidity[rowIdx >> 3] &= (byte)~(1 << (rowIdx & 7));
+                    outNullCount++;
+                }
+            }
         }
 
-        return ctor(bytes, rowCount);
+        // Mask off any garbage trailing bits in the last byte of validity.
+        if (outValidity is not null && (rowCount & 7) != 0)
+            outValidity[outValidity.Length - 1] &= (byte)((1 << (rowCount & 7)) - 1);
+
+        var validityBuf = outValidity is null ? ArrowBuffer.Empty : new ArrowBuffer(outValidity);
+        return ctor(bytes, validityBuf, rowCount, outNullCount);
     }
 
     private static (ulong Len, ulong Offset, int IndicesPtype) ParseSparseMetadata(ReadOnlySpan<byte> bytes)

@@ -783,6 +783,87 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenNullableSparseFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Nullable Int32 sparse: mode = 0, scattered non-zero patches and
+        // null patches. The validity of patch_values rides as a vortex.bool
+        // child of the patch_values primitive node.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 5_000;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 100 == 0) b.AppendNull();
+            else if (i % 50 == 0) b.Append(i);
+            else b.Append(0);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public void RustReader_OpensDotNetWrittenNullableFsstFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Nullable URL-shaped FSST column. Validity bitmap rides as a
+        // vortex.bool node at children[2], after uncompressed_lengths and
+        // codes_offsets.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("u", StringType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 600;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 13 == 0) b.AppendNull();
+            else b.Append($"https://www.example.com/path/to/resource/{i:D6}?token=abc123");
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenAlpRdFile()
     {
         var validator = FindValidator();

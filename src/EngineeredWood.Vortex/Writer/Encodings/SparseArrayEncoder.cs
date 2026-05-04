@@ -39,11 +39,12 @@ internal static class SparseArrayEncoder
         if (ElementSize(array) is not int elemSize) return false;
         var data = ((Apache.Arrow.Array)array).Data;
         if (data.Offset != 0) return false;
-        if (data.GetNullCount() > 0) return false;
         int n = array.Length;
         if (n < 2) return false; // constant catches the 1-row case.
+        int nullCount = data.GetNullCount();
+        if (nullCount == n) return false; // all-null — constant claims with null fill.
 
-        var (modeKey, modeFreq) = FindMode(data.Buffers[1].Span, n, elemSize);
+        var (modeKey, modeFreq) = FindMode(array, n, elemSize);
         int numPatches = n - modeFreq;
         if (numPatches == 0) return false; // constant should claim this column.
 
@@ -51,7 +52,12 @@ internal static class SparseArrayEncoder
         // Approximate fill scalar overhead — varint-encoded sint64 / uint64
         // / fixed-width float — bounded by ~10 bytes incl. tag.
         const int fillOverheadBytes = 10;
-        long sparseBytes = fillOverheadBytes + (long)numPatches * (indicesElemSize + elemSize);
+        // Patch values inherit the parent's nullability — when the input is
+        // nullable, the patch values array carries a validity bitmap (one
+        // bit per patch, packed). Approximate as numPatches/8 bytes.
+        long sparseBytes = fillOverheadBytes
+            + (long)numPatches * (indicesElemSize + elemSize)
+            + (nullCount > 0 ? (long)(numPatches + 7) / 8 : 0);
         long rawBytes = (long)n * elemSize;
         _ = modeKey; // mode value isn't needed in the gate; recomputed in Emit.
         return sparseBytes * 3 / 2 < rawBytes;
@@ -67,37 +73,61 @@ internal static class SparseArrayEncoder
         var data = ((Apache.Arrow.Array)array).Data;
         if (data.Offset != 0)
             throw new NotSupportedException("vortex.sparse writer doesn't yet support sliced inputs.");
-        if (data.GetNullCount() > 0)
-            throw new NotSupportedException("vortex.sparse writer doesn't yet support nullable inputs.");
 
         int n = array.Length;
+        int nullCount = data.GetNullCount();
+        bool hasNulls = nullCount > 0;
         var src = data.Buffers[1].Span;
-        var (modeKey, _) = FindMode(src, n, elemSize);
+        var validity = hasNulls ? data.Buffers[0].Span : default;
+        var (modeKey, _) = FindMode(array, n, elemSize);
 
-        // Walk a second time gathering patches (rows where value != mode).
-        // The 1.5× gate in IsApplicable already bounded numPatches; allocate
-        // exact-size buffers from the count we computed.
+        // Walk a second time gathering patches. A row is a patch if it's
+        // null OR has a value other than the mode. The mode is computed
+        // from non-null values only, so null rows always become patches
+        // (the fill scalar is non-null in the case-A nullable strategy).
         int patchCount = 0;
         for (int i = 0; i < n; i++)
-            if (ReadKey(src, i * elemSize, elemSize) != modeKey) patchCount++;
+        {
+            bool isNull = hasNulls && (validity[i >> 3] & (1 << (i & 7))) == 0;
+            if (isNull || ReadKey(src, i * elemSize, elemSize) != modeKey) patchCount++;
+        }
 
         byte indicesPtype = SmallestUIntPtypeFor(n);
         int indicesElemSize = SmallestUIntElemSize(n);
         var indicesBytes = new byte[(long)patchCount * indicesElemSize];
         var valuesBytes = new byte[(long)patchCount * elemSize];
+        // Patch values' validity bitmap (one bit per patch). Allocated only
+        // for nullable inputs; null rows propagate as cleared bits.
+        byte[]? patchValuesValidityBytes = hasNulls ? new byte[(patchCount + 7) / 8] : null;
+        int patchValuesNullCount = 0;
 
         int writeIdx = 0;
         for (int i = 0; i < n; i++)
         {
-            if (ReadKey(src, i * elemSize, elemSize) == modeKey) continue;
+            bool isNull = hasNulls && (validity[i >> 3] & (1 << (i & 7))) == 0;
+            if (!isNull && ReadKey(src, i * elemSize, elemSize) == modeKey) continue;
+
             WriteIndex(indicesBytes.AsSpan(writeIdx * indicesElemSize, indicesElemSize), (ulong)i, indicesElemSize);
-            src.Slice(i * elemSize, elemSize)
-                .CopyTo(valuesBytes.AsSpan(writeIdx * elemSize, elemSize));
+            if (!isNull)
+            {
+                src.Slice(i * elemSize, elemSize)
+                    .CopyTo(valuesBytes.AsSpan(writeIdx * elemSize, elemSize));
+            }
+            // (else the value slot stays zeroed — the patch's validity bit masks it)
+            if (patchValuesValidityBytes is not null)
+            {
+                if (isNull) patchValuesNullCount++;
+                else patchValuesValidityBytes[writeIdx >> 3] |= (byte)(1 << (writeIdx & 7));
+            }
             writeIdx++;
         }
 
         var indicesArr = BuildUnsignedArray(indicesBytes, patchCount, indicesElemSize);
-        var valuesArr = BuildPrimitiveArray(array, valuesBytes, patchCount);
+        var patchValidityBuf = patchValuesValidityBytes is null
+            ? ArrowBuffer.Empty
+            : new ArrowBuffer(patchValuesValidityBytes);
+        var valuesArr = BuildPrimitiveArray(
+            array, valuesBytes, patchCount, patchValidityBuf, patchValuesNullCount);
         var fillValueBytes = SerializeFillScalar(array, modeKey);
 
         // Children: patch_indices, patch_values. Both go through dispatch
@@ -121,14 +151,21 @@ internal static class SparseArrayEncoder
     /// <summary>
     /// O(n) mode discovery via a Dictionary keyed on the value's 64-bit bit
     /// pattern (works for any primitive ≤ 8 bytes; signed-vs-unsigned
-    /// irrelevant since we compare bit patterns). Returns (modeKey, modeFreq).
+    /// irrelevant since we compare bit patterns). Null rows are skipped —
+    /// the mode is the most-frequent **non-null** value, which becomes the
+    /// fill scalar; null rows always land in patches.
     /// </summary>
     private static (long ModeKey, int ModeFreq) FindMode(
-        ReadOnlySpan<byte> src, int n, int elemSize)
+        IArrowArray array, int n, int elemSize)
     {
+        var data = ((Apache.Arrow.Array)array).Data;
+        var src = data.Buffers[1].Span;
+        bool hasNulls = data.GetNullCount() > 0;
+        var validity = hasNulls ? data.Buffers[0].Span : default;
         var counts = new Dictionary<long, int>();
         for (int i = 0; i < n; i++)
         {
+            if (hasNulls && (validity[i >> 3] & (1 << (i & 7))) == 0) continue;
             long key = ReadKey(src, i * elemSize, elemSize);
             counts.TryGetValue(key, out int c);
             counts[key] = c + 1;
@@ -205,19 +242,21 @@ internal static class SparseArrayEncoder
         };
     }
 
-    private static IArrowArray BuildPrimitiveArray(IArrowArray template, byte[] valuesBytes, int len)
+    private static IArrowArray BuildPrimitiveArray(
+        IArrowArray template, byte[] valuesBytes, int len,
+        ArrowBuffer validity, int nullCount)
     {
         var buf = new ArrowBuffer(valuesBytes);
         return template switch
         {
-            Int8Array => new Int8Array(buf, ArrowBuffer.Empty, len, 0, 0),
-            UInt8Array => new UInt8Array(buf, ArrowBuffer.Empty, len, 0, 0),
-            Int16Array => new Int16Array(buf, ArrowBuffer.Empty, len, 0, 0),
-            UInt16Array => new UInt16Array(buf, ArrowBuffer.Empty, len, 0, 0),
-            Int32Array => new Int32Array(buf, ArrowBuffer.Empty, len, 0, 0),
-            UInt32Array => new UInt32Array(buf, ArrowBuffer.Empty, len, 0, 0),
-            Int64Array => new Int64Array(buf, ArrowBuffer.Empty, len, 0, 0),
-            UInt64Array => new UInt64Array(buf, ArrowBuffer.Empty, len, 0, 0),
+            Int8Array => new Int8Array(buf, validity, len, nullCount, 0),
+            UInt8Array => new UInt8Array(buf, validity, len, nullCount, 0),
+            Int16Array => new Int16Array(buf, validity, len, nullCount, 0),
+            UInt16Array => new UInt16Array(buf, validity, len, nullCount, 0),
+            Int32Array => new Int32Array(buf, validity, len, nullCount, 0),
+            UInt32Array => new UInt32Array(buf, validity, len, nullCount, 0),
+            Int64Array => new Int64Array(buf, validity, len, nullCount, 0),
+            UInt64Array => new UInt64Array(buf, validity, len, nullCount, 0),
             _ => throw new NotSupportedException(),
         };
     }
