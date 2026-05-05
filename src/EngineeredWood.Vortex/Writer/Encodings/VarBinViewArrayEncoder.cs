@@ -29,24 +29,30 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 ///     buffer index (u32), bytes 12..15 = offset within buffer (u32).</item>
 /// </list></para>
 ///
-/// <para>Scope: <see cref="StringArray"/>, nullable + non-nullable, sliced +
-/// non-sliced. Single data buffer (all long strings concatenated).
-/// <see cref="BinaryArray"/> deferred. The encoder is exposed as an opt-in
+/// <para>Scope: <see cref="StringArray"/> + <see cref="BinaryArray"/>,
+/// nullable + non-nullable, sliced + non-sliced. Single data buffer (all
+/// long values concatenated). Apache.Arrow's <c>StringArray</c> inherits
+/// from <c>BinaryArray</c> and shares its byte-level accessors
+/// (<c>GetBytes</c>, <c>GetValueLength</c>, <c>IsValid</c>), so the encode
+/// loop is identical for both — only the schema-level dtype distinguishes
+/// them. The encoder is exposed as an opt-in
 /// (<c>VortexFileWriter</c>'s <c>preferVarBinView</c> flag) rather than
-/// auto-dispatched — for short-string columns vortex.varbin is more compact
-/// (4 + len bytes/row vs varbinview's 16 + (len if &gt; 12) bytes/row).</para>
+/// auto-dispatched — for short-value columns vortex.varbin is more
+/// compact (4 + len bytes/row vs varbinview's 16 + (len if &gt; 12) bytes/row).</para>
 /// </summary>
 internal static class VarBinViewArrayEncoder
 {
-    /// <summary>Inline cutoff. Strings with length ≤ this go in the view.</summary>
+    /// <summary>Inline cutoff. Values with length ≤ this go in the view.</summary>
     private const int InlineLimit = 12;
 
     public static int Emit(
         SegmentBuilder sb, IArrowArray array, EncodingIndices idx, int? statsTicket = null)
     {
-        if (array is not StringArray s)
+        // BinaryArray is the base type; StringArray inherits from it. Both
+        // expose the same byte-level accessors we use below.
+        if (array is not BinaryArray s)
             throw new NotSupportedException(
-                $"vortex.varbinview writer requires StringArray, got {array.GetType().Name}.");
+                $"vortex.varbinview writer requires StringArray or BinaryArray, got {array.GetType().Name}.");
         var data = s.Data;
 
         int n = s.Length;

@@ -125,7 +125,10 @@ internal static class ArrayEncoderDispatch
             // Decimal128/256Array inherit from FixedSizeBinaryArray, so they MUST
             // be matched before any FixedSizeBinary case (none yet, but mind it).
             Decimal128Array or Decimal256Array => DecimalArrayEncoder.Emit(sb, array, idx.Decimal, idx.Bool, statsTicket),
-            StringArray when preferVarBinView => VarBinViewArrayEncoder.Emit(sb, array, idx, statsTicket),
+            // StringArray inherits from BinaryArray, so the BinaryArray
+            // pattern below catches both string + binary columns when the
+            // user opts into varbinview.
+            BinaryArray when preferVarBinView => VarBinViewArrayEncoder.Emit(sb, array, idx, statsTicket),
             StringArray or BinaryArray => VarBinArrayEncoder.Emit(sb, array, idx.VarBin, idx.Primitive, idx.Bool, statsTicket),
             BooleanArray => BoolArrayEncoder.Emit(sb, array, idx.Bool, statsTicket),
             _ => PrimitiveArrayEncoder.Emit(sb, array, idx.Primitive, idx.Bool, statsTicket),

@@ -6684,6 +6684,65 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task VarBinView_BinaryArrayRoundtrip()
+    {
+        // BinaryArray under preferVarBinView. Mix of inline-eligible
+        // (≤ 12 bytes) and referenced (> 12 bytes) values plus nulls so
+        // both view-format branches + the validity child fire.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", BinaryType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 100;
+        var b = new BinaryArray.Builder();
+        var expected = new byte[n][];
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 13 == 0) { b.AppendNull(); expected[i] = null!; continue; }
+            // Even rows: short payload. Odd rows: > 12 bytes to force the
+            // referenced-view path (length, prefix, buf_idx, offset).
+            var bytes = (i % 2 == 0)
+                ? new byte[] { (byte)i, 0xAA, 0xBB }
+                : new byte[20];
+            if (i % 2 == 1)
+            {
+                for (int k = 0; k < 20; k++) bytes[k] = (byte)((i + k) & 0xFF);
+            }
+            b.Append((ReadOnlySpan<byte>)bytes);
+            expected[i] = bytes;
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, preferVarBinView: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            Assert.IsType<BinaryType>(reader.Schema.FieldsList[0].DataType);
+            var read = Assert.IsType<BinaryArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    var actual = read.GetBytes(i);
+                    Assert.Equal(expected[i].Length, actual.Length);
+                    for (int k = 0; k < expected[i].Length; k++)
+                        Assert.Equal(expected[i][k], actual[k]);
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task NullableAlpRd_DoublesRoundtrip()
     {
         // Bounded-magnitude nullable doubles: ALP-RD's IsApplicable cleared
