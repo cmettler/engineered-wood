@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using EngineeredWood.Encodings;
 using EngineeredWood.Vortex.FlatBuffers;
 
 namespace EngineeredWood.Vortex.Writer;
@@ -214,6 +215,106 @@ internal static class LayoutSerializer
                 .EmitU64(totalRows)                    // offset 8..15
                 .EmitUOffset(columnMetadataTickets[c]) // offset 4..7
                 .EmitSOffsetTo(statsVt);               // offset 0..3
+        }
+
+        var rootChildrenTicket = b.WriteUOffsetVector(columnTickets);
+        var structVt = b.WriteUInt16s(new ushort[] { 12, 18, 16, 8, 0, 4 });
+        var structTicket = b.StartTable(alignment: 8, inlineSize: 18)
+            .EmitU16(structEncodingIdx)
+            .EmitU64(totalRows)
+            .EmitUOffset(rootChildrenTicket)
+            .EmitSOffsetTo(structVt);
+
+        return b.Finish(structTicket);
+    }
+
+    /// <summary>
+    /// Like <see cref="SerializeStructChunked"/> but additionally wraps a
+    /// subset of columns in <c>vortex.dict</c>. Each entry of
+    /// <paramref name="dictColumns"/> is non-null for columns whose
+    /// per-batch segments in <paramref name="perColumnSegmentIdx"/> hold
+    /// PER-BATCH CODES (instead of the column's data segments). The dict
+    /// shape per column is:
+    /// <c>vortex.dict(values=vortex.flat(dict-segment), codes=vortex.chunked(vortex.flat × M))</c>.
+    /// Stats co-existence on dict columns is deferred — caller falls back
+    /// to the non-zoned chunked layout when any dict column is present.
+    /// </summary>
+    public static byte[] SerializeStructDictMixed(
+        ushort structEncodingIdx,
+        ushort dictEncodingIdx,
+        ushort chunkedEncodingIdx,
+        ushort flatEncodingIdx,
+        ulong totalRows,
+        IReadOnlyList<ulong> perBatchRowCount,
+        uint[][] perColumnSegmentIdx,
+        VortexFileWriter.DictColumnInfo[] dictColumns)
+    {
+        if (perColumnSegmentIdx.Length != dictColumns.Length)
+            throw new ArgumentException(
+                "perColumnSegmentIdx must align with dictColumns.", nameof(dictColumns));
+        int batchCount = perBatchRowCount.Count;
+
+        var b = new BackwardsFlatBufferBuilder();
+
+        // Reused per-column metadata scratch — DictLayoutMetadata is at most
+        // ~4 bytes (tag + varint codes_ptype + tag + bool nullable). Reused
+        // across columns to avoid stack allocs in a loop.
+        Span<byte> metaBuf = stackalloc byte[16];
+        var columnTickets = new int[perColumnSegmentIdx.Length];
+        for (int c = 0; c < perColumnSegmentIdx.Length; c++)
+        {
+            // Codes / data chunked layout: one flat child per batch with the
+            // per-batch segment index and the batch's row count.
+            var flatTickets = new int[batchCount];
+            for (int batch = 0; batch < batchCount; batch++)
+                flatTickets[batch] = EmitFlatLayout(
+                    b, flatEncodingIdx, perBatchRowCount[batch], perColumnSegmentIdx[c][batch]);
+            var chunkedChildrenTicket = b.WriteUOffsetVector(flatTickets);
+            var chunkedVt = b.WriteUInt16s(new ushort[] { 12, 18, 16, 8, 0, 4 });
+            int chunkedTicket = b.StartTable(alignment: 8, inlineSize: 18)
+                .EmitU16(chunkedEncodingIdx)
+                .EmitU64(totalRows)
+                .EmitUOffset(chunkedChildrenTicket)
+                .EmitSOffsetTo(chunkedVt);
+
+            if (dictColumns[c].ValuesSegmentIdx == 0 && dictColumns[c].DictRowCount == 0)
+            {
+                // Sentinel "no dict" — just use the chunked layout directly.
+                columnTickets[c] = chunkedTicket;
+                continue;
+            }
+
+            // Values flat layout: 1 segment, row_count = dict_size.
+            int valuesFlatTicket = EmitFlatLayout(
+                b, flatEncodingIdx, dictColumns[c].DictRowCount, dictColumns[c].ValuesSegmentIdx);
+
+            // DictLayoutMetadata proto bytes: field 1 = codes_ptype (varint),
+            // field 2 = is_nullable_codes (varint bool, 0/1).
+            // Proto3 default 0/false would normally be omitted, but vortex's
+            // ProstMetadata serializer always emits Some(...) explicitly when
+            // the writer set the field — so write both fields unconditionally
+            // for fidelity with upstream's wire output (the reader is robust
+            // either way).
+            int metaPos = 0;
+            metaBuf[metaPos++] = 0x08;
+            metaPos += Varint.WriteUnsigned(metaBuf.Slice(metaPos), dictColumns[c].CodesPtype);
+            metaBuf[metaPos++] = 0x10;
+            metaBuf[metaPos++] = (byte)(dictColumns[c].IsNullableCodes ? 1 : 0);
+            int dictMetaTicket = b.WriteByteVector(metaBuf.Slice(0, metaPos).ToArray());
+
+            // Dict layout: 2 children (values, codes), metadata. Same
+            // vtable shape as vortex.stats: slots 0+1+2+3, no segments.
+            // inline (22): soffset(4) + meta(4@4) + row_count(8@8) +
+            // children(4@16) + encoding(2@20).
+            // vt: vt_size = 4 + 5*2 = 14, slot offsets {0:20, 1:8, 2:4, 3:16, 4:0}.
+            var dictChildrenTicket = b.WriteUOffsetVector(new[] { valuesFlatTicket, chunkedTicket });
+            var dictVt = b.WriteUInt16s(new ushort[] { 14, 22, 20, 8, 4, 16, 0 });
+            columnTickets[c] = b.StartTable(alignment: 8, inlineSize: 22)
+                .EmitU16(dictEncodingIdx)
+                .EmitUOffset(dictChildrenTicket)
+                .EmitU64(totalRows)
+                .EmitUOffset(dictMetaTicket)
+                .EmitSOffsetTo(dictVt);
         }
 
         var rootChildrenTicket = b.WriteUOffsetVector(columnTickets);

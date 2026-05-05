@@ -89,6 +89,7 @@ public sealed class VortexFileWriter : IDisposable
     private const ushort StructLayoutIdx = 1;
     private const ushort ChunkedLayoutIdx = 2;
     private const ushort StatsLayoutIdx = 3;
+    private const ushort DictLayoutIdx = 4;
 
     private readonly Stream _stream;
     private readonly Apache.Arrow.Schema _schema;
@@ -105,7 +106,36 @@ public sealed class VortexFileWriter : IDisposable
     private readonly bool _preserveStats;
     private readonly bool _preferPco;
     private readonly bool _preferDateTimeParts;
+    private readonly bool _preferDictLayout;
+    /// <summary>One per column; non-null for columns that <see cref="_preferDictLayout"/>
+    /// applies to (StringType today). Accumulates the global dict + per-batch
+    /// codes so <see cref="Close"/> can emit a single shared values segment plus
+    /// one codes segment per batch under a vortex.dict layout. Indices in
+    /// <see cref="_columnSegmentsByBatch"/> hold the per-batch CODES segment
+    /// indices for these columns instead of the column's data segments.</summary>
+    private readonly ColumnDictState?[] _columnDictState;
     private bool _closed;
+
+    /// <summary>
+    /// Per-column accumulator for layout-level vortex.dict. Built lazily as
+    /// each batch is written; finalized at <see cref="Close"/> time when
+    /// the global dict is emitted as a single values segment and each
+    /// batch's codes are emitted as their own segment.
+    /// </summary>
+    private sealed class ColumnDictState
+    {
+        public Dictionary<string, int> Lookup { get; } = new(StringComparer.Ordinal);
+        public List<string> Distinct { get; } = new();
+        /// <summary>Per-batch codes (one int per row). Stored as int[] so we
+        /// can pick the smallest fitting unsigned ptype at Close time once
+        /// the final dict size is known.</summary>
+        public List<int[]> PerBatchCodes { get; } = new();
+        /// <summary>Per-batch validity bitmap (length = (rowCount+7)/8). Empty
+        /// array if the batch had no nulls; we track per-batch so validity is
+        /// row-aligned with the codes child.</summary>
+        public List<byte[]> PerBatchValidity { get; } = new();
+        public bool AnyBatchHadNulls { get; set; }
+    }
 
     /// <summary>
     /// Per-batch stats captured during <see cref="WriteBatch"/> for the
@@ -239,17 +269,29 @@ public sealed class VortexFileWriter : IDisposable
     /// <paramref name="compress"/>: datetimeparts splitting helps even
     /// without other compression, since per-part widths typically narrow
     /// from 8 bytes to 1–4 bytes per row.</param>
+    /// <param name="preferDictLayout">When true, route each
+    /// <see cref="Apache.Arrow.StringArray"/> column through a layout-level
+    /// <c>vortex.dict</c> instead of the array-level dict the
+    /// <paramref name="compress"/> chain would emit. The layout form
+    /// shares a single global dict across ALL batches; the array form
+    /// re-emits the dict per batch. For low-cardinality string columns
+    /// streamed across many batches (e.g. enum-like "country" / "status"
+    /// fields), the saving is roughly <c>(numBatches − 1) × dict_bytes</c>.
+    /// High-cardinality columns shouldn't enable this — same caveat as
+    /// the array-level dict gate.</param>
     public VortexFileWriter(
         Stream stream, Apache.Arrow.Schema schema,
         bool compress = false, bool preferVarBinView = false,
         bool preserveStats = false, bool preferPco = false,
-        bool preferDateTimeParts = false)
+        bool preferDateTimeParts = false,
+        bool preferDictLayout = false)
     {
         _compress = compress;
         _preferVarBinView = preferVarBinView;
         _preserveStats = preserveStats;
         _preferPco = preferPco;
         _preferDateTimeParts = preferDateTimeParts;
+        _preferDictLayout = preferDictLayout;
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _schema = schema ?? throw new ArgumentNullException(nameof(schema));
         _sw = new SegmentWriter(_stream);
@@ -257,11 +299,18 @@ public sealed class VortexFileWriter : IDisposable
         _columnSegmentsByBatch = new List<uint>[nFields];
         _columnBatchStats = new List<BatchStats>[nFields];
         _columnStatScheme = new ZoneStatScheme[nFields];
+        _columnDictState = new ColumnDictState?[nFields];
         for (int i = 0; i < nFields; i++)
         {
             _columnSegmentsByBatch[i] = new List<uint>();
             _columnBatchStats[i] = new List<BatchStats>();
             _columnStatScheme[i] = SchemeForType(schema.FieldsList[i].DataType);
+            // Layout-level dict applies to StringType today (BinaryType could
+            // follow once we have a Binary-friendly value-segment encoder
+            // path; the existing helper here serializes via VarBin which is
+            // string-only at the moment).
+            if (_preferDictLayout && schema.FieldsList[i].DataType is Apache.Arrow.Types.StringType)
+                _columnDictState[i] = new ColumnDictState();
         }
 
         // Leading VTXF magic.
@@ -282,6 +331,18 @@ public sealed class VortexFileWriter : IDisposable
         for (int i = 0; i < _schema.FieldsList.Count; i++)
         {
             var col = batch.Column(i);
+
+            // Layout-level dict path: instead of encoding the column as its
+            // own segment now, accumulate per-batch codes against the global
+            // dict. Close() emits the codes segment + a single shared values
+            // segment per dict-eligible column.
+            if (_columnDictState[i] is ColumnDictState dictState)
+            {
+                AccumulateDictBatch((StringArray)col, dictState);
+                _columnBatchStats[i].Add(ComputeBatchStats(col, _columnStatScheme[i]));
+                continue;
+            }
+
             var sb = new SegmentBuilder();
 
             // Compute and emit per-column stats at the top-level ArrayNode.
@@ -304,6 +365,44 @@ public sealed class VortexFileWriter : IDisposable
             _columnBatchStats[i].Add(ComputeBatchStats(col, _columnStatScheme[i]));
         }
         _batchRowCounts.Add(checked((ulong)batch.Length));
+    }
+
+    /// <summary>
+    /// Walks one batch of a dict-layout-eligible column, building the
+    /// per-batch codes against <paramref name="state"/>'s growing global
+    /// dict. The values themselves are NOT segment-emitted yet — that
+    /// happens once at <see cref="Close"/> for the whole column.
+    /// </summary>
+    private static void AccumulateDictBatch(StringArray col, ColumnDictState state)
+    {
+        int n = col.Length;
+        int nullCount = (int)((Apache.Arrow.Array)col).Data.GetNullCount();
+        bool hasNulls = nullCount > 0;
+        if (hasNulls) state.AnyBatchHadNulls = true;
+
+        var codes = new int[n];
+        var validity = hasNulls ? new byte[(n + 7) / 8] : System.Array.Empty<byte>();
+        for (int j = 0; j < n; j++)
+        {
+            if (hasNulls && !col.IsValid(j))
+            {
+                // Null row: leave code = 0 (the validity bitmap on the codes
+                // child masks it; the value at index 0 is irrelevant since
+                // the reader skips lookup at null positions).
+                continue;
+            }
+            var s = col.GetString(j);
+            if (!state.Lookup.TryGetValue(s, out int code))
+            {
+                code = state.Distinct.Count;
+                state.Lookup[s] = code;
+                state.Distinct.Add(s);
+            }
+            codes[j] = code;
+            if (hasNulls) validity[j >> 3] |= (byte)(1 << (j & 7));
+        }
+        state.PerBatchCodes.Add(codes);
+        state.PerBatchValidity.Add(validity);
     }
 
     /// <summary>
@@ -992,6 +1091,180 @@ public sealed class VortexFileWriter : IDisposable
     /// Finalizes the file: emits DType, Layout, Footer, Postscript, EndOfFile.
     /// Idempotent — calling twice is a no-op. Disposing also calls Close.
     /// </summary>
+    /// <summary>
+    /// For each column with a <see cref="ColumnDictState"/>, emits one
+    /// codes segment per batch (recorded into <see cref="_columnSegmentsByBatch"/>)
+    /// plus a single shared values segment for the global dict. Returns a
+    /// per-column descriptor (values segment index + codes ptype + nullability),
+    /// or null when no dict-layout columns are configured.
+    /// </summary>
+    private DictColumnInfo[]? FinalizeDictLayoutColumns()
+    {
+        bool any = false;
+        for (int i = 0; i < _columnDictState.Length; i++)
+            if (_columnDictState[i] is not null) { any = true; break; }
+        if (!any) return null;
+
+        var result = new DictColumnInfo[_columnDictState.Length];
+        for (int c = 0; c < _columnDictState.Length; c++)
+        {
+            var state = _columnDictState[c];
+            if (state is null) continue;
+
+            // Empty-dict guard: if every row across every batch was null,
+            // distinct values is empty. Insert one placeholder so the codes
+            // child has at least one valid index target. Codes at null rows
+            // are 0 by construction; the validity bitmap masks them.
+            if (state.Distinct.Count == 0) state.Distinct.Add(string.Empty);
+
+            int dictSize = state.Distinct.Count;
+            byte codesPtype = SmallestUnsignedPtype(dictSize);
+            int codesElemSize = ElementSizeForPtype(codesPtype);
+
+            // Per-batch codes segments. Use the existing PrimitiveArrayEncoder
+            // path so encodings, alignment, and validity-child wiring stay
+            // consistent with the rest of the writer.
+            for (int b = 0; b < state.PerBatchCodes.Count; b++)
+            {
+                var codes = state.PerBatchCodes[b];
+                var codesArr = BuildUnsignedCodesArray(
+                    codes, codesPtype, codesElemSize,
+                    state.PerBatchValidity[b]);
+                var sb = new SegmentBuilder();
+                int rootTicket = PrimitiveArrayEncoder.Emit(
+                    sb, codesArr, PrimitiveEncodingIdx, BoolEncodingIdx, statsTicket: null);
+                byte[] bytes = sb.FinishSegment(rootTicket);
+                uint segIdx = _sw.AppendSegment(bytes, alignmentExponent: 0);
+                _columnSegmentsByBatch[c].Add(segIdx);
+            }
+
+            // Shared values segment: build a non-nullable StringArray from
+            // the distinct entries, route through VarBinArrayEncoder.
+            var valuesArr = BuildStringArrayFromList(state.Distinct);
+            var valuesSb = new SegmentBuilder();
+            int valuesRootTicket = VarBinArrayEncoder.Emit(
+                valuesSb, valuesArr, VarBinEncodingIdx, PrimitiveEncodingIdx, BoolEncodingIdx);
+            byte[] valuesBytes = valuesSb.FinishSegment(valuesRootTicket);
+            uint valuesSegIdx = _sw.AppendSegment(valuesBytes, alignmentExponent: 0);
+
+            result[c] = new DictColumnInfo
+            {
+                ValuesSegmentIdx = valuesSegIdx,
+                DictRowCount = (ulong)dictSize,
+                CodesPtype = codesPtype,
+                IsNullableCodes = state.AnyBatchHadNulls,
+            };
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Builds a synthetic typed unsigned-integer array from a list of code
+    /// values, picking the buffer width per <paramref name="codesPtype"/>
+    /// (PType: U8=0, U16=1, U32=2, U64=3). Validity is attached when
+    /// <paramref name="validityBytes"/> is non-empty.
+    /// </summary>
+    private static IArrowArray BuildUnsignedCodesArray(
+        int[] codes, byte codesPtype, int codesElemSize, byte[] validityBytes)
+    {
+        int n = codes.Length;
+        var bytes = new byte[(long)n * codesElemSize];
+        switch (codesPtype)
+        {
+            case 0:
+                for (int i = 0; i < n; i++) bytes[i] = (byte)codes[i];
+                break;
+            case 1:
+                {
+                    var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ushort>(bytes.AsSpan());
+                    for (int i = 0; i < n; i++) span[i] = (ushort)codes[i];
+                    break;
+                }
+            case 2:
+                {
+                    var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes.AsSpan());
+                    for (int i = 0; i < n; i++) span[i] = (uint)codes[i];
+                    break;
+                }
+            default:
+                {
+                    var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan());
+                    for (int i = 0; i < n; i++) span[i] = (ulong)codes[i];
+                    break;
+                }
+        }
+        var validityBuf = validityBytes.Length > 0 ? new ArrowBuffer(validityBytes) : ArrowBuffer.Empty;
+        // Compute nullCount from validity bitmap.
+        int nullCount = 0;
+        if (validityBytes.Length > 0)
+        {
+            for (int i = 0; i < n; i++)
+                if ((validityBytes[i >> 3] & (1 << (i & 7))) == 0) nullCount++;
+        }
+        return codesPtype switch
+        {
+            0 => new UInt8Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
+            1 => new UInt16Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
+            2 => new UInt32Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
+            _ => new UInt64Array(new ArrowBuffer(bytes), validityBuf, n, nullCount, 0),
+        };
+    }
+
+    private static StringArray BuildStringArrayFromList(IReadOnlyList<string> distinct)
+    {
+        int n = distinct.Count;
+        // Two-pass: total bytes, then offsets + values.
+        long totalBytes = 0;
+        for (int i = 0; i < n; i++) totalBytes += System.Text.Encoding.UTF8.GetByteCount(distinct[i]);
+        var offsetsBytes = new byte[(long)(n + 1) * 4];
+        var offsetsSpan = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, int>(offsetsBytes.AsSpan());
+        var valuesBytes = totalBytes == 0 ? System.Array.Empty<byte>() : new byte[totalBytes];
+        int pos = 0;
+        for (int i = 0; i < n; i++)
+        {
+            offsetsSpan[i] = pos;
+            int len = System.Text.Encoding.UTF8.GetBytes(distinct[i], 0, distinct[i].Length, valuesBytes, pos);
+            pos += len;
+        }
+        offsetsSpan[n] = pos;
+        return new StringArray(n,
+            new ArrowBuffer(offsetsBytes), new ArrowBuffer(valuesBytes),
+            ArrowBuffer.Empty, 0, 0);
+    }
+
+    private static byte SmallestUnsignedPtype(int distinct)
+    {
+        // distinct is the dict size; the largest in-use code value is
+        // distinct - 1. Pick the smallest unsigned width that holds it.
+        if (distinct <= byte.MaxValue + 1) return 0;       // U8
+        if (distinct <= ushort.MaxValue + 1) return 1;     // U16
+        // Codes can't exceed Int32.MaxValue in practice (we use int[]
+        // internally); u32 is plenty. u64 path retained for completeness.
+        if ((uint)distinct <= uint.MaxValue) return 2;     // U32
+        return 3;                                          // U64
+    }
+
+    private static int ElementSizeForPtype(byte ptype) => ptype switch
+    {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+
+    /// <summary>
+    /// Per-dict-column descriptor populated by <see cref="FinalizeDictLayoutColumns"/>;
+    /// passed through to <see cref="LayoutSerializer.SerializeStructDictMixed"/>
+    /// to construct the per-column vortex.dict layout.
+    /// </summary>
+    internal struct DictColumnInfo
+    {
+        public uint ValuesSegmentIdx;
+        public ulong DictRowCount;
+        public byte CodesPtype;
+        public bool IsNullableCodes;
+    }
+
     public void Close()
     {
         if (_closed) return;
@@ -1004,6 +1277,13 @@ public sealed class VortexFileWriter : IDisposable
         var dtypeBytes = DTypeSerializer.SerializeSchema(_schema);
         var dtypeBlock = _sw.AppendPostscriptBlock(dtypeBytes);
 
+        // 1a. Dict-layout columns: emit codes per batch + one shared values
+        // segment per dict column. Records the segment indices into
+        // _columnSegmentsByBatch (for codes) and a per-column structure for
+        // the values + ptype metadata so the layout step can synthesize
+        // vortex.dict layouts later.
+        var dictLayoutInfo = FinalizeDictLayoutColumns();
+
         // 2. Layout.
         // Strategy:
         //   - Single batch: vortex.struct(vortex.flat × N).
@@ -1011,10 +1291,16 @@ public sealed class VortexFileWriter : IDisposable
         //   - With preserveStats AND zone-eligible batch sizes: each column is
         //     additionally wrapped in vortex.stats(data, zones) so a
         //     pruning-aware reader can skip whole zones via the zones table.
+        //   - With preferDictLayout: each StringType column is wrapped in
+        //     vortex.dict(values=flat, codes=chunked-of-flat × M); other
+        //     columns keep the chunked-flat default. Stats co-existence on
+        //     dict columns is deferred (zoned path skips dict columns'
+        //     stats wrapper).
         // preserveStats falls back to the non-zoned chunked layout when
         // batch row counts aren't uniform (vortex requires all zones except
         // the last to share zone_len).
-        bool zoned = _preserveStats && _columnSegmentsByBatch.Length > 0 && CanZoneBatches();
+        bool hasDictColumns = dictLayoutInfo is not null;
+        bool zoned = _preserveStats && _columnSegmentsByBatch.Length > 0 && CanZoneBatches() && !hasDictColumns;
         byte[] layoutBytes;
         if (_batchRowCounts.Count == 0)
         {
@@ -1022,7 +1308,16 @@ public sealed class VortexFileWriter : IDisposable
                 "Cannot finalize a Vortex file with zero batches written; write at least one batch first.");
         }
 
-        if (zoned)
+        if (hasDictColumns)
+        {
+            var perColumnSegByBatch = new uint[_columnSegmentsByBatch.Length][];
+            for (int i = 0; i < perColumnSegByBatch.Length; i++)
+                perColumnSegByBatch[i] = _columnSegmentsByBatch[i].ToArray();
+            layoutBytes = LayoutSerializer.SerializeStructDictMixed(
+                StructLayoutIdx, DictLayoutIdx, ChunkedLayoutIdx, FlatLayoutIdx,
+                totalRows, _batchRowCounts, perColumnSegByBatch, dictLayoutInfo!);
+        }
+        else if (zoned)
         {
             // Build per-column zones segment (one row per batch with the
             // batch's null_count). Returns the segment index for each column.
@@ -1090,7 +1385,7 @@ public sealed class VortexFileWriter : IDisposable
                 VortexArrayEncodings.DateTimeParts,
                 VortexArrayEncodings.Extension,
             },
-            layoutSpecs: new[] { VortexLayoutEncodings.Flat, VortexLayoutEncodings.Struct, VortexLayoutEncodings.Chunked, VortexLayoutEncodings.Stats },
+            layoutSpecs: new[] { VortexLayoutEncodings.Flat, VortexLayoutEncodings.Struct, VortexLayoutEncodings.Chunked, VortexLayoutEncodings.Stats, VortexLayoutEncodings.Dictionary },
             segmentSpecs: _sw.SegmentSpecs);
         var footerBlock = _sw.AppendPostscriptBlock(footerBytes);
 
@@ -1123,12 +1418,13 @@ public sealed class VortexFileWriter : IDisposable
         Stream stream, RecordBatch batch,
         bool compress = false, bool preferVarBinView = false,
         bool preserveStats = false, bool preferPco = false,
-        bool preferDateTimeParts = false)
+        bool preferDateTimeParts = false,
+        bool preferDictLayout = false)
     {
         if (batch is null) throw new ArgumentNullException(nameof(batch));
         using var writer = new VortexFileWriter(
             stream, batch.Schema, compress, preferVarBinView,
-            preserveStats, preferPco, preferDateTimeParts);
+            preserveStats, preferPco, preferDateTimeParts, preferDictLayout);
         writer.WriteBatch(batch);
         writer.Close();
     }

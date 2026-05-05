@@ -6900,6 +6900,116 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task DictLayout_StringRoundtrip_MultiBatch()
+    {
+        // Three batches, each drawing from the same 6-string palette.
+        // preferDictLayout merges the per-batch dicts into a single shared
+        // values segment + 3 codes segments. Roundtrip must reproduce
+        // every value bit-exactly.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("color", StringType.Default, nullable: true),
+        }, metadata: null);
+        var palette = new[] { "alpha", "bravo", "charlie", "delta", "echo", "foxtrot" };
+        const int rowsPerBatch = 200;
+        var allExpected = new List<string?>();
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            {
+                using var w = new VortexFileWriter(fs, schema, preferDictLayout: true);
+                var rng = new Random(42);
+                for (int batch = 0; batch < 3; batch++)
+                {
+                    var b = new StringArray.Builder();
+                    for (int i = 0; i < rowsPerBatch; i++)
+                    {
+                        if (i % 17 == 0) { b.AppendNull(); allExpected.Add(null); }
+                        else
+                        {
+                            var v = palette[rng.Next(palette.Length)];
+                            b.Append(v);
+                            allExpected.Add(v);
+                        }
+                    }
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, rowsPerBatch));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            Assert.Equal(rowsPerBatch * 3L, reader.NumberOfRows);
+
+            int read = 0;
+            await foreach (var batch in reader.ReadAllAsync())
+            {
+                var col = Assert.IsType<StringArray>(batch.Column(0));
+                for (int i = 0; i < col.Length; i++)
+                {
+                    var expected = allExpected[read + i];
+                    if (expected is null) Assert.False(col.IsValid(i));
+                    else { Assert.True(col.IsValid(i)); Assert.Equal(expected, col.GetString(i)); }
+                }
+                read += col.Length;
+                batch.Dispose();
+            }
+            Assert.Equal(allExpected.Count, read);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task DictLayout_IsSmallerThanChunked()
+    {
+        // Sanity check the actual win: same data with preferDictLayout=true
+        // should be measurably smaller than the default chunked-flat output.
+        // 5 batches × 1000 rows × repeated palette → dict bytes (palette +
+        // strings) appear once with dict layout vs 5x with chunked.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("country", StringType.Default, nullable: false),
+        }, metadata: null);
+        var palette = new[] { "USA", "Canada", "Mexico", "Brazil", "Argentina", "Chile", "Peru", "Colombia" };
+
+        long Write(bool preferDict)
+        {
+            var path = Path.GetTempFileName();
+            try
+            {
+                using (var fs = File.Create(path))
+                {
+                    using var w = new VortexFileWriter(fs, schema, preferDictLayout: preferDict);
+                    var rng = new Random(7);
+                    for (int batch = 0; batch < 5; batch++)
+                    {
+                        var b = new StringArray.Builder();
+                        for (int i = 0; i < 1000; i++)
+                            b.Append(palette[rng.Next(palette.Length)]);
+                        w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, 1000));
+                    }
+                    w.Close();
+                }
+                return new FileInfo(path).Length;
+            }
+            finally
+            {
+                try { File.Delete(path); } catch { }
+            }
+        }
+
+        long withDict = Write(preferDict: true);
+        long withoutDict = Write(preferDict: false);
+        Assert.True(withDict < withoutDict,
+            $"Layout dict should be smaller than chunked. dict={withDict}, chunked={withoutDict}.");
+        await Task.CompletedTask; // satisfy async signature
+    }
+
+    [Fact]
     public async Task NullableRle_FloatsRoundtrip()
     {
         // Repetitive doubles with sprinkled nulls — fastlanes.rle is the

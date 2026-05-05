@@ -1694,6 +1694,55 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenDictLayoutFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Multi-batch low-cardinality string column under preferDictLayout:
+        // the file uses a vortex.dict layout sharing one global values
+        // segment across all batches. Validates the layout-level dict wire
+        // shape (children = [flat-values, chunked-of-flat-codes], metadata
+        // = { codes_ptype, is_nullable_codes }).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("color", StringType.Default, nullable: false),
+        }, metadata: null);
+        var palette = new[] { "alpha", "bravo", "charlie", "delta", "echo", "foxtrot" };
+        const int rowsPerBatch = 100;
+        const int batchCount = 4;
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            {
+                using var w = new VortexFileWriter(fs, schema, preferDictLayout: true);
+                var rng = new Random(123);
+                for (int batch = 0; batch < batchCount; batch++)
+                {
+                    var b = new StringArray.Builder();
+                    for (int i = 0; i < rowsPerBatch; i++)
+                        b.Append(palette[rng.Next(palette.Length)]);
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, rowsPerBatch));
+                }
+                w.Close();
+            }
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            int total = rowsPerBatch * batchCount;
+            Assert.Contains($"OK rows={total}", stdout);
+            Assert.Contains($"DONE total={total}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenStringStatsFile()
     {
         var validator = FindValidator();
