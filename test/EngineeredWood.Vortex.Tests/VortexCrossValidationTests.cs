@@ -1515,6 +1515,49 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenHalfFloatFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // F16 column: 2 bytes/row, no Extension wrap (just plain
+        // vortex.primitive). Apache.Arrow's HalfFloatArray needs System.Half
+        // (net6+); we construct it directly via Half values. Reader-side
+        // decode is still rejected on netstandard2.0, but Rust's validator
+        // handles F16 natively, so this exercises the writer end-to-end.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("h", HalfFloatType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 50;
+        var bytes = new byte[(long)n * 2];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, Half>(bytes.AsSpan());
+        for (int i = 0; i < n; i++) span[i] = (Half)(1.5f + i * 0.25f);
+        var arrData = new ArrayData(
+            HalfFloatType.Default, n, 0, 0,
+            new[] { ArrowBuffer.Empty, new ArrowBuffer(bytes) });
+        var arr = new HalfFloatArray(arrData);
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenListFile()
     {
         var validator = FindValidator();

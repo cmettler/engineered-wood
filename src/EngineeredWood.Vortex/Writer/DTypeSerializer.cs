@@ -78,6 +78,7 @@ internal static class DTypeSerializer
             UInt64Type => WrapDType(b, DTypeKind.Primitive, EmitPrimitive(b, PType.U64, nullable)),
             FloatType => WrapDType(b, DTypeKind.Primitive, EmitPrimitive(b, PType.F32, nullable)),
             DoubleType => WrapDType(b, DTypeKind.Primitive, EmitPrimitive(b, PType.F64, nullable)),
+            HalfFloatType => WrapDType(b, DTypeKind.Primitive, EmitPrimitive(b, PType.F16, nullable)),
             BooleanType => WrapDType(b, DTypeKind.Bool, EmitBool(b, nullable)),
             Decimal128Type d128 => WrapDType(b, DTypeKind.Decimal, EmitDecimalDType(b, d128.Precision, d128.Scale, nullable)),
             Decimal256Type d256 => WrapDType(b, DTypeKind.Decimal, EmitDecimalDType(b, d256.Precision, d256.Scale, nullable)),

@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Types;
 
 namespace EngineeredWood.Vortex.Writer.Encodings;
 
@@ -75,6 +76,11 @@ internal static class PrimitiveArrayEncoder
         int rowCount = array.Length;
         var data = ((Apache.Arrow.Array)array).Data;
         int byteOffset = data.Offset;
+        // HalfFloat (F16): 2 bytes/row. Apache.Arrow's HalfFloatArray requires
+        // System.Half (netstandard2.1+), so it's not in the type switch — we
+        // detect via DataType instead so this compiles on netstandard2.0.
+        if (data.DataType is HalfFloatType)
+            return (CopyBytes(data.Buffers[1].Span, byteOffset * 2, rowCount * 2), (byte)1);
         return array switch
         {
             Int8Array => (CopyBytes(data.Buffers[1].Span, byteOffset * 1, rowCount * 1), (byte)0),
