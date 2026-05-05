@@ -6402,6 +6402,66 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task SelfRoundtrip_Uuid()
+    {
+        // FixedSizeBinaryType(16) → vortex.uuid Extension over FSL<U8, 16>.
+        // The dispatcher reinterprets FSB as FSL of UInt8 without copying;
+        // the reader unwraps via ExtensionArrayDecoder.Rewrap.
+        var type = new FixedSizeBinaryType(16);
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("u", type, nullable: true),
+        }, metadata: null);
+        const int n = 50;
+        // 16 bytes per row; deterministic per-row pattern.
+        var bytes = new byte[(long)n * 16];
+        var validity = new byte[(n + 7) / 8];
+        int nullCount = 0;
+        var expected = new byte[n][];
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 6 == 0) { nullCount++; expected[i] = null!; continue; }
+            for (int k = 0; k < 16; k++) bytes[i * 16 + k] = (byte)(i + k);
+            validity[i >> 3] |= (byte)(1 << (i & 7));
+            expected[i] = new byte[16];
+            for (int k = 0; k < 16; k++) expected[i][k] = (byte)(i + k);
+        }
+        var arrData = new ArrayData(
+            type, n, nullCount, 0,
+            new[] { new ArrowBuffer(validity), new ArrowBuffer(bytes) });
+        var arr = new Apache.Arrow.Arrays.FixedSizeBinaryArray(arrData);
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var fsbType = Assert.IsType<FixedSizeBinaryType>(reader.Schema.FieldsList[0].DataType);
+            Assert.Equal(16, fsbType.ByteWidth);
+            var read = Assert.IsType<Apache.Arrow.Arrays.FixedSizeBinaryArray>(
+                await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    var actual = read.GetBytes(i);
+                    for (int k = 0; k < 16; k++) Assert.Equal(expected[i][k], actual[k]);
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task SelfRoundtrip_Date64()
     {
         // Date64: i64 milliseconds since epoch, wrapped in vortex.date Extension

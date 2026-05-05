@@ -91,6 +91,8 @@ internal static class DTypeSerializer
             Date64Type => WrapDType(b, DTypeKind.Extension, EmitDateExtension(b, isDate64: true, nullable)),
             Time32Type t32 => WrapDType(b, DTypeKind.Extension, EmitTimeExtension(b, t32.Unit, isWide: false, nullable)),
             Time64Type t64 => WrapDType(b, DTypeKind.Extension, EmitTimeExtension(b, t64.Unit, isWide: true, nullable)),
+            FixedSizeBinaryType fsb when fsb.ByteWidth == 16 =>
+                WrapDType(b, DTypeKind.Extension, EmitUuidExtension(b, nullable)),
             _ => throw new NotSupportedException(
                 $"Vortex writer Phase 1 doesn't yet support Arrow type {field.DataType} (field '{field.Name}')."),
         };
@@ -261,8 +263,46 @@ internal static class DTypeSerializer
     }
 
     /// <summary>
+    /// Emits a <c>vortex.uuid</c> Extension DType wrapping
+    /// <c>FixedSizeList(U8, 16)</c> storage. Metadata is empty (we don't
+    /// record an explicit UUID version; the reader's
+    /// <c>ResolveUuid</c> accepts that). Mirrors upstream
+    /// <c>vortex-array/src/extension/uuid/{metadata,vtable}.rs</c>.
+    /// </summary>
+    private static int EmitUuidExtension(BackwardsFlatBufferBuilder b, bool nullable)
+    {
+        // Inner element field: Primitive(U8, non-nullable).
+        var elemPrimitive = EmitPrimitive(b, PType.U8, nullable: false);
+        var elemDType = WrapDType(b, DTypeKind.Primitive, elemPrimitive);
+        // Storage: FixedSizeList(elem=U8, size=16, nullable). Reuses the
+        // generic FSL DType emitter — no UUID-specific child shape.
+        var storageInner = EmitFixedSizeListInner(b, elemDType, listSize: 16, nullable);
+        var storageTicket = WrapDType(b, DTypeKind.FixedSizeList, storageInner);
+        var metadataTicket = b.WriteByteVector(System.Array.Empty<byte>());
+        var idTicket = b.WriteString("vortex.uuid");
+        return EmitExtensionTable(b, idTicket, storageTicket, metadataTicket);
+    }
+
+    /// <summary>
+    /// Emits a FixedSizeList inner-table given a pre-emitted element-DType
+    /// ticket. Mirrors <see cref="EmitFixedSizeListDType"/> but takes the
+    /// element ticket directly so callers can drive list shape independently
+    /// of an Apache.Arrow Field.
+    /// </summary>
+    private static int EmitFixedSizeListInner(
+        BackwardsFlatBufferBuilder b, int elementDTypeTicket, int listSize, bool nullable)
+    {
+        var vt = b.WriteUInt16s(new ushort[] { 10, 13, 4, 8, 12 });
+        return b.StartTable(alignment: 4, inlineSize: 13)
+            .EmitBool(nullable)
+            .EmitU32(checked((uint)listSize))
+            .EmitUOffset(elementDTypeTicket)
+            .EmitSOffsetTo(vt);
+    }
+
+    /// <summary>
     /// Common Extension table emit for <c>vortex.date</c> / <c>vortex.time</c> /
-    /// <c>vortex.timestamp</c> (and future <c>vortex.uuid</c>). Slots:
+    /// <c>vortex.timestamp</c> / <c>vortex.uuid</c>. Slots:
     /// 0=id (string), 1=storage_dtype (DType), 2=metadata (vec&lt;u8&gt;).
     /// vt_size = 4 + 3*2 = 10. inline = 16
     /// (soffset(4) + id_uoff(4@4) + storage_uoff(4@8) + metadata_uoff(4@12)).

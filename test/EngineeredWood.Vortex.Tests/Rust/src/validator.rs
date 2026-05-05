@@ -12,6 +12,8 @@ use std::path::PathBuf;
 
 use futures::StreamExt;
 use futures::pin_mut;
+use vortex_array::dtype::session::DTypeSessionExt;
+use vortex_array::extension::uuid::Uuid as VortexUuid;
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_buffer::ByteBuffer;
@@ -39,6 +41,10 @@ async fn main() -> std::io::Result<()> {
         .with::<RuntimeSession>()
         .with_tokio();
     vortex_file::register_default_encodings(&session);
+    // Date/Time/Timestamp are registered by DTypeSession::default(); UUID
+    // isn't, so register it explicitly for the cross-validation tests that
+    // produce vortex.uuid columns.
+    session.dtypes().register(VortexUuid);
 
     let vxf = match session.open_options().open_buffer(buffer) {
         Ok(f) => f,

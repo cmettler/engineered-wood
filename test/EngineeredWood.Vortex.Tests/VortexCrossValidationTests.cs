@@ -1475,6 +1475,46 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenUuidFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        var type = new FixedSizeBinaryType(16);
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("u", type, nullable: false),
+        }, metadata: null);
+        const int n = 50;
+        var bytes = new byte[(long)n * 16];
+        for (int i = 0; i < n; i++)
+            for (int k = 0; k < 16; k++)
+                bytes[i * 16 + k] = (byte)(i + k);
+        var arrData = new ArrayData(
+            type, n, 0, 0,
+            new[] { ArrowBuffer.Empty, new ArrowBuffer(bytes) });
+        var arr = new Apache.Arrow.Arrays.FixedSizeBinaryArray(arrData);
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenListFile()
     {
         var validator = FindValidator();

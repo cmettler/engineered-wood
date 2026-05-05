@@ -73,6 +73,20 @@ internal static class ArrayEncoderDispatch
                 sb, array, idx.Primitive, idx.Bool, statsTicket: null);
             return WrapExtension(sb, idx.Ext, storageTicket, statsTicket);
         }
+        // FixedSizeBinaryArray (NOT Decimal128/256, which inherit from FSB
+        // and are matched ahead of this in the type switch below) — emitted
+        // as vortex.uuid wrapping FSL<U8, byteWidth>. Today the DType
+        // serializer only emits the vortex.uuid Extension for byteWidth=16,
+        // matching upstream's UUID convention; other widths fail at the
+        // schema level so we never reach here for them.
+        if (array is Apache.Arrow.Arrays.FixedSizeBinaryArray fsb
+            && array is not Decimal128Array and not Decimal256Array)
+        {
+            var fslArr = WrapFixedSizeBinaryAsListOfBytes(fsb);
+            int storageTicket = FixedSizeListArrayEncoder.Emit(
+                sb, fslArr, idx, statsTicket: null);
+            return WrapExtension(sb, idx.Ext, storageTicket, statsTicket);
+        }
 
         if (compress && ConstantArrayEncoder.IsApplicable(array))
             return ConstantArrayEncoder.Emit(sb, array, idx.Constant, statsTicket);
@@ -129,5 +143,48 @@ internal static class ArrayEncoderDispatch
         return statsTicket is null
             ? ArrayNodeEmitter.EmitWithChildrenOnly(sb.Builder, extEncodingIdx, children)
             : ArrayNodeEmitter.EmitWithChildrenAndStats(sb.Builder, extEncodingIdx, children, statsTicket.Value);
+    }
+
+    /// <summary>
+    /// Reinterprets a <see cref="FixedSizeBinaryArray"/> as the corresponding
+    /// <c>FixedSizeList&lt;UInt8, byteWidth&gt;</c> needed for vortex.uuid
+    /// storage. FSB lays out <c>n × byteWidth</c> contiguous bytes in
+    /// <c>Buffers[1]</c> exactly the way an FSL of u8 would, so the
+    /// rewrap is a pure metadata change — no value-buffer copy.
+    /// </summary>
+    private static FixedSizeListArray WrapFixedSizeBinaryAsListOfBytes(
+        Apache.Arrow.Arrays.FixedSizeBinaryArray fsb)
+    {
+        var fsbType = (Apache.Arrow.Types.FixedSizeBinaryType)fsb.Data.DataType;
+        int byteWidth = fsbType.ByteWidth;
+        var fsbData = fsb.Data;
+        int rowCount = fsb.Length;
+
+        // Inner UInt8Array carries the contiguous bytes. Length = rowCount *
+        // byteWidth so the FSL's child invariant holds; offset = 0 because we
+        // adjust visibility through the parent FSL's offset instead.
+        int innerOffset = fsbData.Offset * byteWidth;
+        int innerLength = rowCount * byteWidth;
+        var innerData = new ArrayData(
+            Apache.Arrow.Types.UInt8Type.Default,
+            length: fsbData.Buffers[1].Length, // covers the full underlying buffer
+            nullCount: 0,
+            offset: 0,
+            buffers: new[] { ArrowBuffer.Empty, fsbData.Buffers[1] });
+        // Leave the inner array's full underlying buffer in place; the FSL's
+        // outer offset will steer the visible window. (Slicing inner here
+        // would force a copy via Apache.Arrow.Array.Slice.)
+        _ = innerLength; _ = innerOffset;
+
+        var elemField = new Field("item", Apache.Arrow.Types.UInt8Type.Default, nullable: false);
+        var fslType = new Apache.Arrow.Types.FixedSizeListType(elemField, byteWidth);
+        var fslData = new ArrayData(
+            fslType,
+            length: rowCount,
+            nullCount: fsbData.NullCount,
+            offset: fsbData.Offset,
+            buffers: new[] { fsbData.NullCount > 0 ? fsbData.Buffers[0] : ArrowBuffer.Empty },
+            children: new[] { innerData });
+        return new FixedSizeListArray(fslData);
     }
 }
