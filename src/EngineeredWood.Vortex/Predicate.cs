@@ -69,6 +69,78 @@ public abstract class Predicate
     public static Predicate NotEqual<T>(int columnIdx, T value) where T : struct
         => new ComparisonPredicate<T>(columnIdx, ComparisonOp.NotEqual, value);
 
+    // -------------------- Factory: string + binary comparisons --------------------
+    //
+    // Compare lexicographically against the column's per-zone Min / Max, which
+    // are themselves StringArray / BinaryArray. Bytes are compared via
+    // ReadOnlySpan<byte>.SequenceCompareTo — UTF-8 byte ordering matches code-
+    // point ordering for code points ≤ U+007F (ASCII) and for any prefix-free
+    // pair of UTF-8-encoded strings, which covers most practical predicates.
+    // For non-ASCII text whose collation differs from byte-wise (e.g. locale-
+    // sensitive sorts), the predicate is conservative — false positives are
+    // possible but never false negatives, so a row-level filter on the
+    // resulting batches still yields correct output.
+
+    /// <summary><c>column &gt;= value</c> (lexicographic UTF-8 byte order).</summary>
+    public static Predicate GreaterOrEqual(int columnIdx, string value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.GreaterOrEqual,
+            System.Text.Encoding.UTF8.GetBytes(value ?? throw new ArgumentNullException(nameof(value))));
+
+    /// <summary><c>column &gt; value</c> (lexicographic UTF-8 byte order).</summary>
+    public static Predicate Greater(int columnIdx, string value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.Greater,
+            System.Text.Encoding.UTF8.GetBytes(value ?? throw new ArgumentNullException(nameof(value))));
+
+    /// <summary><c>column &lt;= value</c> (lexicographic UTF-8 byte order).</summary>
+    public static Predicate LessOrEqual(int columnIdx, string value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.LessOrEqual,
+            System.Text.Encoding.UTF8.GetBytes(value ?? throw new ArgumentNullException(nameof(value))));
+
+    /// <summary><c>column &lt; value</c> (lexicographic UTF-8 byte order).</summary>
+    public static Predicate Less(int columnIdx, string value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.Less,
+            System.Text.Encoding.UTF8.GetBytes(value ?? throw new ArgumentNullException(nameof(value))));
+
+    /// <summary><c>column == value</c> (UTF-8 byte equality).</summary>
+    public static Predicate Equal(int columnIdx, string value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.Equal,
+            System.Text.Encoding.UTF8.GetBytes(value ?? throw new ArgumentNullException(nameof(value))));
+
+    /// <summary><c>column != value</c> (UTF-8 byte equality).</summary>
+    public static Predicate NotEqual(int columnIdx, string value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.NotEqual,
+            System.Text.Encoding.UTF8.GetBytes(value ?? throw new ArgumentNullException(nameof(value))));
+
+    /// <summary><c>column &gt;= value</c> (lexicographic byte order on Binary columns).</summary>
+    public static Predicate GreaterOrEqual(int columnIdx, byte[] value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.GreaterOrEqual,
+            value ?? throw new ArgumentNullException(nameof(value)));
+
+    /// <summary><c>column &gt; value</c> (lexicographic byte order on Binary columns).</summary>
+    public static Predicate Greater(int columnIdx, byte[] value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.Greater,
+            value ?? throw new ArgumentNullException(nameof(value)));
+
+    /// <summary><c>column &lt;= value</c> (lexicographic byte order on Binary columns).</summary>
+    public static Predicate LessOrEqual(int columnIdx, byte[] value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.LessOrEqual,
+            value ?? throw new ArgumentNullException(nameof(value)));
+
+    /// <summary><c>column &lt; value</c> (lexicographic byte order on Binary columns).</summary>
+    public static Predicate Less(int columnIdx, byte[] value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.Less,
+            value ?? throw new ArgumentNullException(nameof(value)));
+
+    /// <summary><c>column == value</c> (byte equality on Binary columns).</summary>
+    public static Predicate Equal(int columnIdx, byte[] value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.Equal,
+            value ?? throw new ArgumentNullException(nameof(value)));
+
+    /// <summary><c>column != value</c> (byte equality on Binary columns).</summary>
+    public static Predicate NotEqual(int columnIdx, byte[] value)
+        => new BytesComparisonPredicate(columnIdx, ComparisonOp.NotEqual,
+            value ?? throw new ArgumentNullException(nameof(value)));
+
     // -------------------- Factory: nullability --------------------
 
     /// <summary>
@@ -134,6 +206,13 @@ public abstract class Predicate
         _ => throw new NotSupportedException(
             $"Predicate values of type {typeof(T).Name} are not supported."),
     };
+
+    internal static HashSet<int> AllZones(int total)
+    {
+        var s = new HashSet<int>();
+        for (int i = 0; i < total; i++) s.Add(i);
+        return s;
+    }
 }
 
 internal sealed class ComparisonPredicate<T> : Predicate where T : struct
@@ -153,7 +232,7 @@ internal sealed class ComparisonPredicate<T> : Predicate where T : struct
         VortexFileReader reader, int totalZones, CancellationToken ct)
     {
         var stats = await reader.GetZoneStatsAsync(_columnIdx, ct).ConfigureAwait(false);
-        if (stats is null) return AllZones(totalZones);
+        if (stats is null) return Predicate.AllZones(totalZones);
 
         // Pruning rules per op:
         //   >=  K: drop zone where max < K. Need Max.
@@ -206,11 +285,93 @@ internal sealed class ComparisonPredicate<T> : Predicate where T : struct
         return accepted;
     }
 
-    private static HashSet<int> AllZones(int total)
+}
+
+/// <summary>
+/// Lexicographic byte comparison predicate against a <see cref="StringArray"/>
+/// or <see cref="BinaryArray"/> column's per-zone <c>Min</c> / <c>Max</c>
+/// stats. Strings are encoded as UTF-8 bytes once and compared via
+/// <see cref="MemoryExtensions.SequenceCompareTo{T}"/>.
+/// </summary>
+internal sealed class BytesComparisonPredicate : Predicate
+{
+    private readonly int _columnIdx;
+    private readonly ComparisonOp _op;
+    private readonly byte[] _value;
+
+    public BytesComparisonPredicate(int columnIdx, ComparisonOp op, byte[] value)
     {
-        var s = new HashSet<int>();
-        for (int i = 0; i < total; i++) s.Add(i);
-        return s;
+        _columnIdx = columnIdx;
+        _op = op;
+        _value = value;
+    }
+
+    internal override async Task<HashSet<int>> EvaluateZonesAsync(
+        VortexFileReader reader, int totalZones, CancellationToken ct)
+    {
+        var stats = await reader.GetZoneStatsAsync(_columnIdx, ct).ConfigureAwait(false);
+        if (stats is null) return Predicate.AllZones(totalZones);
+
+        // Same pruning rules as the numeric path; the only change is that
+        // CompareCellTo lexicographically compares bytes instead of going
+        // through ReadAsDouble. Zones whose Min / Max validity is cleared
+        // (empty / all-null batch) are kept conservatively — the cell
+        // returns null and the relevant rule short-circuits as "keep".
+        var maxArr = stats.Max;
+        var minArr = stats.Min;
+        var accepted = new HashSet<int>();
+        for (int z = 0; z < stats.ZoneCount; z++)
+        {
+            bool keep = true;
+            switch (_op)
+            {
+                case ComparisonOp.GreaterOrEqual:
+                    if (CompareCellTo(maxArr, z) is int cmpGe && cmpGe < 0) keep = false;
+                    break;
+                case ComparisonOp.Greater:
+                    if (CompareCellTo(maxArr, z) is int cmpGt && cmpGt <= 0) keep = false;
+                    break;
+                case ComparisonOp.LessOrEqual:
+                    if (CompareCellTo(minArr, z) is int cmpLe && cmpLe > 0) keep = false;
+                    break;
+                case ComparisonOp.Less:
+                    if (CompareCellTo(minArr, z) is int cmpLt && cmpLt >= 0) keep = false;
+                    break;
+                case ComparisonOp.Equal:
+                    // Drop only when value > max (cell vs value < 0) or value < min (cell > 0).
+                    if (CompareCellTo(maxArr, z) is int cmpEqMax && cmpEqMax < 0) keep = false;
+                    if (keep && CompareCellTo(minArr, z) is int cmpEqMin && cmpEqMin > 0) keep = false;
+                    break;
+                case ComparisonOp.NotEqual:
+                    // Drop only when min == max == value.
+                    var minCmp = CompareCellTo(minArr, z);
+                    var maxCmp = CompareCellTo(maxArr, z);
+                    if (minCmp == 0 && maxCmp == 0) keep = false;
+                    break;
+            }
+            if (keep) accepted.Add(z);
+        }
+        return accepted;
+    }
+
+    /// <summary>
+    /// Returns <c>cell.SequenceCompareTo(_value)</c> for valid cells, null
+    /// for invalid cells, null when <paramref name="array"/> is null
+    /// (column has no Min / Max stats). Caller treats null as "keep
+    /// conservatively."
+    /// </summary>
+    private int? CompareCellTo(IArrowArray? array, int z)
+    {
+        if (array is null) return null;
+        ReadOnlySpan<byte> value = _value;
+        return array switch
+        {
+            StringArray s => s.IsValid(z) ? s.GetBytes(z).SequenceCompareTo(value) : (int?)null,
+            BinaryArray b => b.IsValid(z) ? b.GetBytes(z).SequenceCompareTo(value) : (int?)null,
+            _ => throw new NotSupportedException(
+                $"BytesComparisonPredicate doesn't handle Arrow array {array.GetType().Name}; "
+                + "string/binary predicates require StringArray or BinaryArray Min/Max stats."),
+        };
     }
 }
 

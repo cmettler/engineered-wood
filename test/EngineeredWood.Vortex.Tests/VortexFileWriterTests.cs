@@ -6462,6 +6462,117 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task StringPredicate_EqualKeepsZoneInRange()
+    {
+        // dict_string_64rows.vortex has one zone with min='alpha' max='foxtrot'.
+        // 'delta' is lex-in [alpha, foxtrot] so the zone is kept and the batch
+        // surfaces. Tests Predicate.Equal(string).
+        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync(Predicate.Equal(0, "delta"))) batches.Add(b);
+        try
+        {
+            Assert.Single(batches);
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task StringPredicate_EqualOutOfRangePrunes()
+    {
+        // 'zebra' > 'foxtrot' (max), so the zone is dropped.
+        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync(Predicate.Equal(0, "zebra"))) batches.Add(b);
+        try
+        {
+            Assert.Empty(batches);
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task StringPredicate_GreaterThanMaxPrunes()
+    {
+        // Predicate "> max" drops the zone (max is foxtrot, cmp(max, foxtrot)=0 ≤ 0).
+        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync(Predicate.Greater(0, "foxtrot"))) batches.Add(b);
+        try
+        {
+            Assert.Empty(batches);
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task StringPredicate_LessThanMinPrunes()
+    {
+        // Predicate "< min" drops the zone (min is alpha, cmp(min, alpha)=0 ≥ 0).
+        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync(Predicate.Less(0, "alpha"))) batches.Add(b);
+        try
+        {
+            Assert.Empty(batches);
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task StringPredicate_GreaterOrEqualKeeps()
+    {
+        // GreaterOrEqual(min) keeps the zone (cmp(max, min) >= 0 trivially).
+        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync(Predicate.GreaterOrEqual(0, "alpha"))) batches.Add(b);
+        try
+        {
+            Assert.Single(batches);
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task StringPredicate_NotEqualKeepsRange()
+    {
+        // NotEqual is conservative: drops only when min == max == K. Here
+        // min='alpha' max='foxtrot' so the zone stays.
+        var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
+        await using var r = await VortexFileReader.OpenAsync(path);
+        var batches = new List<RecordBatch>();
+        await foreach (var b in r.ReadAllAsync(Predicate.NotEqual(0, "delta"))) batches.Add(b);
+        try
+        {
+            Assert.Single(batches);
+        }
+        finally
+        {
+            foreach (var b in batches) b.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task SelfRoundtrip_HalfFloat()
     {
         // F16: 2 bytes/row, no Extension wrap. Reader's PrimitiveArrayDecoder

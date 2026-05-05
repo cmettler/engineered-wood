@@ -75,9 +75,42 @@ internal static class ConstantArrayDecoder
                 (data, len) => new DoubleArray(new ArrowBuffer(data), ArrowBuffer.Empty, len, 0, 0),
                 scalar.F64Value),
             (BooleanType, ScalarValueKind.Bool) => BuildBool(n, scalar.BoolValue),
+            // Repeated-string / repeated-binary constants typically arise as
+            // a zone-stats Min or Max when every zone has the same lex-min /
+            // lex-max (or is the only zone). vortex's writer collapses both
+            // into vortex.constant carrying a single StringValue / BytesValue.
+            (StringType, ScalarValueKind.String) => BuildVarBin(
+                n, isString: true, System.Text.Encoding.UTF8.GetBytes(scalar.StringValue ?? string.Empty)),
+            (BinaryType, ScalarValueKind.Bytes) => BuildVarBin(
+                n, isString: false, scalar.BytesValue ?? System.Array.Empty<byte>()),
             _ => throw new NotSupportedException(
                 $"vortex.constant decoder doesn't support Arrow {type} with ScalarValue {scalar.Kind}."),
         };
+    }
+
+    /// <summary>
+    /// Builds a repeated-string / repeated-binary array of length
+    /// <paramref name="rowCount"/>. Offsets are <c>{0, len, 2*len, …, n*len}</c>;
+    /// the values buffer is the bytes repeated once per row.
+    /// </summary>
+    private static IArrowArray BuildVarBin(int rowCount, bool isString, byte[] valueBytes)
+    {
+        // Offsets buffer: (n+1) i32 values stepping by valueBytes.Length each row.
+        var offsetsBytes = new byte[(long)(rowCount + 1) * 4];
+        var offsetsSpan = MemoryMarshal.Cast<byte, int>(offsetsBytes.AsSpan());
+        for (int i = 0; i <= rowCount; i++) offsetsSpan[i] = i * valueBytes.Length;
+
+        // Values buffer: valueBytes copied rowCount times. For empty strings
+        // (valueBytes.Length == 0) this is a zero-length buffer.
+        var valuesBytes = new byte[(long)rowCount * valueBytes.Length];
+        for (int i = 0; i < rowCount && valueBytes.Length > 0; i++)
+            Buffer.BlockCopy(valueBytes, 0, valuesBytes, i * valueBytes.Length, valueBytes.Length);
+
+        var offsetsBuf = new ArrowBuffer(offsetsBytes);
+        var valuesBuf = new ArrowBuffer(valuesBytes);
+        return isString
+            ? new StringArray(rowCount, offsetsBuf, valuesBuf, ArrowBuffer.Empty, 0, 0)
+            : new BinaryArray(BinaryType.Default, rowCount, offsetsBuf, valuesBuf, ArrowBuffer.Empty, 0, 0);
     }
 
     private static IArrowArray Filled<T>(
