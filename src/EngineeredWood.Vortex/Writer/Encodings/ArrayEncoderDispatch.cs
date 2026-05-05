@@ -50,9 +50,9 @@ internal static class ArrayEncoderDispatch
         bool preferPco = false,
         bool preferDateTimeParts = false)
     {
-        // Extension-typed columns (currently: TimestampArray) need to be
-        // wrapped in a vortex.ext ArrayNode whose single child is the
-        // storage encoding. Upstream's wire shape: 0 buffers, 1 child,
+        // Extension-typed columns (TimestampArray / Date32Array / Date64Array)
+        // need to be wrapped in a vortex.ext ArrayNode whose single child is
+        // the storage encoding. Upstream's wire shape: 0 buffers, 1 child,
         // empty metadata (per vortex-array/src/arrays/extension/vtable/mod.rs).
         // Dispatched ahead of the compress chain so the wrapper sits on the
         // OUTSIDE — stats attach to the wrapper, the storage encoding has
@@ -64,6 +64,12 @@ internal static class ArrayEncoderDispatch
                 storageTicket = DateTimePartsArrayEncoder.Emit(sb, array, idx, statsTicket: null);
             else
                 storageTicket = PrimitiveArrayEncoder.Emit(sb, array, idx.Primitive, idx.Bool, statsTicket: null);
+            return WrapExtension(sb, idx.Ext, storageTicket, statsTicket);
+        }
+        if (array is Apache.Arrow.Date32Array or Apache.Arrow.Date64Array)
+        {
+            int storageTicket = PrimitiveArrayEncoder.Emit(
+                sb, array, idx.Primitive, idx.Bool, statsTicket: null);
             return WrapExtension(sb, idx.Ext, storageTicket, statsTicket);
         }
 

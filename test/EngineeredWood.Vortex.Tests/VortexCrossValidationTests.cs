@@ -1325,6 +1325,84 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenDate32File()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("d", Date32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 100;
+        var bytes = new byte[(long)n * 4];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, int>(bytes.AsSpan());
+        for (int i = 0; i < n; i++) span[i] = 19_723 + i;
+        var arr = new Date32Array(new ArrowBuffer(bytes), ArrowBuffer.Empty, n, 0, 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public void RustReader_OpensDotNetWrittenDate64File()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("d", Date64Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 80;
+        var bytes = new byte[(long)n * 8];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, long>(bytes.AsSpan());
+        var validity = new byte[(n + 7) / 8];
+        int nullCount = 0;
+        long baseMs = 1_704_067_200L * 1_000L;
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 9 == 0) { nullCount++; continue; }
+            span[i] = baseMs + (long)i * 86_400_000L;
+            validity[i >> 3] |= (byte)(1 << (i & 7));
+        }
+        var arr = new Date64Array(new ArrowBuffer(bytes), new ArrowBuffer(validity), n, nullCount, 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenListFile()
     {
         var validator = FindValidator();

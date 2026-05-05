@@ -87,6 +87,8 @@ internal static class DTypeSerializer
             ListType lst => WrapDType(b, DTypeKind.List, EmitListDType(b, lst.ValueField, nullable)),
             FixedSizeListType fsl => WrapDType(b, DTypeKind.FixedSizeList, EmitFixedSizeListDType(b, fsl.ValueField, fsl.ListSize, nullable)),
             TimestampType ts => WrapDType(b, DTypeKind.Extension, EmitTimestampExtension(b, ts, nullable)),
+            Date32Type => WrapDType(b, DTypeKind.Extension, EmitDateExtension(b, isDate64: false, nullable)),
+            Date64Type => WrapDType(b, DTypeKind.Extension, EmitDateExtension(b, isDate64: true, nullable)),
             _ => throw new NotSupportedException(
                 $"Vortex writer Phase 1 doesn't yet support Arrow type {field.DataType} (field '{field.Name}')."),
         };
@@ -205,10 +207,37 @@ internal static class DTypeSerializer
         var metadataTicket = b.WriteByteVector(metadata);
 
         var idTicket = b.WriteString("vortex.timestamp");
+        return EmitExtensionTable(b, idTicket, storageTicket, metadataTicket);
+    }
 
-        // Extension table: { id (string, slot 0), storage_dtype (DType, slot 1),
-        // metadata (vec<u8>, slot 2) }. vt_size = 4 + 3*2 = 10. inline = 16
-        // (soffset(4) + id_uoff(4@4) + storage_uoff(4@8) + metadata_uoff(4@12)).
+    /// <summary>
+    /// Emits a <c>vortex.date</c> Extension DType. Storage is Primitive(I32) +
+    /// unit tag 4 (Days) for Date32, or Primitive(I64) + unit tag 2 (Ms) for
+    /// Date64 — matching the reader's <c>ResolveDate</c>. Metadata is a
+    /// single unit byte (no tz). Mirrors upstream
+    /// <c>vortex-array/src/extension/datetime/date.rs</c>.
+    /// </summary>
+    private static int EmitDateExtension(
+        BackwardsFlatBufferBuilder b, bool isDate64, bool nullable)
+    {
+        var (ptype, unitTag) = isDate64 ? (PType.I64, (byte)2) : (PType.I32, (byte)4);
+        var storageInner = EmitPrimitive(b, ptype, nullable);
+        var storageTicket = WrapDType(b, DTypeKind.Primitive, storageInner);
+        var metadataTicket = b.WriteByteVector(new[] { unitTag });
+        var idTicket = b.WriteString("vortex.date");
+        return EmitExtensionTable(b, idTicket, storageTicket, metadataTicket);
+    }
+
+    /// <summary>
+    /// Common Extension table emit for <c>vortex.date</c> / <c>vortex.time</c> /
+    /// <c>vortex.timestamp</c> (and future <c>vortex.uuid</c>). Slots:
+    /// 0=id (string), 1=storage_dtype (DType), 2=metadata (vec&lt;u8&gt;).
+    /// vt_size = 4 + 3*2 = 10. inline = 16
+    /// (soffset(4) + id_uoff(4@4) + storage_uoff(4@8) + metadata_uoff(4@12)).
+    /// </summary>
+    private static int EmitExtensionTable(
+        BackwardsFlatBufferBuilder b, int idTicket, int storageTicket, int metadataTicket)
+    {
         var vt = b.WriteUInt16s(new ushort[] { 10, 16, 4, 8, 12 });
         return b.StartTable(alignment: 4, inlineSize: 16)
             .EmitUOffset(metadataTicket)

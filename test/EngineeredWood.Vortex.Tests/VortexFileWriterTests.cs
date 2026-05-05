@@ -6265,4 +6265,91 @@ public class VortexFileWriterTests
             try { File.Delete(path); } catch { }
         }
     }
+
+    [Fact]
+    public async Task SelfRoundtrip_Date32()
+    {
+        // Date32: i32 days since epoch, wrapped in vortex.date Extension.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("d", Date32Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 100;
+        var bytes = new byte[(long)n * 4];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, int>(bytes.AsSpan());
+        var validity = new byte[(n + 7) / 8];
+        int nullCount = 0;
+        var expected = new int?[n];
+        // 2024-01-01 = 19_723 days since epoch.
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 5 == 0) { nullCount++; expected[i] = null; }
+            else { int v = 19_723 + i; span[i] = v; validity[i >> 3] |= (byte)(1 << (i & 7)); expected[i] = v; }
+        }
+        var arr = new Date32Array(new ArrowBuffer(bytes), new ArrowBuffer(validity), n, nullCount, 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            Assert.IsType<Date32Type>(reader.Schema.FieldsList[0].DataType);
+            var read = Assert.IsType<Date32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[i]!.Value, read.GetValue(i)!.Value); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task SelfRoundtrip_Date64()
+    {
+        // Date64: i64 milliseconds since epoch, wrapped in vortex.date Extension
+        // with TimeUnit::Ms (tag 2).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("d", Date64Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 50;
+        var bytes = new byte[(long)n * 8];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, long>(bytes.AsSpan());
+        long baseMs = 1_704_067_200L * 1_000L; // 2024-01-01 UTC in ms
+        var expected = new long[n];
+        for (int i = 0; i < n; i++)
+        {
+            long v = baseMs + (long)i * 86_400_000L;
+            span[i] = v;
+            expected[i] = v;
+        }
+        var arr = new Date64Array(new ArrowBuffer(bytes), ArrowBuffer.Empty, n, 0, 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            Assert.IsType<Date64Type>(reader.Schema.FieldsList[0].DataType);
+            var read = Assert.IsType<Date64Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(expected[i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
 }
