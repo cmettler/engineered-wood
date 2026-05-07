@@ -5,7 +5,7 @@ A .NET library for reading and writing columnar file formats — **Apache Parque
 ## Highlights
 
 - **Five formats, one Arrow surface.** Parquet, ORC, Avro, Lance, and Vortex readers and writers all speak `Apache.Arrow.RecordBatch`; Delta Lake, Lance dataset, and Iceberg sit on top of them.
-- **Predicate pushdown across formats.** A shared expression library (`EngineeredWood.Expressions`) drives row-group pruning in Parquet, file pruning in Delta Lake, scan planning in Iceberg, and predicate-based delete/update on Lance datasets from the same tree. Vortex ships its own zone-stats predicate API for the same purpose.
+- **Predicate pushdown across formats.** A shared expression library (`EngineeredWood.Expressions`) drives row-group pruning in Parquet, file pruning in Delta Lake, scan planning in Iceberg, predicate-based delete/update on Lance datasets, and zone-stats pruning on Vortex — one predicate type works against any of them.
 - **Table-format support.** Delta Lake Reader v3 / Writer v7 with deletion vectors, column mapping, type widening, change data feed, identity columns, row tracking, and V2 checkpoints. Lance datasets with Create / Append / Overwrite / Delete / Update / Compact / Vacuum and version + timestamp time travel. Iceberg v1/v2/v3 metadata with manifest read/write and partition-transform-aware scan planning.
 - **Cloud-native I/O.** An offset-based I/O layer (instead of `Stream`) lets readers issue concurrent, coalesced range requests against local files or Azure Blob Storage.
 - **Pure-managed compression.** Snappy, Zstd, and LZ4 via managed codecs; no native dependencies.
@@ -350,11 +350,14 @@ implementation.
 - **Row-range slice**: `ReadAllAsync(long rowOffset, long rowCount, ...)`
   drops chunks fully outside the range with zero I/O; boundary chunks are
   decoded fully and sliced via `RecordBatch.Slice`.
-- **Predicate-based zone pruning**: `ReadAllAsync(Predicate, ...)` skips
-  zones whose stored stats prove the predicate can't match. Predicates
-  cover numeric (`i8..i64`, `u8..u64`, `f32`, `f64`) + string + binary +
-  bool + temporal (`Date32/64`, `Timestamp`, `Time32/64`) comparisons,
-  `IsNull` / `IsNotNull`, and `And` / `Or` composition.
+- **Predicate-based zone pruning**: `ReadAllAsync(Predicate, ...)` takes
+  a shared `EngineeredWood.Expressions.Predicate` and skips zones whose
+  stored stats prove the predicate can't match. The same predicate types
+  drive Parquet row-group pruning, Delta Lake file pruning, and Iceberg
+  scan planning. Coverage spans numeric (`i8..i64`, `u8..u64`, `f32`,
+  `f64`) + string + binary + bool + temporal (`Date32/64`, `Timestamp`,
+  `Time32/64`) comparisons, `IS NULL` / `IS NOT NULL`, `IN` / `NOT IN`,
+  and `AND` / `OR` / `NOT` composition with three-valued logic.
 - `GetZoneStatsAsync(int fieldIndex)` exposes the per-zone stats table
   (Min, Max, Sum, NullCount, NaNCount, IsConstant, IsSorted,
   IsStrictSorted, UncompressedSizeInBytes, MinIsTruncated,
@@ -726,6 +729,8 @@ await foreach (var batch in latest.ReadAsync(
 ```csharp
 using EngineeredWood.Vortex;
 using EngineeredWood.Vortex.Writer;
+using Ex = EngineeredWood.Expressions.Expressions;
+using EngineeredWood.Expressions;
 
 // Write a Vortex file with the compressing chain enabled and per-zone stats.
 using (var stream = File.Create("data.vortex"))
@@ -742,9 +747,9 @@ await using var reader = await VortexFileReader.OpenAsync("data.vortex");
 
 await foreach (var batch in reader.ReadAllAsync(
     columnIndices: new[] { 0, 2 },
-    predicate: Predicate.And(
-        Predicate.GreaterOrEqual(0, 100L),
-        Predicate.Equal(2, "us"))))
+    predicate: Ex.And(
+        Ex.GreaterThanOrEqual("event_count", LiteralValue.Of(100L)),
+        Ex.Equal("region", LiteralValue.Of("us")))))
 {
     // batch is an Apache.Arrow.RecordBatch
 }

@@ -5,6 +5,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using EngineeredWood.Compression;
+using EngineeredWood.Expressions;
 using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Vortex.Encodings;
@@ -360,15 +361,19 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Streams the file as Arrow <see cref="RecordBatch"/>es, pruned by
-    /// <paramref name="predicate"/> against the per-zone stats. Predicates
-    /// are conservative — zones whose stats prove no row can match are
-    /// skipped at decode time; zones with missing stats or matching ranges
-    /// are kept and the caller is expected to apply a row-level filter.
+    /// <paramref name="predicate"/> (from the shared
+    /// <see cref="EngineeredWood.Expressions"/> library) against the per-zone
+    /// stats. Predicates are conservative — zones whose stats prove no row
+    /// can match are skipped at decode time; zones with missing stats or
+    /// matching ranges are kept and the caller is expected to apply a
+    /// row-level filter.
     ///
-    /// <para>Equivalent to:
-    /// <c>ReadAllAsync(await predicate.EvaluateZonesAsync(this, ...))</c>
-    /// — the predicate evaluates lazily against each column's
-    /// <see cref="GetZoneStatsAsync"/> result.</para>
+    /// <para>The predicate's <see cref="UnboundReference"/> nodes are matched
+    /// against the file's <see cref="Schema"/> by name; references to columns
+    /// not in the schema cause the affected zone to be kept conservatively.
+    /// Build predicates with <c>EngineeredWood.Expressions.Expressions</c>
+    /// (e.g. <c>Expressions.GreaterThanOrEqual("v", LiteralValue.Of(100L))</c>)
+    /// or a higher-level translator (Spark SQL, Substrait, etc.).</para>
     /// </summary>
     public async IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
         Predicate predicate,
@@ -488,8 +493,8 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         if (predicate is not null && _columnPlans.Length > 0)
         {
             int totalZones = _columnPlans[0].ChunkCount;
-            acceptedZones = await predicate.EvaluateZonesAsync(this, totalZones, cancellationToken)
-                .ConfigureAwait(false);
+            acceptedZones = await EvaluatePredicateZonesAsync(
+                predicate, totalZones, cancellationToken).ConfigureAwait(false);
         }
         await foreach (var batch in ReadAllCoreAsync(
             acceptedZones, columnIndices, rowOffset, rowCount, cancellationToken).ConfigureAwait(false))
@@ -518,11 +523,60 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     {
         if (_columnPlans.Length == 0) yield break;
         int totalZones = _columnPlans[0].ChunkCount;
-        var accepted = await predicate.EvaluateZonesAsync(this, totalZones, cancellationToken)
-            .ConfigureAwait(false);
+        var accepted = await EvaluatePredicateZonesAsync(
+            predicate, totalZones, cancellationToken).ConfigureAwait(false);
         await foreach (var batch in ReadAllCoreAsync(accepted, columnIndices, rowOffset: 0, rowCount: long.MaxValue, cancellationToken)
             .ConfigureAwait(false))
             yield return batch;
+    }
+
+    /// <summary>
+    /// Walks <paramref name="predicate"/>, pre-loads the per-zone stats for
+    /// every column it references (one <see cref="GetZoneStatsAsync"/> call
+    /// per referenced column), then iterates the zones and runs the shared
+    /// <see cref="StatisticsEvaluator"/> against a per-zone cursor. Returns
+    /// the set of zone indices that aren't proven to contain no matches.
+    /// </summary>
+    private async Task<HashSet<int>> EvaluatePredicateZonesAsync(
+        Predicate predicate, int totalZones, CancellationToken cancellationToken)
+    {
+        // Collect referenced column names once. Predicates over columns that
+        // aren't in the schema, or that the predicate doesn't reference at
+        // all, don't trigger any stats fetch.
+        var referenced = VortexZoneStatsAccessor.CollectReferencedColumns(predicate);
+        var statsByColumn = new Dictionary<string, ZoneStats?>(referenced.Count, StringComparer.Ordinal);
+        foreach (var name in referenced)
+        {
+            int idx = FindFieldIndex(name);
+            // Unresolvable reference → null entry → accessor returns null for
+            // min/max/etc. → evaluator stays at Unknown → zone kept.
+            statsByColumn[name] = idx < 0
+                ? null
+                : await GetZoneStatsAsync(idx, cancellationToken).ConfigureAwait(false);
+        }
+
+        var accessor = new VortexZoneStatsAccessor(Schema);
+        var cursor = new VortexZoneCursor(statsByColumn);
+        var accepted = new HashSet<int>();
+        for (int z = 0; z < totalZones; z++)
+        {
+            cursor.ZoneIndex = z;
+            var result = StatisticsEvaluator.Evaluate(predicate, cursor, accessor);
+            if (result != FilterResult.AlwaysFalse)
+                accepted.Add(z);
+        }
+        return accepted;
+    }
+
+    private int FindFieldIndex(string name)
+    {
+        var fields = Schema.FieldsList;
+        for (int i = 0; i < fields.Count; i++)
+        {
+            if (string.Equals(fields[i].Name, name, StringComparison.Ordinal))
+                return i;
+        }
+        return -1;
     }
 
     /// <summary>

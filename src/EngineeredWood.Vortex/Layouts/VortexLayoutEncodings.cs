@@ -25,7 +25,9 @@ internal static class VortexLayoutEncodings
     /// reasons the serialized layout encoding ID is still vortex.stats.").
     /// Two children — child[0] = data, child[1] = zones table — plus
     /// metadata <c>{ zone_len: u32 LE, present_stats: bitset }</c>. Used
-    /// for filter pruning via <see cref="EngineeredWood.Vortex.Predicate"/>.
+    /// for filter pruning via the shared
+    /// <see cref="EngineeredWood.Expressions.Predicate"/> API
+    /// (see <see cref="VortexFileReader.ReadAllAsync(EngineeredWood.Expressions.Predicate, System.Threading.CancellationToken)"/>).
     /// </summary>
     public const string Stats = "vortex.stats";
 

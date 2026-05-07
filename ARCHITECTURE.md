@@ -97,7 +97,10 @@ src/
                                           plus ArrayEncoderDispatch, ArrayStatsComputer,
                                           ArrayNodeEmitter, EncoderHelpers,
                                           ScalarValueSerializer, SegmentBuilder)
-    Predicate.cs                        Public predicate API for zone-stats pruning
+    VortexZoneStatsAccessor.cs          IStatisticsAccessor<TStats> adapter so
+                                          shared EngineeredWood.Expressions
+                                          predicates evaluate against per-zone
+                                          stats (typed Arrow Min/Max arrays)
     Stat.cs / ZoneStats.cs              Per-zone stats enum + typed accessor surface
     VortexFileReader.cs                 Open + Schema + ReadAllAsync (with column
                                           projection, row-range slice, and predicate)
@@ -164,6 +167,7 @@ EngineeredWood.Expressions                            (no Arrow, no format deps)
   ├── EngineeredWood.Expressions.Arrow                (depends on Apache.Arrow)
   ├── EngineeredWood.Parquet
   ├── EngineeredWood.Iceberg
+  ├── EngineeredWood.Vortex
   └── EngineeredWood.DeltaLake
         ↑
         └── EngineeredWood.DeltaLake.Table
@@ -656,30 +660,46 @@ all-null columns where the encoding would degenerate.
 
 ### Predicate API + zone pruning
 
-`EngineeredWood.Vortex.Predicate` is a small standalone hierarchy
-(separate from `EngineeredWood.Expressions` because Vortex's zone-stats
-shape needs typed access at decode time):
+Vortex consumes the shared `EngineeredWood.Expressions` library — the
+same `Predicate` type that drives Parquet row-group pruning, Delta
+file pruning, and Iceberg scan planning. There is no Vortex-specific
+predicate hierarchy.
 
-- Comparisons: `Greater<T>`, `GreaterOrEqual<T>`, `Less<T>`,
-  `LessOrEqual<T>`, `Equal<T>`, `NotEqual<T>` for `T` constrained to
-  numeric structs (i8..i64, u8..u64, f32, f64), plus typed overloads
-  for `string`, `byte[]`, `bool`, `DateTime`, `DateTimeOffset`,
-  `TimeSpan`.
-- Nullability: `IsNull`, `IsNotNull`.
-- Composition: `And(params Predicate[])`, `Or(params Predicate[])`.
+- Build predicates with the shared `EngineeredWood.Expressions.Expressions`
+  factory: `Equal("col", LiteralValue.Of(...))`,
+  `GreaterThanOrEqual(...)`, `IsNull("col")`, `In("col", ...)`,
+  `And(...)`, `Or(...)`, `Not(...)`, etc.
+- The `LiteralValue` struct carries 17 typed kinds (numeric, string,
+  binary, decimal, `DateOnly`, `TimeOnly`, `DateTimeOffset`, GUID,
+  Half) with cross-type numeric promotion in `CompareTo`.
 
-Evaluation lives in `Predicate.EvaluateZonesAsync(reader, totalZones)`,
-which calls `reader.GetZoneStatsAsync(columnIdx)` per referenced
-column, applies conservative per-op pruning rules (drop only when
-stats prove the predicate can't match), and folds the per-predicate
-`HashSet<int>` of accepted zones through `And` (intersect) and `Or`
-(union). For temporal predicates the captured .NET ticks are converted
-to the column's unit at evaluation time so a single `DateTime` value
-prunes uniformly against either Date32 (days) or Date64 (ms).
+The reader-side wiring lives in two places:
 
-`ReadAllAsync(Predicate, ...)` is a thin wrapper that calls
-`EvaluateZonesAsync` then dispatches to `ReadAllAsync(ISet<int>
-acceptedZones, ...)`.
+- **`VortexZoneStatsAccessor : IStatisticsAccessor<VortexZoneCursor>`**
+  reads the typed Arrow zone-stats arrays at the cursor's `ZoneIndex`
+  and produces `LiteralValue` matching the column's Arrow type. Handles
+  Arrow numerics, Bool, String, Binary, Decimal128/256 (via raw
+  little-endian bytes → `BigInteger` →
+  `LiteralValue.HighPrecisionDecimalOf`), and the temporal types
+  Date32/64 (→ `DateOnly`), Time32/64 (→ `TimeOnly`), Timestamp (→
+  `DateTimeOffset`). On netstandard2.0 the date/time kinds fall back
+  to long unit-ticks since `System.DateOnly` / `System.TimeOnly`
+  require .NET 6+.
+- **`VortexFileReader.EvaluatePredicateZonesAsync`** walks the
+  predicate to collect referenced column names, calls
+  `GetZoneStatsAsync` once per referenced column, then iterates each
+  zone with a mutable `VortexZoneCursor` and calls
+  `StatisticsEvaluator.Evaluate(predicate, cursor, accessor)`. Zones
+  whose result is anything other than `FilterResult.AlwaysFalse` are
+  kept (conservative — the row batch may still need a row-level
+  filter). Unresolved column references resolve to a null stats entry
+  → accessor returns null → evaluator returns Unknown → zone kept.
+
+`ReadAllAsync(Predicate, ...)` is a thin wrapper that drives this
+loop and then dispatches to `ReadAllAsync(ISet<int> acceptedZones,
+...)`. The wider features of the shared evaluator (truncated-bound
+handling, three-valued AND/OR/NOT, set predicates, all-null column
+short-circuiting) come for free.
 
 ### Cross-validation
 
@@ -720,6 +740,10 @@ on `net472`; only the two HalfFloat-focused tests are gated behind
 
 ### Dependencies (above Apache.Arrow + Core)
 
+- **`EngineeredWood.Expressions`** — shared predicate / `LiteralValue`
+  / `StatisticsEvaluator`. Vortex doesn't depend on
+  `EngineeredWood.Expressions.Arrow` since zone-stat arrays are read
+  via the Arrow API directly inside `VortexZoneStatsAccessor`.
 - **`Clast.FastLanes`** — bit-packing / FoR / delta / RLE primitives
   (same dependency Lance uses).
 - **`Clast.Fsst`** — FSST symbol-table compression / decompression.
@@ -729,7 +753,7 @@ on `net472`; only the two HalfFloat-focused tests are gated behind
 
 ## Expressions (`EngineeredWood.Expressions`, `EngineeredWood.Expressions.Arrow`)
 
-A format-agnostic expression library used by Parquet, Delta Lake, and Iceberg for predicate pushdown, plus a separate Arrow-based row evaluator. See [`doc/predicate-pushdown-design.md`](doc/predicate-pushdown-design.md) for the full architecture and remaining phases.
+A format-agnostic expression library used by Parquet, Delta Lake, Iceberg, and Vortex for predicate pushdown, plus a separate Arrow-based row evaluator. See [`doc/predicate-pushdown-design.md`](doc/predicate-pushdown-design.md) for the full architecture and remaining phases.
 
 ### Expression tree
 
@@ -751,6 +775,7 @@ A format-agnostic expression library used by Parquet, Delta Lake, and Iceberg fo
 | Iceberg | `DataFileStats` | `IcebergStatisticsAccessor` (column name → field ID translation) |
 | Parquet | `RowGroup` | `ParquetStatisticsAccessor` (raw bytes → `LiteralValue` per physical+logical type) |
 | Delta Lake | `DeltaFileStats` | `DeltaFileStatsAccessor` (handles partition values + JSON stats in one pass) |
+| Vortex | `VortexZoneCursor` | `VortexZoneStatsAccessor` (typed Arrow zone-stat arrays at a per-zone cursor; Date/Time/Timestamp unit conversion) |
 
 The evaluator handles all comparison operators, AND/OR/NOT with short-circuiting, IS NULL via null counts, IN/NOT IN with empty-set folding, operator flipping when literal is on the left, and constant folding when both sides are literals. Truncated statistics (`IsMinExact`/`IsMaxExact`) are conservative: derives `AlwaysFalse` safely but holds back from `AlwaysTrue` on equality.
 

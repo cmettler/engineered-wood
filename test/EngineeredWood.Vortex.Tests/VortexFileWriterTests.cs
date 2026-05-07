@@ -3,7 +3,9 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Expressions;
 using EngineeredWood.Vortex.Writer;
+using Pred = EngineeredWood.Expressions.Expressions;
 
 namespace EngineeredWood.Vortex.Tests;
 
@@ -1314,7 +1316,7 @@ public class VortexFileWriterTests
             }
 
             await using var reader = await VortexFileReader.OpenAsync(path);
-            var pred = Predicate.GreaterOrEqual(0, 250);
+            var pred = Pred.GreaterThanOrEqual("v", LiteralValue.Of(250));
             int batches = 0;
             int totalRows = 0;
             await foreach (var batch in reader.ReadAllAsync(pred))
@@ -1356,7 +1358,7 @@ public class VortexFileWriterTests
             }
 
             await using var reader = await VortexFileReader.OpenAsync(path);
-            var pred = Predicate.Equal(0, 75);
+            var pred = Pred.Equal("v", LiteralValue.Of(75));
             int batches = 0;
             await foreach (var batch in reader.ReadAllAsync(pred)) batches++;
             Assert.Equal(1, batches);
@@ -1399,9 +1401,9 @@ public class VortexFileWriterTests
             }
 
             await using var reader = await VortexFileReader.OpenAsync(path);
-            var pred = Predicate.And(
-                Predicate.GreaterOrEqual(0, 200),
-                Predicate.Less(1, 300));
+            var pred = Pred.And(
+                Pred.GreaterThanOrEqual("a", LiteralValue.Of(200)),
+                Pred.LessThan("b", LiteralValue.Of(300)));
             int batches = 0;
             await foreach (var batch in reader.ReadAllAsync(pred))
             {
@@ -1442,9 +1444,9 @@ public class VortexFileWriterTests
             }
 
             await using var reader = await VortexFileReader.OpenAsync(path);
-            var pred = Predicate.Or(
-                Predicate.Less(0, 100),
-                Predicate.GreaterOrEqual(0, 300));
+            var pred = Pred.Or(
+                Pred.LessThan("v", LiteralValue.Of(100)),
+                Pred.GreaterThanOrEqual("v", LiteralValue.Of(300)));
             int batches = 0;
             await foreach (var batch in reader.ReadAllAsync(pred)) batches++;
             Assert.Equal(2, batches);
@@ -1483,7 +1485,7 @@ public class VortexFileWriterTests
             }
 
             await using var reader = await VortexFileReader.OpenAsync(path);
-            var pred = Predicate.IsNull(0);
+            var pred = Pred.IsNull("v");
             int batches = 0;
             await foreach (var batch in reader.ReadAllAsync(pred)) batches++;
             Assert.Equal(1, batches); // only zone 1
@@ -1516,7 +1518,7 @@ public class VortexFileWriterTests
             await using var reader = await VortexFileReader.OpenAsync(path);
             // Predicate would prune everything if stats were available, but
             // with no stats we keep the chunk and let the caller filter.
-            var pred = Predicate.GreaterOrEqual(0, 1_000_000);
+            var pred = Pred.GreaterThanOrEqual("v", LiteralValue.Of(1_000_000));
             int batches = 0;
             await foreach (var b2 in reader.ReadAllAsync(pred)) batches++;
             Assert.Equal(1, batches);
@@ -1543,43 +1545,50 @@ public class VortexFileWriterTests
         await using var reader = await VortexFileReader.OpenAsync(path);
 
         // Out-of-range high: drop the only zone.
-        var dropHigh = Predicate.Greater(0, new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var dropHigh = Pred.GreaterThan("ts",
+            LiteralValue.Of(new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero)));
         int kept = 0;
         await foreach (var b in reader.ReadAllAsync(dropHigh)) kept++;
         Assert.Equal(0, kept);
 
         // Out-of-range low: drop the only zone.
-        var dropLow = Predicate.Less(0, new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var dropLow = Pred.LessThan("ts",
+            LiteralValue.Of(new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero)));
         kept = 0;
         await foreach (var b in reader.ReadAllAsync(dropLow)) kept++;
         Assert.Equal(0, kept);
 
         // In-range: keep the zone (max > 2024-06-01).
-        var keep = Predicate.Greater(0, new DateTimeOffset(2024, 6, 1, 0, 0, 0, TimeSpan.Zero));
+        var keep = Pred.GreaterThan("ts",
+            LiteralValue.Of(new DateTimeOffset(2024, 6, 1, 0, 0, 0, TimeSpan.Zero)));
         kept = 0;
         await foreach (var b in reader.ReadAllAsync(keep)) kept++;
         Assert.Equal(1, kept);
     }
 
+#if NET6_0_OR_GREATER
     [Fact]
     public async Task Predicate_Date32_PrunesByRange()
     {
         // date_days_2048rows.vortex: zone 0 covers days [19723 (2024-01-01) .. 21547 (2028-12-30)].
+        // Date32 stats decode to LiteralValue.Of(DateOnly), so callers build
+        // predicates with DateOnly literals; this test is gated to net6+
+        // because System.DateOnly itself is net6+.
         var path = TestData.TestDataPath.Resolve("date_days_2048rows.vortex");
         if (!File.Exists(path)) return;
         await using var reader = await VortexFileReader.OpenAsync(path);
 
-        var dropLow = Predicate.Less(0, new DateTime(2020, 1, 1));
+        var dropLow = Pred.LessThan("d", LiteralValue.Of(new DateOnly(2020, 1, 1)));
         int kept = 0;
         await foreach (var b in reader.ReadAllAsync(dropLow)) kept++;
         Assert.Equal(0, kept);
 
-        var dropHigh = Predicate.Greater(0, new DateTime(2030, 1, 1));
+        var dropHigh = Pred.GreaterThan("d", LiteralValue.Of(new DateOnly(2030, 1, 1)));
         kept = 0;
         await foreach (var b in reader.ReadAllAsync(dropHigh)) kept++;
         Assert.Equal(0, kept);
 
-        var keep = Predicate.Greater(0, new DateTime(2024, 1, 1));
+        var keep = Pred.GreaterThan("d", LiteralValue.Of(new DateOnly(2024, 1, 1)));
         kept = 0;
         await foreach (var b in reader.ReadAllAsync(keep)) kept++;
         Assert.Equal(1, kept);
@@ -1589,25 +1598,30 @@ public class VortexFileWriterTests
     public async Task Predicate_Time64Microsecond_PrunesByRange()
     {
         // time_us_2048rows.vortex: zone 0 covers ~[1m15s .. 23h59m16s] microseconds-of-day.
+        // Time64 stats decode to LiteralValue.Of(TimeOnly); gated to net6+
+        // because System.TimeOnly is net6+.
         var path = TestData.TestDataPath.Resolve("time_us_2048rows.vortex");
         if (!File.Exists(path)) return;
         await using var reader = await VortexFileReader.OpenAsync(path);
 
-        var dropHigh = Predicate.Greater(0, TimeSpan.FromHours(48));
+        // TimeOnly's range is [00:00:00, 24:00:00); to prune the upper end of
+        // the zone we use the maximum legal TimeOnly (just before 24:00).
+        var dropHigh = Pred.GreaterThan("t", LiteralValue.Of(TimeOnly.MaxValue));
         int kept = 0;
         await foreach (var b in reader.ReadAllAsync(dropHigh)) kept++;
         Assert.Equal(0, kept);
 
-        var dropLow = Predicate.Less(0, TimeSpan.Zero);
+        var dropLow = Pred.LessThan("t", LiteralValue.Of(TimeOnly.MinValue));
         kept = 0;
         await foreach (var b in reader.ReadAllAsync(dropLow)) kept++;
         Assert.Equal(0, kept);
 
-        var keep = Predicate.Greater(0, TimeSpan.FromHours(1));
+        var keep = Pred.GreaterThan("t", LiteralValue.Of(new TimeOnly(1, 0)));
         kept = 0;
         await foreach (var b in reader.ReadAllAsync(keep)) kept++;
         Assert.Equal(1, kept);
     }
+#endif
 
     [Fact]
     public async Task Predicate_Bool_DropsAllSameValueZone()
@@ -1641,19 +1655,19 @@ public class VortexFileWriterTests
                 || stats?.Max is not Apache.Arrow.BooleanArray) return;
 
             int kept = 0;
-            await foreach (var b in reader.ReadAllAsync(Predicate.Equal(0, true))) kept++;
+            await foreach (var b in reader.ReadAllAsync(Pred.Equal("b", LiteralValue.Of(true)))) kept++;
             Assert.Equal(1, kept);
 
             kept = 0;
-            await foreach (var b in reader.ReadAllAsync(Predicate.Equal(0, false))) kept++;
+            await foreach (var b in reader.ReadAllAsync(Pred.Equal("b", LiteralValue.Of(false)))) kept++;
             Assert.Equal(1, kept);
 
             kept = 0;
-            await foreach (var b in reader.ReadAllAsync(Predicate.NotEqual(0, true))) kept++;
+            await foreach (var b in reader.ReadAllAsync(Pred.NotEqual("b", LiteralValue.Of(true)))) kept++;
             Assert.Equal(1, kept);
 
             kept = 0;
-            await foreach (var b in reader.ReadAllAsync(Predicate.NotEqual(0, false))) kept++;
+            await foreach (var b in reader.ReadAllAsync(Pred.NotEqual("b", LiteralValue.Of(false)))) kept++;
             Assert.Equal(1, kept);
         }
         finally
@@ -1797,7 +1811,7 @@ public class VortexFileWriterTests
         try
         {
             await using var reader = await VortexFileReader.OpenAsync(path);
-            var pred = Predicate.GreaterOrEqual(0, 75);
+            var pred = Pred.GreaterThanOrEqual("v", LiteralValue.Of(75));
             var batches = new List<RecordBatch>();
             await foreach (var b in reader.ReadAllAsync(
                 rowOffset: 25, rowCount: 100, columnIndices: null, predicate: pred))
@@ -6833,7 +6847,7 @@ public class VortexFileWriterTests
         var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
-        await foreach (var b in r.ReadAllAsync(Predicate.Equal(0, "delta"))) batches.Add(b);
+        await foreach (var b in r.ReadAllAsync(Pred.Equal("color", LiteralValue.Of("delta")))) batches.Add(b);
         try
         {
             Assert.Single(batches);
@@ -6851,7 +6865,7 @@ public class VortexFileWriterTests
         var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
-        await foreach (var b in r.ReadAllAsync(Predicate.Equal(0, "zebra"))) batches.Add(b);
+        await foreach (var b in r.ReadAllAsync(Pred.Equal("color", LiteralValue.Of("zebra")))) batches.Add(b);
         try
         {
             Assert.Empty(batches);
@@ -6869,7 +6883,7 @@ public class VortexFileWriterTests
         var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
-        await foreach (var b in r.ReadAllAsync(Predicate.Greater(0, "foxtrot"))) batches.Add(b);
+        await foreach (var b in r.ReadAllAsync(Pred.GreaterThan("color", LiteralValue.Of("foxtrot")))) batches.Add(b);
         try
         {
             Assert.Empty(batches);
@@ -6887,7 +6901,7 @@ public class VortexFileWriterTests
         var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
-        await foreach (var b in r.ReadAllAsync(Predicate.Less(0, "alpha"))) batches.Add(b);
+        await foreach (var b in r.ReadAllAsync(Pred.LessThan("color", LiteralValue.Of("alpha")))) batches.Add(b);
         try
         {
             Assert.Empty(batches);
@@ -6905,7 +6919,7 @@ public class VortexFileWriterTests
         var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
-        await foreach (var b in r.ReadAllAsync(Predicate.GreaterOrEqual(0, "alpha"))) batches.Add(b);
+        await foreach (var b in r.ReadAllAsync(Pred.GreaterThanOrEqual("color", LiteralValue.Of("alpha")))) batches.Add(b);
         try
         {
             Assert.Single(batches);
@@ -6962,7 +6976,7 @@ public class VortexFileWriterTests
             Assert.Equal(3, stats.ZoneCount);
 
             var batches = new List<RecordBatch>();
-            await foreach (var b in reader.ReadAllAsync(Predicate.Equal(0, "bx-a050"))) batches.Add(b);
+            await foreach (var b in reader.ReadAllAsync(Pred.Equal("v", LiteralValue.Of("bx-a050")))) batches.Add(b);
             try
             {
                 var batch = Assert.Single(batches);
@@ -7028,7 +7042,7 @@ public class VortexFileWriterTests
             // Predicate Equal([0x20, 0x10]) — only zone 1 (leading byte 0x20).
             var batches = new List<RecordBatch>();
             var pat = new byte[] { 0x20, 0x10 };
-            await foreach (var b in reader.ReadAllAsync(Predicate.Equal(0, pat))) batches.Add(b);
+            await foreach (var b in reader.ReadAllAsync(Pred.Equal("v", LiteralValue.Of(pat)))) batches.Add(b);
             try
             {
                 var batch = Assert.Single(batches);
@@ -7372,7 +7386,7 @@ public class VortexFileWriterTests
 
             // Predicate drops 2 of 3 zones.
             var batches = new List<RecordBatch>();
-            await foreach (var b in reader.ReadAllAsync(Predicate.Equal(0, "bx-050")))
+            await foreach (var b in reader.ReadAllAsync(Pred.Equal("v", LiteralValue.Of("bx-050"))))
                 batches.Add(b);
             try
             {
@@ -7668,7 +7682,7 @@ public class VortexFileWriterTests
             // Project "value" only (col index 1); predicate matches zone 1.
             var batches = new List<RecordBatch>();
             await foreach (var b in reader.ReadAllAsync(
-                new[] { 1 }, Predicate.Equal(0, "zone1-row025")))
+                new[] { 1 }, Pred.Equal("key", LiteralValue.Of("zone1-row025"))))
                 batches.Add(b);
             try
             {
@@ -7749,7 +7763,7 @@ public class VortexFileWriterTests
         await using var r = await VortexFileReader.OpenAsync(path);
         var midValue = new byte[] { 0x10, 0x20, 0, 0, 0, 0, 0, 0 };
         var batches = new List<RecordBatch>();
-        await foreach (var b in r.ReadAllAsync(Predicate.Equal(0, midValue))) batches.Add(b);
+        await foreach (var b in r.ReadAllAsync(Pred.Equal("b", LiteralValue.Of(midValue)))) batches.Add(b);
         try
         {
             Assert.Single(batches);
@@ -7769,7 +7783,7 @@ public class VortexFileWriterTests
         await using var r = await VortexFileReader.OpenAsync(path);
         var pastMax = new byte[] { 0x11, 0, 0, 0, 0, 0, 0, 0 };
         var batches = new List<RecordBatch>();
-        await foreach (var b in r.ReadAllAsync(Predicate.Greater(0, pastMax))) batches.Add(b);
+        await foreach (var b in r.ReadAllAsync(Pred.GreaterThan("b", LiteralValue.Of(pastMax)))) batches.Add(b);
         try
         {
             Assert.Empty(batches);
@@ -7789,7 +7803,7 @@ public class VortexFileWriterTests
         await using var r = await VortexFileReader.OpenAsync(path);
         var beforeMin = new byte[] { 0x0F, 0xFF, 0, 0, 0, 0, 0, 0 };
         var batches = new List<RecordBatch>();
-        await foreach (var b in r.ReadAllAsync(Predicate.Less(0, beforeMin))) batches.Add(b);
+        await foreach (var b in r.ReadAllAsync(Pred.LessThan("b", LiteralValue.Of(beforeMin)))) batches.Add(b);
         try
         {
             Assert.Empty(batches);
@@ -7808,7 +7822,7 @@ public class VortexFileWriterTests
         await using var r = await VortexFileReader.OpenAsync(path);
         var unreachable = new byte[] { 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99 };
         var batches = new List<RecordBatch>();
-        await foreach (var b in r.ReadAllAsync(Predicate.Equal(0, unreachable))) batches.Add(b);
+        await foreach (var b in r.ReadAllAsync(Pred.Equal("b", LiteralValue.Of(unreachable)))) batches.Add(b);
         try
         {
             Assert.Empty(batches);
@@ -7827,7 +7841,7 @@ public class VortexFileWriterTests
         var path = TestData.TestDataPath.Resolve("dict_string_64rows.vortex");
         await using var r = await VortexFileReader.OpenAsync(path);
         var batches = new List<RecordBatch>();
-        await foreach (var b in r.ReadAllAsync(Predicate.NotEqual(0, "delta"))) batches.Add(b);
+        await foreach (var b in r.ReadAllAsync(Pred.NotEqual("color", LiteralValue.Of("delta")))) batches.Add(b);
         try
         {
             Assert.Single(batches);
