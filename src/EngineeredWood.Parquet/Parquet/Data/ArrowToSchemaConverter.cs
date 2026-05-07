@@ -258,9 +258,34 @@ internal static class ArrowToSchemaConverter
             FixedSizeBinaryType fsb => (PhysicalType.FixedLenByteArray, fsb.ByteWidth,
                 null, null, null, null),
 
+            // ExtensionType: encode using the storage type's physical layout,
+            // and emit the matching logical-type annotation when we recognise
+            // the extension by name. arrow.uuid -> UuidType + FLBA(16). Any
+            // other extension over a supported storage type round-trips as the
+            // raw storage (no annotation), which still preserves the data.
+            ExtensionType ext => MapExtensionType(ext),
+
             _ => throw new NotSupportedException(
                 $"Arrow type '{arrowType.Name}' is not supported for Parquet writing."),
         };
+    }
+
+    private static (
+        PhysicalType PhysicalType,
+        int? TypeLength,
+        LogicalType? LogicalType,
+        ConvertedType? ConvertedType,
+        int? Scale,
+        int? Precision)
+        MapExtensionType(ExtensionType ext)
+    {
+        var (phys, len, _, conv, scale, prec) = MapArrowType(ext.StorageType);
+        LogicalType? logical = ext.Name switch
+        {
+            "arrow.uuid" => new LogicalType.UuidType(),
+            _ => null,
+        };
+        return (phys, len, logical, conv, scale, prec);
     }
 
     private static Metadata.TimeUnit MapTimeUnit(Apache.Arrow.Types.TimeUnit unit) => unit switch

@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using Apache.Arrow;
 using EngineeredWood.Expressions;
 
 namespace EngineeredWood.Parquet;
@@ -90,6 +91,18 @@ public sealed class ParquetReadOptions
     /// <see cref="ParquetFormatException"/>. Default is <see langword="false"/>.
     /// </summary>
     public bool PageChecksumValidation { get; init; }
+
+    /// <summary>
+    /// Optional registry of Arrow extension types. When supplied, columns whose
+    /// Parquet logical type matches a registered extension are materialised as
+    /// the corresponding <see cref="Apache.Arrow.ExtensionArray"/> rather than
+    /// the default storage type. For example, registering
+    /// <c>GuidExtensionDefinition</c> causes <c>UUID</c>-annotated columns to
+    /// produce <see cref="GuidArray"/> instead of <see cref="Apache.Arrow.FixedSizeBinaryArray"/>.
+    /// When <see langword="null"/> (the default), the reader produces the
+    /// underlying storage types and ignores extension annotations.
+    /// </summary>
+    public ExtensionTypeRegistry? ExtensionRegistry { get; init; }
 
     /// <summary>
     /// Shorthand for <c>ByteArrayOutput == ByteArrayOutputKind.ViewType</c>.

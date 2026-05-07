@@ -4,6 +4,7 @@
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
+using Apache.Arrow.Types;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet.Data;
 using EngineeredWood.Parquet.Metadata;
@@ -330,6 +331,14 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             var field = _arrowSchema!.FieldsList[c];
             var element = FindLeafElement(_parquetSchema!, field.Name);
 
+            // Encoders dispatch on the storage type, not the ExtensionType
+            // wrapper (which they don't recognise). Strip the extension here;
+            // ArrowToSchemaConverter has already emitted the correct annotation
+            // on the schema side.
+            IArrowType encodingType = field.DataType is ExtensionType ext
+                ? ext.StorageType
+                : field.DataType;
+
             leafColumns.Add(new BufferedColumnState
             {
                 PathInSchema = [field.Name],
@@ -337,7 +346,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 TypeLength = element.TypeLength ?? 0,
                 MaxDefLevel = field.IsNullable ? 1 : 0,
                 MaxRepLevel = 0,
-                ArrowType = field.DataType,
+                ArrowType = encodingType,
                 IsNullable = field.IsNullable,
             });
         }
@@ -355,6 +364,10 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         {
             var state = _columnStates[c];
             var array = batch.Column(c);
+            // Mirror InitializeColumnStates: hand the encoder the storage
+            // array so it dispatches on the Arrow storage type.
+            if (array is ExtensionArray ea)
+                array = ea.Storage;
             state.AppendArray(array, rowCount);
         });
 

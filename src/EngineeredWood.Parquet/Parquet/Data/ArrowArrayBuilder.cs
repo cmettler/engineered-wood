@@ -62,6 +62,11 @@ internal static class ArrowArrayBuilder
             LargeBinaryType => BuildDenseLargeVarBinaryArray(state, arrowType, numValues),
             Decimal32Type or Decimal64Type or Decimal128Type or Decimal256Type
                 => BuildDecimalArray(state, arrowType, numValues, dense: true),
+            // Any ExtensionType whose storage is FixedSizeBinary (e.g. GuidType
+            // wrapping FixedSizeBinaryType(16)): build the storage array with the
+            // existing FLBA path, then wrap it via the extension's CreateArray.
+            ExtensionType ext when ext.StorageType is FixedSizeBinaryType fsbStorage
+                => ext.CreateArray(BuildDenseFixedSizeBinaryArray(state, numValues, fsbStorage)),
             FixedSizeBinaryType fsb => BuildDenseFixedSizeBinaryArray(state, numValues, fsb),
             NullType => BuildNullArray(numValues),
             _ => throw new NotSupportedException(
@@ -309,6 +314,8 @@ internal static class ArrowArrayBuilder
             LargeBinaryType => BuildLargeBinaryArray(state, rowCount),
             Decimal32Type or Decimal64Type or Decimal128Type or Decimal256Type
                 => BuildDecimalArray(state, arrowType, rowCount, dense: false),
+            ExtensionType ext when ext.StorageType is FixedSizeBinaryType fsbStorage
+                => ext.CreateArray(BuildFixedSizeBinaryArray(state, rowCount, fsbStorage)),
             FixedSizeBinaryType fsb => BuildFixedSizeBinaryArray(state, rowCount, fsb),
             NullType => BuildNullArray(rowCount),
             _ => throw new NotSupportedException(
@@ -1659,6 +1666,12 @@ internal static class ArrowArrayFactory
             Decimal128Type => new Decimal128Array(data),
             Decimal256Type => new Decimal256Array(data),
             FixedSizeBinaryType => new FixedSizeBinaryArray(data),
+            // ExtensionType: rebuild the storage array with the inner storage
+            // type, then wrap via CreateArray. This covers GuidType today and
+            // any future extension whose storage type we already know how to
+            // build.
+            ExtensionType ext => ext.CreateArray(
+                BuildArray(new ArrayData(ext.StorageType, data.Length, data.NullCount, data.Offset, data.Buffers, data.Children, data.Dictionary))),
             _ => throw new NotSupportedException($"Cannot construct Arrow array for type '{data.DataType.Name}'."),
         };
 }

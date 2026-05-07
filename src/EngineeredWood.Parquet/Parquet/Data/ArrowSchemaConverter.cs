@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Parquet.Metadata;
 using EngineeredWood.Parquet.Schema;
@@ -18,7 +19,7 @@ internal static class ArrowSchemaConverter
     public static Apache.Arrow.Field ToArrowField(ColumnDescriptor column, ParquetReadOptions? options = null)
     {
         bool nullable = column.MaxDefinitionLevel > 0;
-        var arrowType = ToArrowType(column);
+        var arrowType = ToArrowType(column, options);
         arrowType = ApplyOutputKind(arrowType, options?.ByteArrayOutput ?? ByteArrayOutputKind.Default);
         return new Apache.Arrow.Field(column.DottedPath, arrowType, nullable);
     }
@@ -169,7 +170,7 @@ internal static class ArrowSchemaConverter
         {
             // Build a temporary descriptor to reuse existing logic
             var desc = BuildTempDescriptor(node);
-            var result = FromLogicalType(element.LogicalType, desc);
+            var result = FromLogicalType(element.LogicalType, desc, options);
             if (result != null)
                 return ApplyOutputKind(result, kind);
         }
@@ -201,14 +202,14 @@ internal static class ArrowSchemaConverter
     /// Converts a Parquet column's type information to an Arrow <see cref="IArrowType"/>.
     /// Falls through: LogicalType → ConvertedType → PhysicalType.
     /// </summary>
-    public static IArrowType ToArrowType(ColumnDescriptor column)
+    public static IArrowType ToArrowType(ColumnDescriptor column, ParquetReadOptions? options = null)
     {
         var element = column.SchemaElement;
 
         // First: check LogicalType
         if (element.LogicalType != null)
         {
-            var arrowType = FromLogicalType(element.LogicalType, column);
+            var arrowType = FromLogicalType(element.LogicalType, column, options);
             if (arrowType != null)
                 return arrowType;
         }
@@ -225,7 +226,7 @@ internal static class ArrowSchemaConverter
         return FromPhysicalType(column);
     }
 
-    private static IArrowType? FromLogicalType(LogicalType logicalType, ColumnDescriptor column)
+    private static IArrowType? FromLogicalType(LogicalType logicalType, ColumnDescriptor column, ParquetReadOptions? options = null)
     {
         return logicalType switch
         {
@@ -260,7 +261,7 @@ internal static class ArrowSchemaConverter
                 }),
             LogicalType.EnumType => Apache.Arrow.Types.StringType.Default,
             LogicalType.JsonType => Apache.Arrow.Types.StringType.Default,
-            LogicalType.UuidType => new FixedSizeBinaryType(16),
+            LogicalType.UuidType => MakeUuidArrowType(options),
             LogicalType.Float16Type => HalfFloatType.Default,
             LogicalType.DecimalType dt => MakeDecimalType(dt.Precision, dt.Scale, column.PhysicalType),
             LogicalType.UnknownLogicalType { ThriftFieldId: 11 } => NullType.Default,
@@ -310,6 +311,26 @@ internal static class ArrowSchemaConverter
                 _ => new Decimal256Type(precision, scale),
             },
         };
+    }
+
+    /// <summary>
+    /// Decodes a Parquet UUID logical type to an Arrow type. When the caller
+    /// has registered an <c>arrow.uuid</c> extension via
+    /// <see cref="ParquetReadOptions.ExtensionRegistry"/>, returns the
+    /// extension type (typically <see cref="GuidType"/>); otherwise returns
+    /// the raw <see cref="FixedSizeBinaryType"/> storage type so existing
+    /// callers see the historical behaviour.
+    /// </summary>
+    private static IArrowType MakeUuidArrowType(ParquetReadOptions? options)
+    {
+        var storage = new FixedSizeBinaryType(16);
+        if (options?.ExtensionRegistry is { } registry
+            && registry.TryGetDefinition("arrow.uuid", out var definition)
+            && definition.TryCreateType(storage, metadata: string.Empty, out var extType))
+        {
+            return extType;
+        }
+        return storage;
     }
 
     private static IArrowType FromPhysicalType(ColumnDescriptor column)
