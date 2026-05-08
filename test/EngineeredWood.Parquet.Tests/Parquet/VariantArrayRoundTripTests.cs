@@ -171,6 +171,78 @@ public class VariantArrayRoundTripTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Walks every <c>.parquet</c> file in
+    /// <c>parquet-testing/shredded_variant/</c> with the registry registered.
+    /// Each VARIANT-annotated column should materialise as a
+    /// <see cref="VariantArray"/>; the test fails if any file errors out or
+    /// produces a column we recognise as VARIANT but didn't wrap.
+    /// </summary>
+    [Fact]
+    public async Task SweepTest_ShreddedVariantCorpus_AllReadAsVariantArray()
+    {
+        string? shreddedRoot = FindShreddedVariantDirectory();
+        if (shreddedRoot is null) return; // submodule not initialized in this checkout
+
+        var files = Directory.GetFiles(shreddedRoot, "*.parquet");
+        Assert.NotEmpty(files);
+
+        var registry = VariantRegistry();
+        var failures = new List<string>();
+        int variantColumns = 0;
+        int shreddedColumns = 0;
+
+        foreach (var filePath in files)
+        {
+            string name = Path.GetFileName(filePath);
+            try
+            {
+                await using var file = new LocalRandomAccessFile(filePath);
+                await using var reader = new ParquetFileReader(file, ownsFile: false,
+                    new ParquetReadOptions { ExtensionRegistry = registry });
+
+                var meta = await reader.ReadMetadataAsync();
+                if (meta.RowGroups.Count == 0) continue;
+
+                var batch = await reader.ReadRowGroupAsync(0);
+                for (int i = 0; i < batch.ColumnCount; i++)
+                {
+                    bool annotated = batch.Schema.FieldsList[i].DataType is VariantType;
+                    bool wrapped = batch.Column(i) is VariantArray;
+                    if (annotated != wrapped)
+                    {
+                        failures.Add($"{name} col[{i}]: annotated={annotated} wrapped={wrapped}");
+                    }
+                    if (wrapped)
+                    {
+                        variantColumns++;
+                        if (((VariantArray)batch.Column(i)).IsShredded) shreddedColumns++;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"{name}: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        Assert.Empty(failures);
+        Assert.True(variantColumns > 0, "Expected at least one VariantArray column across the corpus.");
+        Assert.True(shreddedColumns > 0, "Expected at least one shredded VariantArray (typed_value present).");
+    }
+
+    private static string? FindShreddedVariantDirectory()
+    {
+        var dir = AppContext.BaseDirectory;
+        while (dir is not null)
+        {
+            var candidate = Path.Combine(dir, "parquet-testing", "shredded_variant");
+            if (Directory.Exists(candidate)) return candidate;
+            dir = Path.GetDirectoryName(dir);
+        }
+        return null;
+    }
+
     [Fact]
     public async Task ToggleRegistry_SameFile_GivesDifferentArrayTypes()
     {
