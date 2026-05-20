@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Collections;
+using Clast.BloomFilter;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.BloomFilter;

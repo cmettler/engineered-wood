@@ -4,6 +4,7 @@
 using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using Clast.BloomFilter;
 
 namespace EngineeredWood.Parquet.BloomFilter;
 

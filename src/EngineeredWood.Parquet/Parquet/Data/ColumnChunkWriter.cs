@@ -4,6 +4,7 @@
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
+using Clast.BloomFilter;
 using EngineeredWood.Compression;
 using EngineeredWood.Parquet.BloomFilter;
 using EngineeredWood.Parquet.Metadata;

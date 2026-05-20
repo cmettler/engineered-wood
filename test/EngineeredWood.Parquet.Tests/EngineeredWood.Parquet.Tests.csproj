@@ -11,6 +11,7 @@
   <ItemGroup>
     <PackageReference Include="Apache.Arrow" Version="23.0.0" />
     <PackageReference Include="Azure.Storage.Blobs" Version="12.*" />
+    <PackageReference Include="Clast.BloomFilter" Version="0.1.0" />
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="ParquetSharp" Version="23.0.0.2" />
