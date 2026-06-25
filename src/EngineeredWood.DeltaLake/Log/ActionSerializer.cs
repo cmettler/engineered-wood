@@ -214,8 +214,9 @@ internal static class ActionSerializer
                     case "stats": stats = r.GetString(); break;
                     case "tags": tags = ReadStringDict(ref r); break;
                     case "deletionVector": deletionVector = JsonSerializer.Deserialize(ref r, s_deletionVectorInfo); break;
-                    case "baseRowId": baseRowId = r.GetInt64(); break;
-                    case "defaultRowCommitVersion": defaultRowCommitVersion = r.GetInt64(); break;
+                    // delta-rs writes optional fields as explicit JSON null (our own writer omits them), so guard.
+                    case "baseRowId": baseRowId = r.TokenType == JsonTokenType.Null ? null : r.GetInt64(); break;
+                    case "defaultRowCommitVersion": defaultRowCommitVersion = r.TokenType == JsonTokenType.Null ? null : r.GetInt64(); break;
                     case "clusteringProvider": clusteringProvider = r.GetString(); break;
                     default: r.Skip(); break;
                 }
@@ -256,15 +257,16 @@ internal static class ActionSerializer
                 switch (prop)
                 {
                     case "path": path = r.GetString(); break;
-                    case "deletionTimestamp": deletionTimestamp = r.GetInt64(); break;
+                    case "deletionTimestamp": deletionTimestamp = r.TokenType == JsonTokenType.Null ? null : r.GetInt64(); break;
                     case "dataChange": dataChange = r.GetBoolean(); break;
-                    case "extendedFileMetadata": extendedFileMetadata = r.GetBoolean(); break;
+                    case "extendedFileMetadata": extendedFileMetadata = r.TokenType == JsonTokenType.Null ? null : r.GetBoolean(); break;
                     case "partitionValues": partitionValues = ReadStringDict(ref r); break;
-                    case "size": size = r.GetInt64(); break;
+                    case "size": size = r.TokenType == JsonTokenType.Null ? null : r.GetInt64(); break;
                     case "tags": tags = ReadStringDict(ref r); break;
                     case "deletionVector": deletionVector = JsonSerializer.Deserialize(ref r, s_deletionVectorInfo); break;
-                    case "baseRowId": baseRowId = r.GetInt64(); break;
-                    case "defaultRowCommitVersion": defaultRowCommitVersion = r.GetInt64(); break;
+                    // delta-rs writes optional fields as explicit JSON null (our own writer omits them), so guard.
+                    case "baseRowId": baseRowId = r.TokenType == JsonTokenType.Null ? null : r.GetInt64(); break;
+                    case "defaultRowCommitVersion": defaultRowCommitVersion = r.TokenType == JsonTokenType.Null ? null : r.GetInt64(); break;
                     default: r.Skip(); break;
                 }
             });
