@@ -45,9 +45,10 @@ public static class InCommitTimestamp
     /// Creates a <see cref="CommitInfo"/> action with the specified timestamp.
     /// </summary>
     public static CommitInfo CreateCommitInfo(
-        long inCommitTimestamp,
+        long timestampMs,
         string operation = "WRITE",
-        IDictionary<string, JsonElement>? additionalValues = null)
+        IDictionary<string, JsonElement>? additionalValues = null,
+        bool includeInCommitTimestamp = true)
     {
         var values = new Dictionary<string, JsonElement>();
 
@@ -57,12 +58,19 @@ public static class InCommitTimestamp
                 values[kvp.Key] = kvp.Value;
         }
 
+        // `timestamp` + `operation` are standard, feature-free commitInfo fields (every Spark/delta-rs commit
+        // writes them) — safe on a plain (writer-v2) table. The `inCommitTimestamp` field is the opt-in
+        // monotonic timestamp and is written ONLY when the inCommitTimestamps feature is declared (writing it
+        // without the feature would imply a feature the protocol doesn't list).
         values["timestamp"] = JsonDocument.Parse(
-            inCommitTimestamp.ToString()).RootElement.Clone();
+            timestampMs.ToString()).RootElement.Clone();
         values["operation"] = JsonDocument.Parse(
             $"\"{operation}\"").RootElement.Clone();
-        values["inCommitTimestamp"] = JsonDocument.Parse(
-            inCommitTimestamp.ToString()).RootElement.Clone();
+        if (includeInCommitTimestamp)
+        {
+            values["inCommitTimestamp"] = JsonDocument.Parse(
+                timestampMs.ToString()).RootElement.Clone();
+        }
 
         return new CommitInfo { Values = values };
     }
@@ -73,8 +81,14 @@ public static class InCommitTimestamp
     /// </summary>
     public static long? GetTimestamp(CommitInfo commitInfo)
     {
+        // Prefer the in-protocol monotonic inCommitTimestamp (when the feature is enabled); otherwise
+        // fall back to commitInfo's standard informational `timestamp` (always written by EnsureCommitInfo),
+        // so CDF's _commit_timestamp is populated even without the inCommitTimestamps feature.
         var ts = commitInfo.GetValue("inCommitTimestamp");
-        return ts?.ValueKind == JsonValueKind.Number ? ts.Value.GetInt64() : null;
+        if (ts?.ValueKind == JsonValueKind.Number)
+            return ts.Value.GetInt64();
+        var legacy = commitInfo.GetValue("timestamp");
+        return legacy?.ValueKind == JsonValueKind.Number ? legacy.Value.GetInt64() : null;
     }
 
     /// <summary>
@@ -97,24 +111,27 @@ public static class InCommitTimestamp
     }
 
     /// <summary>
-    /// Prepends a <see cref="CommitInfo"/> with <c>inCommitTimestamp</c> to an action list
-    /// if the table has in-commit timestamps enabled and the list doesn't already have one.
+    /// Prepends a <see cref="CommitInfo"/> (the first action) to a commit, recording <c>operation</c> and a
+    /// <c>timestamp</c> — standard, feature-free fields written on EVERY commit so the table has a usable
+    /// history (the snapshots/versions view) even on a plain writer-v2 table. The opt-in <c>inCommitTimestamp</c>
+    /// field is added only when the table has in-commit timestamps enabled. No-op if a commitInfo is already present.
     /// </summary>
     public static IReadOnlyList<DeltaAction> EnsureCommitInfo(
         IReadOnlyList<DeltaAction> actions,
         IReadOnlyDictionary<string, string>? configuration,
         string operation = "WRITE")
     {
-        if (!IsEnabled(configuration))
-            return actions;
+        // Already has a commitInfo (any kind) — leave it.
+        foreach (var action in actions)
+        {
+            if (action is CommitInfo)
+                return actions;
+        }
 
-        // Check if there's already a CommitInfo with inCommitTimestamp
-        if (GetTimestampFromActions(actions).HasValue)
-            return actions;
-
-        // Prepend CommitInfo as the first action
         var result = new List<DeltaAction>(actions.Count + 1);
-        result.Add(CreateCommitInfo(operation));
+        result.Add(CreateCommitInfo(
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), operation,
+            additionalValues: null, includeInCommitTimestamp: IsEnabled(configuration)));
         result.AddRange(actions);
         return result;
     }

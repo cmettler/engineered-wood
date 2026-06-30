@@ -17,6 +17,9 @@ internal static class ActionSerializer
 {
     private static readonly JsonSerializerOptions s_options = CreateOptions();
 
+    // Shared empty map for the non-nullable metaData.configuration / format.options fields strict readers require.
+    private static readonly Dictionary<string, string> EmptyStringDict = new();
+
     // The action wrapper format is handled entirely by this converter; we invoke it
     // directly (rather than via the reflection-based JsonSerializer entry points) so the
     // top-level DeltaAction round-trip stays trim/AOT safe without registering the
@@ -589,8 +592,10 @@ internal static class ActionSerializer
             writer.WritePropertyName("format");
             writer.WriteStartObject();
             writer.WriteString("provider", metadata.Format.Provider);
-            if (metadata.Format.Options.Count > 0)
-                WriteStringDict(writer, "options", metadata.Format.Options);
+            // `options` is REQUIRED by the Delta spec and by strict readers (delta-kernel-rs / Microsoft Fabric)
+            // — its Arrow schema marks the field non-nullable, so omitting it breaks them. Always emit it
+            // (an empty map serializes as "options":{}).
+            WriteStringDict(writer, "options", metadata.Format.Options);
             writer.WriteEndObject();
 
             writer.WriteString("schemaString", metadata.SchemaString);
@@ -601,8 +606,10 @@ internal static class ActionSerializer
                 writer.WriteStringValue(col);
             writer.WriteEndArray();
 
-            if (metadata.Configuration is not null)
-                WriteStringDict(writer, "configuration", metadata.Configuration);
+            // `configuration` is also a non-nullable map for strict readers (delta-kernel-rs / Fabric) — always
+            // emit it (empty => "configuration":{}), like `format.options` above.
+            WriteStringDict(writer, "configuration",
+                metadata.Configuration ?? (IReadOnlyDictionary<string, string>)EmptyStringDict);
             if (metadata.CreatedTime.HasValue) writer.WriteNumber("createdTime", metadata.CreatedTime.Value);
             writer.WriteEndObject();
         }

@@ -56,11 +56,11 @@ internal static class RoaringBitmap
     /// bits come from the container key; in the typical 32-bit-bitmap
     /// case the values fit in a uint).
     /// </summary>
-    public static void DeserializePortable(
+    public static int DeserializePortable(
         ReadOnlySpan<byte> data, Action<long> emit,
         RoaringFormat format = RoaringFormat.SpecCompliant)
     {
-        if (data.Length < 4) return;
+        if (data.Length < 4) return 0;
 
         int pos = 0;
         uint cookie = BinaryPrimitives.ReadUInt32LittleEndian(data);
@@ -106,7 +106,7 @@ internal static class RoaringBitmap
             hasOffsetHeader = false;
         }
 
-        if (containerCount == 0) return;
+        if (containerCount == 0) return pos;
 
         // Descriptive header: (key, cardinality-1) pairs.
         var keys = new ushort[containerCount];
@@ -169,5 +169,7 @@ internal static class RoaringBitmap
                 }
             }
         }
+
+        return pos; // bytes consumed (lets a RoaringBitmapArray reader advance across sub-bitmaps)
     }
 }

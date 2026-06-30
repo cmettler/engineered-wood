@@ -22,16 +22,23 @@ internal static class RoaringBitmapWriter
     /// </summary>
     public static byte[] Serialize(IEnumerable<long> rowIndices)
     {
-        // Group indices by high 16-bit container key
-        var containers = new SortedDictionary<ushort, List<ushort>>();
-
+        // Delta DV bitmaps are a 64-bit RoaringBitmapArray: indices are split by their high 32 bits into
+        // sub-bitmaps, each a standard 32-bit portable Roaring bitmap (whose own 16-bit container keys cover the
+        // low 32 bits). On-disk (and inline): magic, then int64 sub-bitmap count, then per sub-bitmap an int32
+        // high-32-bit key followed by the portable bitmap — this is what delta-kernel / Spark / Fabric decode.
+        var subBitmaps = new SortedDictionary<uint, SortedDictionary<ushort, List<ushort>>>();
         foreach (long idx in rowIndices)
         {
-            // Delta DVs use 64-bit indices, but for files < 2^32 rows
-            // we only need the lower 32 bits, split into 16-bit key + 16-bit value
-            ushort key = (ushort)(idx >> 16);
-            ushort value = (ushort)(idx & 0xFFFF);
+            uint high = (uint)((ulong)idx >> 32);
+            uint low = (uint)((ulong)idx & 0xFFFFFFFF);
+            ushort key = (ushort)(low >> 16);
+            ushort value = (ushort)(low & 0xFFFF);
 
+            if (!subBitmaps.TryGetValue(high, out var containers))
+            {
+                containers = new SortedDictionary<ushort, List<ushort>>();
+                subBitmaps[high] = containers;
+            }
             if (!containers.TryGetValue(key, out var values))
             {
                 values = new List<ushort>();
@@ -43,11 +50,13 @@ internal static class RoaringBitmapWriter
         using var ms = new MemoryStream();
         using var bw = new BinaryWriter(ms);
 
-        // Write magic
-        bw.Write(RoaringBitmapArrayMagic);
-
-        // Write portable Roaring Bitmap
-        WritePortableRoaringBitmap(bw, containers);
+        bw.Write(RoaringBitmapArrayMagic);     // 4 bytes LE
+        bw.Write((long)subBitmaps.Count);      // 8 bytes LE: number of sub-bitmaps (Portable RoaringBitmapArray)
+        foreach (var kvp in subBitmaps)
+        {
+            bw.Write(kvp.Key);                 // 4 bytes LE: the high-32-bit key
+            WritePortableRoaringBitmap(bw, kvp.Value);
+        }
 
         bw.Flush();
         return ms.ToArray();
@@ -56,19 +65,20 @@ internal static class RoaringBitmapWriter
     private static void WritePortableRoaringBitmap(
         BinaryWriter bw, SortedDictionary<ushort, List<ushort>> containers)
     {
+        // Standard CRoaring "portable" NO_RUNCONTAINER format (what delta-kernel / Spark / Fabric decode):
+        //   [u32 cookie = SERIAL_COOKIE_NO_RUNCONTAINER (12346)]
+        //   [u32 size = container count]
+        //   [descriptive header: (u16 key, u16 cardinality-1) × size]
+        //   [offset header: u32 × size]   (ALWAYS present for the no-run cookie)
+        //   [containers]
+        const uint SerialCookieNoRunContainer = 12346;
         int containerCount = containers.Count;
+        bw.Write(SerialCookieNoRunContainer); // full u32 cookie (NOT count<<16 | cookie — that's non-standard)
+        bw.Write((uint)containerCount);       // size as a separate u32
         if (containerCount == 0)
         {
-            // Empty bitmap: write no-run cookie with 0 containers
-            // Actually the cookie encodes (containerCount - 1), so for 0 containers
-            // we write a legacy format with just count = 0
-            bw.Write((uint)0);
-            return;
+            return; // empty bitmap: cookie + size 0, no headers/containers
         }
-
-        // No-run cookie: (containerCount - 1) << 16 | 12346
-        uint cookie = (uint)((containerCount - 1) << 16) | 12346;
-        bw.Write(cookie);
 
         // Prepare container data
         var keys = new ushort[containerCount];
@@ -101,11 +111,10 @@ internal static class RoaringBitmapWriter
             bw.Write((ushort)(cardinalities[i] - 1));
         }
 
-        // Offset header (only when containerCount >= 4 for no-run cookie)
-        if (containerCount >= 4)
+        // Offset header — ALWAYS present for the NO_RUNCONTAINER cookie. headerSize = cookie(4) + size(4) +
+        // descriptive(4×count) + offsets(4×count).
         {
-            // Calculate offsets
-            int headerSize = 4 + containerCount * 4 + containerCount * 4; // cookie + descriptive + offsets
+            int headerSize = 4 + 4 + containerCount * 4 + containerCount * 4;
             int offset = headerSize;
             for (i = 0; i < containerCount; i++)
             {

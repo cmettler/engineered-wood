@@ -141,6 +141,11 @@ internal static class CdfReader
             // Strip _change_type column if present in the data file
             var cleanBatch = StripChangeTypeColumn(batch);
 
+            // On a rowTracking table the data files carry the physical __delta_row_id column; strip it so the
+            // inferred change rows share the user-column schema with cdc-file-derived rows (a 6-vs-5-col mismatch
+            // across change batches otherwise breaks strict consumers / the Arrow C-stream boundary).
+            (cleanBatch, _) = RowTracking.RowTrackingWriter.StripRowIdColumn(cleanBatch);
+
             // Add _change_type, _commit_version, _commit_timestamp
             var withChangeType = CdfWriter.AddChangeTypeColumn(cleanBatch, changeType);
             yield return AddMetadataColumns(withChangeType, commitVersion, commitTimestamp);
