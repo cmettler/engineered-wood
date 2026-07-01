@@ -320,18 +320,15 @@ internal static class ArrowSchemaConverter
 
     private static IArrowType MakeDecimalType(int precision, int scale, PhysicalType physicalType)
     {
-        return physicalType switch
-        {
-            PhysicalType.Int32 => new Decimal32Type(precision, scale),
-            PhysicalType.Int64 => new Decimal64Type(precision, scale),
-            _ => precision switch
-            {
-                <= 9 => new Decimal32Type(precision, scale),
-                <= 18 => new Decimal64Type(precision, scale),
-                <= 38 => new Decimal128Type(precision, scale),
-                _ => new Decimal256Type(precision, scale),
-            },
-        };
+        // Always surface decimals as the classic Decimal128 (Decimal256 for precision > 38), regardless of the
+        // parquet physical width (INT32/INT64/FLBA). The narrower Arrow decimal types (Decimal32/Decimal64) are
+        // newer and NOT reliably handled by Arrow C-data-interface consumers (e.g. crossing to DuckDB, the
+        // exported format string is read as 128-bit over the 4/8-byte buffer => corruption); the value decoders
+        // (BuildDecimalFromInt32/Int64) sign-extend to any target byte-width, so Decimal128 is produced correctly
+        // and losslessly from a narrower physical column.
+        return precision <= 38
+            ? new Decimal128Type(precision, scale)
+            : new Decimal256Type(precision, scale);
     }
 
     /// <summary>

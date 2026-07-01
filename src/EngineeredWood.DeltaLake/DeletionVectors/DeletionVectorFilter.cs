@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Types;
 
 namespace EngineeredWood.DeltaLake.DeletionVectors;
 
@@ -148,8 +149,43 @@ public static class DeletionVectorFilter
                 foreach (int r in rows) { if (a.IsNull(r)) b.AppendNull(); else b.Append(a.GetBytes(r)); }
                 return b.Build();
             }
+            // Decimals are fixed-width (Decimal128 = 16 bytes, Decimal256 = 32). Slice the raw value
+            // buffer per kept row rather than GetValue/Append — System.Decimal cannot hold precision
+            // 29-38, so GetValue would overflow on high-precision decimals; the byte copy is exact.
+            case Decimal128Array a:
+                return TakeFixedWidth(a, rows, 16);
+            case Decimal256Array a:
+                return TakeFixedWidth(a, rows, 32);
             default:
                 return source; // Unsupported types returned as-is
         }
+    }
+
+    /// <summary>
+    /// Takes specific rows from a fixed-width array (decimals) by copying the raw value slot bytes.
+    /// Avoids System.Decimal round-tripping (which caps at precision 28) so high-precision decimals
+    /// survive the copy-on-write rewrite intact.
+    /// </summary>
+    private static IArrowArray TakeFixedWidth(IArrowArray source, List<int> rows, int byteWidth)
+    {
+        ReadOnlySpan<byte> srcValues = source.Data.Buffers[1].Span;
+        var valueBytes = new byte[rows.Count * byteWidth];
+        var validity = new ArrowBuffer.BitmapBuilder(rows.Count);
+        int nullCount = 0;
+        int i = 0;
+        foreach (int r in rows)
+        {
+            bool isNull = source.IsNull(r);
+            validity.Append(!isNull);
+            if (isNull)
+                nullCount++;
+            else
+                srcValues.Slice(r * byteWidth, byteWidth).CopyTo(valueBytes.AsSpan(i * byteWidth, byteWidth));
+            i++;
+        }
+
+        var buffers = new[] { validity.Build(), new ArrowBuffer(valueBytes) };
+        var data = new ArrayData(source.Data.DataType, rows.Count, nullCount, 0, buffers);
+        return ArrowArrayFactory.BuildArray(data);
     }
 }
