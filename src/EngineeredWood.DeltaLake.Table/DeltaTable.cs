@@ -1303,6 +1303,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
     }
 
+    // True when `fileValues` matches every entry in `filter` (partition-overwrite file selection). A file matches
+    // only if it carries each filter key with the exact same value (ordinal string compare — partition values are
+    // stored as strings). Keys are validated to be partition columns before this is called.
+    private static bool PartitionValuesMatch(
+        IReadOnlyDictionary<string, string> fileValues, IReadOnlyDictionary<string, string> filter)
+    {
+        foreach (var kv in filter)
+        {
+            if (!fileValues.TryGetValue(kv.Key, out var v) || !string.Equals(v, kv.Value, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     #endregion
 
     /// <summary>
@@ -1498,15 +1514,51 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Writes RecordBatch data as a new commit.
     /// Returns the committed version number.
     /// </summary>
-    public async ValueTask<long> WriteAsync(
+    public ValueTask<long> WriteAsync(
         IReadOnlyList<RecordBatch> batches,
         DeltaWriteMode mode = DeltaWriteMode.Append,
         CancellationToken cancellationToken = default)
+        => WriteCoreAsync(batches, mode, null, cancellationToken);
+
+    /// <summary>
+    /// Atomically overwrites one or more whole partitions in a SINGLE commit: removes exactly the active files
+    /// whose partition values match every entry in <paramref name="overwritePartitions"/>, and adds
+    /// <paramref name="batches"/> (which must fall within those partitions). This is delta-rs's static
+    /// partition-overwrite / <c>replaceWhere</c>-on-partition-columns: the removal is file-exact (no rewrite)
+    /// because the keys are partition columns, and the swap is one atomic Delta version. Files outside the target
+    /// partitions are untouched. The keys must be partition columns of the table.
+    /// </summary>
+    public ValueTask<long> OverwritePartitionsAsync(
+        IReadOnlyList<RecordBatch> batches,
+        IReadOnlyDictionary<string, string> overwritePartitions,
+        CancellationToken cancellationToken = default)
+        => WriteCoreAsync(batches, DeltaWriteMode.Overwrite, overwritePartitions, cancellationToken);
+
+    private async ValueTask<long> WriteCoreAsync(
+        IReadOnlyList<RecordBatch> batches,
+        DeltaWriteMode mode,
+        IReadOnlyDictionary<string, string>? overwritePartitions,
+        CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
 
         var snapshot = CurrentSnapshot;
+
+        // A partition-overwrite: the filter keys MUST be partition columns so file-level removal is exact (a
+        // data-column predicate could partially match a file → deleting the whole file would drop other rows).
+        if (overwritePartitions is { Count: > 0 })
+        {
+            foreach (var key in overwritePartitions.Keys)
+            {
+                if (!snapshot.Metadata.PartitionColumns.Contains(key))
+                {
+                    throw new DeltaFormatException(
+                        $"OverwritePartitions: '{key}' is not a partition column of the table " +
+                        $"(partition columns: {string.Join(", ", snapshot.Metadata.PartitionColumns)}).");
+                }
+            }
+        }
 
         // Iceberg compatibility: validate constraints before writing
         var icebergVersion = Schema.IcebergCompat.GetVersion(snapshot.Metadata.Configuration);
@@ -1517,12 +1569,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var actions = new List<DeltaAction>();
 
-        // For overwrite mode, remove all existing files
+        // For overwrite mode, remove existing files: ALL of them for a full overwrite, or only the files whose
+        // partition values match `overwritePartitions` for an atomic partition-scoped overwrite (files outside
+        // the target partitions are kept).
         if (mode == DeltaWriteMode.Overwrite)
         {
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             foreach (var existingFile in snapshot.ActiveFiles.Values)
             {
+                if (overwritePartitions is { Count: > 0 } &&
+                    !PartitionValuesMatch(existingFile.PartitionValues, overwritePartitions))
+                {
+                    continue; // keep files outside the target partition(s)
+                }
                 actions.Add(new RemoveFile
                 {
                     Path = existingFile.Path,
@@ -1579,6 +1638,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 if (dataBatch.Length == 0)
                     continue;
+
+                // Partition overwrite: the input must fall within the target partition(s) — otherwise we'd ADD
+                // files in partitions we didn't clear, silently mixing overwrite + append semantics.
+                if (overwritePartitions is { Count: > 0 } && !PartitionValuesMatch(partValues, overwritePartitions))
+                {
+                    throw new DeltaFormatException(
+                        "OverwritePartitions: input data falls outside the target partition(s) " +
+                        $"({string.Join(", ", overwritePartitions.Select(kv => kv.Key + "=" + kv.Value))}).");
+                }
 
                 // Rename logical columns to physical names for Parquet storage
                 var physicalBatch = ColumnMapping.RenameToPhysical(dataBatch, logicalToPhysical);
