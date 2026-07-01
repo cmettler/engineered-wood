@@ -405,6 +405,54 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Replaces the table's schema wholesale with <paramref name="newSchema"/> as a metadata-only commit
+    /// (a new <c>metaData</c> action; no data files are rewritten). Unlike <see cref="AddColumnAsync"/> this can
+    /// add, drop, or retype columns — it is the "schema overwrite" primitive used by a true CREATE OR REPLACE
+    /// (adopt exactly the incoming schema). Callers are responsible for aligning the data (typically paired with
+    /// an <c>Overwrite</c> write that removes the old-schema files immediately after). Only for tables WITHOUT
+    /// column mapping (no field ids to assign/preserve). Returns the new version. No-op (returns the current
+    /// version) if the schema is already identical.
+    /// </summary>
+    public async ValueTask<long> SetSchemaAsync(
+        Apache.Arrow.Schema newSchema, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        var config = snapshot.Metadata.Configuration;
+        if (config is not null
+            && config.TryGetValue(ColumnMapping.ModeKey, out var mode)
+            && !string.Equals(mode, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "SetSchema is not supported on a column-mapping table (field ids are not reassigned).");
+        }
+
+        var newDeltaSchema = SchemaConverter.FromArrowSchema(newSchema);
+        string newSchemaString = DeltaSchemaSerializer.Serialize(newDeltaSchema);
+        if (string.Equals(newSchemaString, snapshot.Metadata.SchemaString, StringComparison.Ordinal))
+        {
+            return snapshot.Version; // identical schema — nothing to commit
+        }
+
+        IReadOnlyList<DeltaAction> actions = new List<DeltaAction>
+        {
+            snapshot.Metadata with { SchemaString = newSchemaString },
+        };
+        actions = Log.InCommitTimestamp.EnsureCommitInfo(
+            actions, snapshot.Metadata.Configuration, "CHANGE COLUMNS");
+
+        long newVersion = snapshot.Version + 1;
+        await _log.WriteCommitAsync(newVersion, actions, cancellationToken).ConfigureAwait(false);
+
+        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
+            snapshot, _log, cancellationToken).ConfigureAwait(false);
+
+        return newVersion;
+    }
+
+    /// <summary>
     /// Gets a snapshot at a specific version (time travel).
     /// </summary>
     public async ValueTask<Snapshot.Snapshot> GetSnapshotAtVersionAsync(
