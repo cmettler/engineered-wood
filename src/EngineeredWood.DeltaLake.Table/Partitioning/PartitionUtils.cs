@@ -313,9 +313,64 @@ internal static class PartitionUtils
                 return b.Build();
             }
             default:
-                // Unsupported complex types — return source unchanged
-                return source;
+            {
+                // Every other fixed-width type (unsigned ints, decimals, Time/Duration, HalfFloat,
+                // FixedSizeBinary, ...) is filtered by copying its raw value-slot bytes — preserving the exact
+                // type and avoiding per-type builders. A type we cannot slice (nested list/struct/map/...) must
+                // THROW, never fall through unfiltered: an unfiltered column has the wrong length and silently
+                // corrupts the partitioned write (mispaired rows in the written partition file).
+                int? width = FixedWidthBytes(source.Data.DataType);
+                if (width is int byteWidth)
+                    return TakeFixedWidth(source, rows, byteWidth);
+                throw new NotSupportedException(
+                    $"PartitionUtils.TakeRows cannot filter column type {source.Data.DataType.TypeId} — "
+                    + "partitioned writes do not support this column type.");
+            }
         }
+    }
+
+    /// <summary>
+    /// Byte width of a fixed-width Arrow type (Boolean is bit-packed → excluded, handled by its own builder
+    /// case), or null for variable-width / nested types.
+    /// </summary>
+    private static int? FixedWidthBytes(IArrowType type) => type switch
+    {
+        Int8Type or UInt8Type => 1,
+        Int16Type or UInt16Type or HalfFloatType => 2,
+        Int32Type or UInt32Type or FloatType or Date32Type or Time32Type => 4,
+        Int64Type or UInt64Type or DoubleType or Date64Type or Time64Type or TimestampType or DurationType => 8,
+        // Decimal128Type / Decimal256Type derive from FixedSizeBinaryType, so ByteWidth (16 / 32) is exact.
+        FixedSizeBinaryType fsb => fsb.ByteWidth,
+        _ => null,
+    };
+
+    /// <summary>
+    /// Takes specific rows from a fixed-width array by copying the raw value-slot bytes (accounting for the
+    /// source array's logical offset) and rebuilding the validity bitmap. Type-agnostic and lossless.
+    /// </summary>
+    private static IArrowArray TakeFixedWidth(IArrowArray source, List<int> rows, int byteWidth)
+    {
+        ReadOnlySpan<byte> srcValues = source.Data.Buffers[1].Span;
+        int srcOffset = source.Data.Offset;
+        var valueBytes = new byte[rows.Count * byteWidth];
+        var validity = new ArrowBuffer.BitmapBuilder(rows.Count);
+        int nullCount = 0;
+        int i = 0;
+        foreach (int r in rows)
+        {
+            bool isNull = source.IsNull(r);
+            validity.Append(!isNull);
+            if (isNull)
+                nullCount++;
+            else
+                srcValues.Slice((srcOffset + r) * byteWidth, byteWidth)
+                         .CopyTo(valueBytes.AsSpan(i * byteWidth, byteWidth));
+            i++;
+        }
+
+        var buffers = new[] { validity.Build(), new ArrowBuffer(valueBytes) };
+        var data = new ArrayData(source.Data.DataType, rows.Count, nullCount, 0, buffers);
+        return ArrowArrayFactory.BuildArray(data);
     }
 
     /// <summary>
