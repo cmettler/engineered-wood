@@ -1729,17 +1729,27 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 long fileSize;
 
-                await using (var file = await _fs.CreateAsync(
-                    fileName, cancellationToken: cancellationToken).ConfigureAwait(false))
+                if (_options.DataFileWriter is { } dataFileWriter)
                 {
-                    await using var writer = new ParquetFileWriter(
-                        file, ownsFile: false, _options.ParquetWriteOptions);
-                    await writer.WriteRowGroupAsync(physicalBatch, cancellationToken)
-                        .ConfigureAwait(false);
+                    // Delegate the parquet bytes to the host writer (e.g. DuckDB's native COPY); it places the
+                    // file at the location the table filesystem maps `fileName` to and returns its byte size.
+                    fileSize = await dataFileWriter.WriteAsync(
+                        physicalBatch, fileName, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await using (var file = await _fs.CreateAsync(
+                        fileName, cancellationToken: cancellationToken).ConfigureAwait(false))
+                    {
+                        await using var writer = new ParquetFileWriter(
+                            file, ownsFile: false, _options.ParquetWriteOptions);
+                        await writer.WriteRowGroupAsync(physicalBatch, cancellationToken)
+                            .ConfigureAwait(false);
 
-                    // DisposeAsync writes the Parquet footer before we read Position
-                    await writer.DisposeAsync().ConfigureAwait(false);
-                    fileSize = file.Position;
+                        // DisposeAsync writes the Parquet footer before we read Position
+                        await writer.DisposeAsync().ConfigureAwait(false);
+                        fileSize = file.Position;
+                    }
                 }
 
                 // Collect stats from the data batch using logical names
