@@ -12,7 +12,7 @@ namespace EngineeredWood.DeltaLake.Table;
 /// using both partition values and per-file column statistics. Skips files
 /// that the evaluator proves cannot contain matching rows.
 /// </summary>
-internal sealed class DeltaFilePruner
+public sealed class DeltaFilePruner
 {
     private readonly DeltaFileStatsAccessor _accessor;
 

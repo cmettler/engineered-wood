@@ -41,4 +41,11 @@ public sealed record DeltaTableOptions
     /// all other write logic (partitioning, row tracking, stats, the <c>add</c> action, the commit) is unchanged.
     /// Default: null (use the built-in writer).</summary>
     public IDataFileWriter? DataFileWriter { get; init; }
+
+    /// <summary>Optional pluggable rewrite reader for copy-on-write DELETE/UPDATE. When set (and the table shape
+    /// permits — no column mapping, no schema-evolved files), the table delegates the source-file read + row-level
+    /// transform to it (e.g. DuckDB's native <c>read_parquet</c> + SQL SET substitution) instead of reading the
+    /// file with its own reader; stats, the data-file writer, row tracking, CDF, and the commit are unchanged.
+    /// Default: null (use the built-in reader + in-process transform).</summary>
+    public IDataFileRewriter? DataFileRewriter { get; init; }
 }

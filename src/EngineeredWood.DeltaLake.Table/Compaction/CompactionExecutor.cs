@@ -28,7 +28,8 @@ internal static class CompactionExecutor
         CompactionOptions options,
         ParquetWriteOptions parquetOptions,
         ParquetReadOptions parquetReadOptions,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IDataFileWriter? dataFileWriter = null)
     {
         // Select small files as compaction candidates
         var candidates = snapshot.ActiveFiles.Values
@@ -44,19 +45,81 @@ internal static class CompactionExecutor
         var targetSchema = SchemaConverter.ToArrowSchema(
             DeltaSchemaSerializer.Parse(snapshot.Metadata.SchemaString));
 
-        // Read all data from candidate files, widening types if needed
+        // When the table declares materialized row tracking, compaction must PRESERVE each row's ORIGINAL stable
+        // id AND commit version — rows from several source files mix into one compacted file, so the compacted
+        // add's single baseRowId / defaultRowCommitVersion cannot represent them. Materialize both columns from
+        // the per-source-file baseRowId + physical position (or the source's own materialized __delta_row_id when
+        // present) and the source's defaultRowCommitVersion. Default off (no declared column) → the original
+        // behavior: strip __delta_row_id, write a fresh baseRowId (readers use baseRowId + position).
+        string? matRowIdCol = snapshot.Metadata.Configuration is { } matCfg
+            && matCfg.TryGetValue("delta.rowTracking.materializedRowIdColumnName", out var mrc) ? mrc : null;
+        bool materialize = matRowIdCol is not null;
+
+        // Read all LIVE data from candidate files, widening types if needed. A candidate may carry a deletion
+        // vector (deletion vectors are the default DML mode) — its deleted rows MUST be excluded, else compaction
+        // would resurrect them. The internal materialized row-id column (__delta_row_id) is stripped from the data
+        // (it is re-materialized below when `materialize`, else dropped).
+        var dvReader = new DeletionVectors.DeletionVectorReader(fs);
         var allBatches = new List<RecordBatch>();
+        var batchIds = materialize ? new List<Int64Array>() : null;   // aligned 1:1 with allBatches
+        var batchVers = materialize ? new List<Int64Array>() : null;  // aligned 1:1 with allBatches
         foreach (var addFile in candidates)
         {
+            var deletedRows = addFile.DeletionVector is not null
+                ? await dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
+                : null;
+            long baseId = addFile.BaseRowId ?? 0;
+            long commitVer = addFile.DefaultRowCommitVersion ?? 0;
+
             await using var file = await fs.OpenReadAsync(addFile.Path, cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
 
+            long batchStartRow = 0;
             await foreach (var batch in reader.ReadAllAsync(
                 cancellationToken: cancellationToken).ConfigureAwait(false))
             {
-                // Widen values from old files to match current schema
-                allBatches.Add(TypeWidening.ValueWidener.WidenBatch(batch, targetSchema));
+                // Drop the internal row-id column (no-op when absent) — count physical rows for DV positions first.
+                var (userBatch, srcRowIds) = RowTracking.RowTrackingWriter.StripRowIdColumn(batch);
+                long physicalRows = batch.Length;
+
+                // Build the survivor id/version arrays in the SAME order DeletionVectorFilter keeps (ascending
+                // physical index, skipping DV-deleted rows) so they stay aligned with the filtered batch.
+                Int64Array? survivorIds = null, survivorVers = null;
+                if (materialize)
+                {
+                    var idb = new Int64Array.Builder();
+                    var vrb = new Int64Array.Builder();
+                    for (int i = 0; i < physicalRows; i++)
+                    {
+                        if (deletedRows is not null && deletedRows.Contains(batchStartRow + i))
+                            continue;
+                        // Prefer the source file's OWN materialized id (handles a source that was itself an
+                        // UPDATE-append carrying preserved ids); else compute baseRowId + physical position.
+                        long id = srcRowIds is not null && !srcRowIds.IsNull(i)
+                            ? srcRowIds.GetValue(i)!.Value
+                            : baseId + batchStartRow + i;
+                        idb.Append(id);
+                        vrb.Append(commitVer);
+                    }
+                    survivorIds = idb.Build();
+                    survivorVers = vrb.Build();
+                }
+
+                if (deletedRows is not null)
+                {
+                    userBatch = DeletionVectors.DeletionVectorFilter.Filter(userBatch, deletedRows, batchStartRow);
+                }
+                batchStartRow += physicalRows;
+                if (userBatch.Length == 0)
+                    continue; // whole batch was deleted
+                // Widen values from old files to match current schema (row order/count preserved → ids stay aligned)
+                allBatches.Add(TypeWidening.ValueWidener.WidenBatch(userBatch, targetSchema));
+                if (materialize)
+                {
+                    batchIds!.Add(survivorIds!);
+                    batchVers!.Add(survivorVers!);
+                }
             }
         }
 
@@ -78,6 +141,7 @@ internal static class CompactionExecutor
                 ExtendedFileMetadata = true,
                 PartitionValues = oldFile.PartitionValues,
                 Size = oldFile.Size,
+                DeletionVector = oldFile.DeletionVector, // match the active (path, DV) entry so the remove takes effect
             });
         }
 
@@ -105,12 +169,19 @@ internal static class CompactionExecutor
 
         int batchIdx = 0;
         long currentRowCount = 0;
-        var currentBatches = new List<RecordBatch>();
+        var currentBatches = new List<RecordBatch>();          // USER columns (for stats)
+        var currentWrite = new List<RecordBatch>();            // what gets written (== currentBatches unless materialize)
 
         while (batchIdx < allBatches.Count)
         {
-            currentBatches.Add(allBatches[batchIdx]);
-            currentRowCount += allBatches[batchIdx].Length;
+            var b = allBatches[batchIdx];
+            currentBatches.Add(b);
+            // When materializing, append the ORIGINAL id + commit-version columns to the written batch (stats are
+            // still collected over the user columns only — the internal columns must not appear in Delta stats).
+            currentWrite.Add(materialize
+                ? RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(b, batchIds![batchIdx], batchVers![batchIdx])
+                : b);
+            currentRowCount += b.Length;
             batchIdx++;
 
             if (currentRowCount >= rowsPerFile || batchIdx == allBatches.Count)
@@ -119,12 +190,20 @@ internal static class CompactionExecutor
                 long fileSize;
                 long fileBaseRowId = nextRowId;
 
-                await using (var outFile = await fs.CreateAsync(
-                    fileName, cancellationToken: cancellationToken).ConfigureAwait(false))
+                if (dataFileWriter is not null)
                 {
+                    // native_write: DuckDB's parquet writer produces the compacted file (bloom/stats/footer),
+                    // so an OPTIMIZE keeps the native-write quality instead of reverting to the built-in codec.
+                    fileSize = await dataFileWriter.WriteAsync(currentWrite, fileName, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await using var outFile = await fs.CreateAsync(
+                        fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
                         outFile, ownsFile: false, parquetOptions);
-                    foreach (var batch in currentBatches)
+                    foreach (var batch in currentWrite)
                     {
                         await writer.WriteRowGroupAsync(batch, cancellationToken)
                             .ConfigureAwait(false);
@@ -151,6 +230,7 @@ internal static class CompactionExecutor
                 });
 
                 currentBatches.Clear();
+                currentWrite.Clear();
                 currentRowCount = 0;
             }
         }

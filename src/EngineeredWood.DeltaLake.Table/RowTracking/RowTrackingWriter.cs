@@ -17,6 +17,11 @@ internal static class RowTrackingWriter
     public const string RowIdColumn = "__delta_row_id";
 
     /// <summary>
+    /// The internal column name used in Parquet files to store materialized row commit versions.
+    /// </summary>
+    public const string RowCommitVersionColumn = "__delta_row_commit_version";
+
+    /// <summary>
     /// Adds a <c>__delta_row_id</c> column to a batch with sequential IDs
     /// starting from <paramref name="baseRowId"/>.
     /// </summary>
@@ -42,6 +47,59 @@ internal static class RowTrackingWriter
         foreach (var f in fields)
             schema.Field(f);
 
+        return new RecordBatch(schema.Build(), columns, batch.Length);
+    }
+
+    /// <summary>
+    /// Adds a <c>__delta_row_id</c> column carrying EXPLICIT row ids (one per row) — used on a copy-on-write /
+    /// merge-on-read rewrite to MATERIALIZE each row's ORIGINAL stable id, so an UPDATE/compaction preserves the
+    /// row id (a spec reader honors the materialized column over baseRowId + position). <paramref name="rowIds"/>
+    /// length must equal <paramref name="batch"/>.Length.
+    /// </summary>
+    public static RecordBatch AddRowIdColumn(RecordBatch batch, Int64Array rowIds)
+    {
+        var columns = new IArrowArray[batch.ColumnCount + 1];
+        var fields = new List<Field>(batch.ColumnCount + 1);
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            columns[i] = batch.Column(i);
+            fields.Add(batch.Schema.FieldsList[i]);
+        }
+        columns[batch.ColumnCount] = rowIds;
+        fields.Add(new Field(RowIdColumn, Int64Type.Default, false));
+
+        var schema = new Apache.Arrow.Schema.Builder();
+        foreach (var f in fields)
+            schema.Field(f);
+        return new RecordBatch(schema.Build(), columns, batch.Length);
+    }
+
+    /// <summary>
+    /// Adds BOTH the <c>__delta_row_id</c> and <c>__delta_row_commit_version</c> columns carrying EXPLICIT
+    /// per-row values — used on a COMPACTION rewrite, where rows from several source files mix, so a single
+    /// <c>baseRowId</c> / <c>defaultRowCommitVersion</c> on the compacted <c>add</c> cannot represent them.
+    /// Materializing both preserves each row's ORIGINAL stable id AND commit version across compaction (a spec
+    /// reader honors the materialized columns over <c>baseRowId + position</c> / the file's default version).
+    /// Both arrays' length must equal <paramref name="batch"/>.Length.
+    /// </summary>
+    public static RecordBatch AddRowIdAndCommitVersionColumns(
+        RecordBatch batch, Int64Array rowIds, Int64Array commitVersions)
+    {
+        var columns = new IArrowArray[batch.ColumnCount + 2];
+        var fields = new List<Field>(batch.ColumnCount + 2);
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            columns[i] = batch.Column(i);
+            fields.Add(batch.Schema.FieldsList[i]);
+        }
+        columns[batch.ColumnCount] = rowIds;
+        fields.Add(new Field(RowIdColumn, Int64Type.Default, false));
+        columns[batch.ColumnCount + 1] = commitVersions;
+        fields.Add(new Field(RowCommitVersionColumn, Int64Type.Default, false));
+
+        var schema = new Apache.Arrow.Schema.Builder();
+        foreach (var f in fields)
+            schema.Field(f);
         return new RecordBatch(schema.Build(), columns, batch.Length);
     }
 
