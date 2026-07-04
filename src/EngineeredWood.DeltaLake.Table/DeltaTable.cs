@@ -1055,29 +1055,45 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             string newFileName = $"{Guid.NewGuid():N}.parquet";
             long fileSize;
-            await using (var file = await _fs.CreateAsync(newFileName, cancellationToken: cancellationToken)
-                             .ConfigureAwait(false))
-            {
-                await using var writer = new Parquet.ParquetFileWriter(
-                    file, ownsFile: false, _options.ParquetWriteOptions);
-                foreach (var b in rewritten)
-                {
-                    // Clean schema (drop reader field metadata) before re-writing — same as the delete path,
-                    // else the parquet footer is malformed for delta-kernel/Spark/Fabric.
-                    var cleanFields = new List<Field>(b.Schema.FieldsList.Count);
-                    foreach (var f in b.Schema.FieldsList)
-                        cleanFields.Add(new Field(f.Name, f.DataType, f.IsNullable));
-                    var cleanArrays = new List<IArrowArray>(b.ColumnCount);
-                    for (int c = 0; c < b.ColumnCount; c++)
-                        cleanArrays.Add(b.Column(c));
-                    var clean = new RecordBatch(new Apache.Arrow.Schema(cleanFields, null), cleanArrays, b.Length);
 
-                    var physicalBatch = ColumnMapping.RenameToPhysical(clean, logicalToPhysical);
-                    physicalBatch = ColumnMapping.SetParquetFieldIds(physicalBatch, snapshot.Schema, mappingMode);
-                    await writer.WriteRowGroupAsync(physicalBatch, cancellationToken).ConfigureAwait(false);
+            // Build the physical batches (clean schema + column mapping) once for either writer.
+            var physicalBatches = new List<RecordBatch>(rewritten.Count);
+            foreach (var b in rewritten)
+            {
+                // Clean schema (drop reader field metadata) before re-writing — same as the delete path,
+                // else the parquet footer is malformed for delta-kernel/Spark/Fabric.
+                var cleanFields = new List<Field>(b.Schema.FieldsList.Count);
+                foreach (var f in b.Schema.FieldsList)
+                    cleanFields.Add(new Field(f.Name, f.DataType, f.IsNullable));
+                var cleanArrays = new List<IArrowArray>(b.ColumnCount);
+                for (int c = 0; c < b.ColumnCount; c++)
+                    cleanArrays.Add(b.Column(c));
+                var clean = new RecordBatch(new Apache.Arrow.Schema(cleanFields, null), cleanArrays, b.Length);
+
+                var physicalBatch = ColumnMapping.RenameToPhysical(clean, logicalToPhysical);
+                physicalBatch = ColumnMapping.SetParquetFieldIds(physicalBatch, snapshot.Schema, mappingMode);
+                physicalBatches.Add(physicalBatch);
+            }
+
+            if (_options.DataFileWriter is { } dataFileWriter)
+            {
+                // Host writer (e.g. DuckDB's native COPY) produces the rewritten file; remove(old)+add(new) below
+                // is unchanged → standard-readable copy-on-write UPDATE output.
+                fileSize = await dataFileWriter.WriteAsync(physicalBatches, newFileName, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                await using (var file = await _fs.CreateAsync(newFileName, cancellationToken: cancellationToken)
+                                 .ConfigureAwait(false))
+                {
+                    await using var writer = new Parquet.ParquetFileWriter(
+                        file, ownsFile: false, _options.ParquetWriteOptions);
+                    foreach (var physicalBatch in physicalBatches)
+                        await writer.WriteRowGroupAsync(physicalBatch, cancellationToken).ConfigureAwait(false);
+                    await writer.DisposeAsync().ConfigureAwait(false);
+                    fileSize = file.Position;
                 }
-                await writer.DisposeAsync().ConfigureAwait(false);
-                fileSize = file.Position;
             }
 
             actions.Add(new RemoveFile
