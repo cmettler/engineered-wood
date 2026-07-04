@@ -793,30 +793,47 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 string newFileName = $"{Guid.NewGuid():N}.parquet";
                 long fileSize;
-                await using (var file = await _fs.CreateAsync(newFileName, cancellationToken: cancellationToken)
-                                 .ConfigureAwait(false))
-                {
-                    await using var writer = new Parquet.ParquetFileWriter(
-                        file, ownsFile: false, _options.ParquetWriteOptions);
-                    foreach (var b in keptBatches)
-                    {
-                        // Rebuild with a CLEAN schema (drop the parquet reader's field metadata, e.g. an existing
-                        // PARQUET:field_id) so the re-write matches the initial write path — otherwise the writer
-                        // emits a malformed footer (TProtocolException) on reader-sourced batches.
-                        var cleanFields = new List<Field>(b.Schema.FieldsList.Count);
-                        foreach (var f in b.Schema.FieldsList)
-                            cleanFields.Add(new Field(f.Name, f.DataType, f.IsNullable));
-                        var cleanArrays = new List<IArrowArray>(b.ColumnCount);
-                        for (int c = 0; c < b.ColumnCount; c++)
-                            cleanArrays.Add(b.Column(c));
-                        var clean = new RecordBatch(new Apache.Arrow.Schema(cleanFields, null), cleanArrays, b.Length);
 
-                        var physicalBatch = ColumnMapping.RenameToPhysical(clean, logicalToPhysical);
-                        physicalBatch = ColumnMapping.SetParquetFieldIds(physicalBatch, snapshot.Schema, mappingMode);
-                        await writer.WriteRowGroupAsync(physicalBatch, cancellationToken).ConfigureAwait(false);
+                // Build the physical batches for the rewritten file (clean schema + column mapping) once — the
+                // built-in writer and the pluggable host writer consume the same list.
+                var physicalBatches = new List<RecordBatch>(keptBatches.Count);
+                foreach (var b in keptBatches)
+                {
+                    // Rebuild with a CLEAN schema (drop the parquet reader's field metadata, e.g. an existing
+                    // PARQUET:field_id) so the re-write matches the initial write path — otherwise the writer
+                    // emits a malformed footer (TProtocolException) on reader-sourced batches.
+                    var cleanFields = new List<Field>(b.Schema.FieldsList.Count);
+                    foreach (var f in b.Schema.FieldsList)
+                        cleanFields.Add(new Field(f.Name, f.DataType, f.IsNullable));
+                    var cleanArrays = new List<IArrowArray>(b.ColumnCount);
+                    for (int c = 0; c < b.ColumnCount; c++)
+                        cleanArrays.Add(b.Column(c));
+                    var clean = new RecordBatch(new Apache.Arrow.Schema(cleanFields, null), cleanArrays, b.Length);
+
+                    var physicalBatch = ColumnMapping.RenameToPhysical(clean, logicalToPhysical);
+                    physicalBatch = ColumnMapping.SetParquetFieldIds(physicalBatch, snapshot.Schema, mappingMode);
+                    physicalBatches.Add(physicalBatch);
+                }
+
+                if (_options.DataFileWriter is { } dataFileWriter)
+                {
+                    // Host writer (e.g. DuckDB's native COPY) produces the rewritten file; the _delta_log
+                    // remove(old)+add(new) below is unchanged → standard-readable copy-on-write output.
+                    fileSize = await dataFileWriter.WriteAsync(physicalBatches, newFileName, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await using (var file = await _fs.CreateAsync(newFileName, cancellationToken: cancellationToken)
+                                     .ConfigureAwait(false))
+                    {
+                        await using var writer = new Parquet.ParquetFileWriter(
+                            file, ownsFile: false, _options.ParquetWriteOptions);
+                        foreach (var physicalBatch in physicalBatches)
+                            await writer.WriteRowGroupAsync(physicalBatch, cancellationToken).ConfigureAwait(false);
+                        await writer.DisposeAsync().ConfigureAwait(false);
+                        fileSize = file.Position;
                     }
-                    await writer.DisposeAsync().ConfigureAwait(false);
-                    fileSize = file.Position;
                 }
 
                 actions.Add(new AddFile
@@ -1734,7 +1751,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     // Delegate the parquet bytes to the host writer (e.g. DuckDB's native COPY); it places the
                     // file at the location the table filesystem maps `fileName` to and returns its byte size.
                     fileSize = await dataFileWriter.WriteAsync(
-                        physicalBatch, fileName, cancellationToken).ConfigureAwait(false);
+                        new[] { physicalBatch }, fileName, cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
