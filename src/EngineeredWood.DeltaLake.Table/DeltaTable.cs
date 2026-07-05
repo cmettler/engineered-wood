@@ -586,9 +586,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         string newSchemaString = DeltaSchemaSerializer.Serialize(
             new EngineeredWood.DeltaLake.Schema.StructType { Fields = newFields });
 
+        // metaData.partitionColumns holds LOGICAL names (Spark convention) — renaming a partition column must
+        // update it too, else the reader/writer treat the renamed column as a data column (and the committed
+        // partitionValues, keyed by the stable PHYSICAL name, no longer resolve).
+        var newPartitionColumns = snapshot.Metadata.PartitionColumns;
+        if (newPartitionColumns.Contains(oldName))
+        {
+            newPartitionColumns = newPartitionColumns
+                .Select(pc => string.Equals(pc, oldName, StringComparison.Ordinal) ? newName : pc)
+                .ToList();
+        }
+
         IReadOnlyList<DeltaAction> actions = new List<DeltaAction>
         {
-            snapshot.Metadata with { SchemaString = newSchemaString },
+            snapshot.Metadata with { SchemaString = newSchemaString, PartitionColumns = newPartitionColumns },
         };
         actions = Log.InCommitTimestamp.EnsureCommitInfo(
             actions, snapshot.Metadata.Configuration, "RENAME COLUMN");
@@ -1858,13 +1869,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     // True when `fileValues` matches every entry in `filter` (partition-overwrite file selection). A file matches
     // only if it carries each filter key with the exact same value (ordinal string compare — partition values are
-    // stored as strings). Keys are validated to be partition columns before this is called.
+    // stored as strings). Keys are validated to be partition columns before this is called. `filter` keys are the
+    // user-facing LOGICAL names; under column mapping a file's partitionValues are keyed by the PHYSICAL name
+    // (the Delta-spec convention — physical keys survive a partition-column rename), while files written before
+    // that convention are logical-keyed — so each filter key is tried under BOTH names.
     private static bool PartitionValuesMatch(
-        IReadOnlyDictionary<string, string> fileValues, IReadOnlyDictionary<string, string> filter)
+        IReadOnlyDictionary<string, string> fileValues, IReadOnlyDictionary<string, string> filter,
+        IReadOnlyDictionary<string, string>? logicalToPhysical = null)
     {
         foreach (var kv in filter)
         {
-            if (!fileValues.TryGetValue(kv.Key, out var v) || !string.Equals(v, kv.Value, StringComparison.Ordinal))
+            if (!fileValues.TryGetValue(kv.Key, out var v)
+                && (logicalToPhysical is null || !logicalToPhysical.TryGetValue(kv.Key, out var phys)
+                    || !fileValues.TryGetValue(phys, out v)))
+            {
+                return false;
+            }
+            if (!string.Equals(v, kv.Value, StringComparison.Ordinal))
             {
                 return false;
             }
@@ -2169,6 +2190,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var actions = new List<DeltaAction>();
 
+        // Column mapping: prepare logical-to-physical name mapping (also used to match/emit partitionValues,
+        // which are keyed by the PHYSICAL column name under mapping — the Delta-spec convention).
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
+            snapshot.Schema, mappingMode);
+
         // For overwrite mode, remove existing files: ALL of them for a full overwrite, or only the files whose
         // partition values match `overwritePartitions` for an atomic partition-scoped overwrite (files outside
         // the target partitions are kept).
@@ -2178,7 +2206,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             foreach (var existingFile in snapshot.ActiveFiles.Values)
             {
                 if (overwritePartitions is { Count: > 0 } &&
-                    !PartitionValuesMatch(existingFile.PartitionValues, overwritePartitions))
+                    !PartitionValuesMatch(existingFile.PartitionValues, overwritePartitions, logicalToPhysical))
                 {
                     continue; // keep files outside the target partition(s)
                 }
@@ -2209,12 +2237,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 identityConfigs[field.Name] = config;
         }
         var allIdentityUpdates = new List<(string Name, long HighWaterMark)>();
-
-        // Column mapping: prepare logical-to-physical name mapping
-        var partitionColumns = snapshot.Metadata.PartitionColumns;
-        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
-        var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
-            snapshot.Schema, mappingMode);
 
         foreach (var batch in batches)
         {
@@ -2273,8 +2295,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     nextRowId += dataBatch.Length;
                 }
 
+                // Under column mapping the tracked partitionValues are keyed by the PHYSICAL column name (Delta
+                // spec: "track partition values with the physical name" — Spark does the same; physical keys
+                // survive a partition-column RENAME, which never rewrites add actions). The Hive-style directory
+                // follows the same (physical) keys; readers treat paths as opaque and take values from the log.
+                var trackedPartValues = partValues;
+                if (mappingMode != ColumnMappingMode.None && partValues.Count > 0)
+                {
+                    trackedPartValues = new Dictionary<string, string>(partValues.Count);
+                    foreach (var kv in partValues)
+                    {
+                        trackedPartValues[logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
+                    }
+                }
+
                 // Build file path: partition subdirectory + UUID filename
-                string partDir = Partitioning.PartitionUtils.BuildPartitionPath(partValues);
+                string partDir = Partitioning.PartitionUtils.BuildPartitionPath(trackedPartValues);
                 string fileName = string.IsNullOrEmpty(partDir)
                     ? $"{Guid.NewGuid():N}.parquet"
                     : $"{partDir}/{Guid.NewGuid():N}.parquet";
@@ -2314,7 +2350,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 actions.Add(new AddFile
                 {
                     Path = fileName,
-                    PartitionValues = partValues,
+                    PartitionValues = trackedPartValues,
                     Size = fileSize,
                     ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                     DataChange = true,
@@ -2719,7 +2755,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     : snapshot.ArrowSchema;
 
                 result = Partitioning.PartitionUtils.AddPartitionColumns(
-                    result, fullSchema, addFile.PartitionValues, partitionColumns);
+                    result, fullSchema, addFile.PartitionValues, partitionColumns, logicalToPhysical);
             }
 
             // Strip any internal row tracking column if present (no-op for plain tables).

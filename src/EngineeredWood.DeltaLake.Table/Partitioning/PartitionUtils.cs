@@ -90,12 +90,17 @@ internal static class PartitionUtils
     /// <summary>
     /// Adds partition columns as constant-value arrays to a RecordBatch read from a data file.
     /// The partition columns are appended at the positions matching the full table schema.
+    /// Under column mapping a file's <paramref name="partitionValues"/> are keyed by the PHYSICAL column name
+    /// (the Delta-spec convention Spark follows — physical keys survive a partition-column rename), while files
+    /// written before that convention are logical-keyed — so each value is looked up under BOTH names via the
+    /// optional <paramref name="logicalToPhysical"/> map.
     /// </summary>
     public static RecordBatch AddPartitionColumns(
         RecordBatch dataBatch,
         Apache.Arrow.Schema fullSchema,
         IReadOnlyDictionary<string, string> partitionValues,
-        IReadOnlyList<string> partitionColumns)
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyDictionary<string, string>? logicalToPhysical = null)
     {
         if (partitionColumns.Count == 0)
             return dataBatch;
@@ -111,9 +116,14 @@ internal static class PartitionUtils
 
             if (partColSet.Contains(field.Name))
             {
-                // Build a constant array from the partition value
-                string value = partitionValues.TryGetValue(field.Name, out var v) ? v : "";
-                columns.Add(BuildConstantArray(field.DataType, value, dataBatch.Length));
+                // Build a constant array from the partition value (logical key, else the physical key)
+                if (!partitionValues.TryGetValue(field.Name, out var v)
+                    && (logicalToPhysical is null || !logicalToPhysical.TryGetValue(field.Name, out var phys)
+                        || !partitionValues.TryGetValue(phys, out v)))
+                {
+                    v = "";
+                }
+                columns.Add(BuildConstantArray(field.DataType, v, dataBatch.Length));
                 fields.Add(field);
             }
             else

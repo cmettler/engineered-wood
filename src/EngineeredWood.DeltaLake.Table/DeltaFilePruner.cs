@@ -19,14 +19,23 @@ public sealed class DeltaFilePruner
     public DeltaFilePruner(StructType schema, IReadOnlyList<string> partitionColumns)
     {
         var typeMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        var logicalToPhysical = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var field in schema.Fields)
         {
             if (field.Type is PrimitiveType pt)
                 typeMap[field.Name] = pt.TypeName;
+            // Column mapping: partitionValues + stats in the log are keyed by the PHYSICAL column name
+            // (older engineered-wood commits used logical keys) — the accessor looks values up under both.
+            if (field.Metadata is not null
+                && field.Metadata.TryGetValue(ColumnMapping.PhysicalNameKey, out var phys)
+                && !string.IsNullOrEmpty(phys) && phys != field.Name)
+            {
+                logicalToPhysical[field.Name] = phys;
+            }
         }
 
         var partitionSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
-        _accessor = new DeltaFileStatsAccessor(typeMap, partitionSet);
+        _accessor = new DeltaFileStatsAccessor(typeMap, partitionSet, logicalToPhysical);
     }
 
     /// <summary>
@@ -73,13 +82,29 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
 {
     private readonly IReadOnlyDictionary<string, string> _columnTypes;
     private readonly HashSet<string> _partitionColumns;
+    private readonly IReadOnlyDictionary<string, string> _logicalToPhysical;
 
     public DeltaFileStatsAccessor(
         IReadOnlyDictionary<string, string> columnTypes,
-        HashSet<string> partitionColumns)
+        HashSet<string> partitionColumns,
+        IReadOnlyDictionary<string, string>? logicalToPhysical = null)
     {
         _columnTypes = columnTypes;
         _partitionColumns = partitionColumns;
+        _logicalToPhysical = logicalToPhysical ?? new Dictionary<string, string>();
+    }
+
+    // Looks up a per-file dictionary keyed by column name under the LOGICAL name first, then the PHYSICAL name
+    // (column mapping: partitionValues/stats keys are physical per the Delta spec; older engineered-wood
+    // commits used logical keys — both must resolve).
+    private bool TryGet<TValue>(IReadOnlyDictionary<string, TValue>? dict, string column, out TValue value)
+    {
+        value = default!;
+        if (dict is null)
+            return false;
+        if (dict.TryGetValue(column, out value!))
+            return true;
+        return _logicalToPhysical.TryGetValue(column, out var phys) && dict.TryGetValue(phys, out value!);
     }
 
     public LiteralValue? GetMinValue(DeltaFileStats stats, string column) =>
@@ -95,13 +120,12 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
             // Partition value is constant per file. If the stored value is
             // null (the dictionary holds a null string), every row is null;
             // otherwise no row is null in this column.
-            if (stats.AddFile.PartitionValues.TryGetValue(column, out var v))
+            if (TryGet(stats.AddFile.PartitionValues, column, out var v))
                 return v is null ? stats.AddFile.PartitionValues.Count > 0 ? GetValueCount(stats, column) : null : 0;
             return null;
         }
 
-        return stats.ColumnStats?.NullCount?.TryGetValue(column, out long n) == true
-            ? (long?)n : null;
+        return TryGet(stats.ColumnStats?.NullCount, column, out long n) ? (long?)n : null;
     }
 
     public long? GetValueCount(DeltaFileStats stats, string column) =>
@@ -117,13 +141,13 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
 
         if (_partitionColumns.Contains(column))
         {
-            if (!stats.AddFile.PartitionValues.TryGetValue(column, out var partVal))
+            if (!TryGet(stats.AddFile.PartitionValues, column, out var partVal))
                 return null;
             return DeltaLiteralDecoder.FromPartitionString(partVal, typeName);
         }
 
         var bounds = isMin ? stats.ColumnStats?.MinValues : stats.ColumnStats?.MaxValues;
-        if (bounds is null || !bounds.TryGetValue(column, out var element))
+        if (!TryGet(bounds, column, out var element))
             return null;
 
         return DeltaLiteralDecoder.FromJson(element, typeName);
