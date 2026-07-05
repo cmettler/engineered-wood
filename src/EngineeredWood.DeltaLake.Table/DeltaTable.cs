@@ -705,6 +705,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        HonorWriterFeatures(isAppend: false);
 
         var snapshot = CurrentSnapshot;
         if (rowIds.Count == 0)
@@ -916,6 +917,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        HonorWriterFeatures(isAppend: false);
 
         var snapshot = CurrentSnapshot;
         if (rowIds.Count == 0)
@@ -1037,6 +1039,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        HonorWriterFeatures(isAppend: false);
 
         var snapshot = CurrentSnapshot;
         if (rowIds.Count == 0)
@@ -1875,6 +1878,46 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
         => WriteCoreAsync(batches, DeltaWriteMode.Overwrite, overwritePartitions, cancellationToken);
 
+    /// <summary>
+    /// Honors the writer-enforcement features a writer-v7 table LISTS but must enforce only when ACTIVE:
+    ///   • <c>appendOnly</c> — when <c>delta.appendOnly=true</c>, only appends are permitted (a non-append write
+    ///     throws). Most tables merely LIST the feature (the v7-upgrade enumerates legacy features) without setting
+    ///     the property, so this is a no-op there.
+    ///   • <c>invariants</c> / <c>checkConstraints</c> — arbitrary column/table CHECK expressions this writer
+    ///     cannot evaluate; if a table actually DECLARES one, the write is REJECTED (rather than silently writing
+    ///     possibly-violating data — Delta constraints are enforced at write time only). NOT NULL is schema
+    ///     nullability, separate and unaffected.
+    /// </summary>
+    private void HonorWriterFeatures(bool isAppend)
+    {
+        var cfg = CurrentSnapshot.Metadata.Configuration;
+        if (cfg is not null)
+        {
+            if (!isAppend && cfg.TryGetValue("delta.appendOnly", out var ao)
+                && string.Equals(ao, "true", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new DeltaFormatException(
+                    "Table is append-only (delta.appendOnly=true): overwrite/delete/update are not permitted.");
+            }
+            foreach (var key in cfg.Keys)
+            {
+                if (key.StartsWith("delta.constraints.", StringComparison.Ordinal))
+                {
+                    throw new DeltaFormatException(
+                        $"Table declares CHECK constraint '{key}' which this writer cannot evaluate; write rejected.");
+                }
+            }
+        }
+        foreach (var field in CurrentSnapshot.Schema.Fields)
+        {
+            if (field.Metadata is not null && field.Metadata.ContainsKey("delta.invariants"))
+            {
+                throw new DeltaFormatException(
+                    $"Column '{field.Name}' declares an invariant expression this writer cannot evaluate; write rejected.");
+            }
+        }
+    }
+
     private async ValueTask<long> WriteCoreAsync(
         IReadOnlyList<RecordBatch> batches,
         DeltaWriteMode mode,
@@ -1883,6 +1926,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        HonorWriterFeatures(mode == DeltaWriteMode.Append);
 
         var snapshot = CurrentSnapshot;
 
@@ -2147,6 +2191,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        HonorWriterFeatures(mode == DeltaWriteMode.Append);
 
         // Reject configurations that require write-time per-row processing the external writer did not do
         // (the caller should have checked SupportsExternalDataFileCommit first).
