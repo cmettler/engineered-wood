@@ -1867,6 +1867,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
     }
 
+    // The canonical identity of ONE partition (for dynamic partition overwrite set membership): the
+    // sorted "key=value" pairs joined with U+0001, with every key translated to its PHYSICAL name when the
+    // table has column mapping — so a physical-keyed entry (the spec convention) and a logical-keyed one
+    // (older engineered-wood commits) canonicalize identically. A null value (Delta's "row is null in this
+    // partition column") is marked distinctly from an empty string.
+    private static string CanonicalPartitionKey(
+        IReadOnlyDictionary<string, string> values,
+        IReadOnlyDictionary<string, string>? logicalToPhysical)
+    {
+        var parts = new List<string>(values.Count);
+        foreach (var kv in values)
+        {
+            string key = logicalToPhysical is not null && logicalToPhysical.TryGetValue(kv.Key, out var phys)
+                ? phys : kv.Key;
+            parts.Add(key + "=" + (kv.Value is null ? "\u0000<null>" : kv.Value));
+        }
+        parts.Sort(StringComparer.Ordinal);
+        return string.Join("\u0001", parts);
+    }
+
     // True when `fileValues` matches every entry in `filter` (partition-overwrite file selection). A file matches
     // only if it carries each filter key with the exact same value (ordinal string compare — partition values are
     // stored as strings). Keys are validated to be partition columns before this is called. `filter` keys are the
@@ -1907,15 +1927,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        // Column mapping: change rows inferred from DATA files carry PHYSICAL column names — rename them back to
-        // the current logical names so the feed's user columns match the table schema. (CDC _change_data files are
-        // written from logical-named batches, so the rename no-ops there.)
-        var snapshot = CurrentSnapshot;
-        var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
-            snapshot.Schema, ColumnMapping.GetMode(snapshot.Metadata.Configuration));
+        // The CURRENT snapshot names/types the feed's user columns: the column-mapping physical→logical rename,
+        // the partition-column re-add for rows inferred from data files (which exclude them), and the per-file
+        // deletion-vector exclusion all derive from it inside CdfReader.
         return ChangeDataFeed.CdfReader.ReadChangesAsync(
             _fs, _log, startVersion, endVersion,
-            _options.ParquetReadOptions, physicalToLogical, cancellationToken);
+            _options.ParquetReadOptions, CurrentSnapshot, cancellationToken);
     }
 
     /// <summary>
@@ -2115,6 +2132,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         => WriteCoreAsync(batches, DeltaWriteMode.Overwrite, overwritePartitions, cancellationToken);
 
     /// <summary>
+    /// DYNAMIC partition overwrite (Spark <c>partitionOverwriteMode=dynamic</c>): atomically replaces exactly the
+    /// partitions PRESENT IN <paramref name="batches"/> in a SINGLE commit — their currently-active files are
+    /// removed and the new files added; partitions the input does not touch are unaffected. Unlike
+    /// <see cref="OverwritePartitionsAsync"/> the target set is derived from the data, not supplied. Requires a
+    /// partitioned table (throws otherwise — an unpartitioned "dynamic overwrite" would be a full replace in
+    /// disguise; use Overwrite explicitly for that).
+    /// </summary>
+    public ValueTask<long> DynamicOverwriteAsync(
+        IReadOnlyList<RecordBatch> batches,
+        CancellationToken cancellationToken = default)
+        => WriteCoreAsync(batches, DeltaWriteMode.Append, null, cancellationToken,
+                          dynamicPartitionOverwrite: true);
+
+    /// <summary>
     /// Honors the writer-enforcement features a writer-v7 table LISTS but must enforce only when ACTIVE:
     ///   • <c>appendOnly</c> — when <c>delta.appendOnly=true</c>, only appends are permitted (a non-append write
     ///     throws). Most tables merely LIST the feature (the v7-upgrade enumerates legacy features) without setting
@@ -2158,13 +2189,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<RecordBatch> batches,
         DeltaWriteMode mode,
         IReadOnlyDictionary<string, string>? overwritePartitions,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool dynamicPartitionOverwrite = false)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        HonorWriterFeatures(mode == DeltaWriteMode.Append);
+        // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
+        HonorWriterFeatures(mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite);
 
         var snapshot = CurrentSnapshot;
+
+        if (dynamicPartitionOverwrite && snapshot.Metadata.PartitionColumns.Count == 0)
+        {
+            throw new DeltaFormatException(
+                "Dynamic partition overwrite requires a partitioned table (the table has no partition columns).");
+        }
 
         // A partition-overwrite: the filter keys MUST be partition columns so file-level removal is exact (a
         // data-column predicate could partially match a file → deleting the whole file would drop other rows).
@@ -2196,6 +2235,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
             snapshot.Schema, mappingMode);
+
+        // Dynamic partition overwrite: collect the canonical partition keys the INPUT touches while writing;
+        // the matching active files are removed after the write loop (one atomic commit).
+        var touchedPartitions = dynamicPartitionOverwrite ? new HashSet<string>(StringComparer.Ordinal) : null;
 
         // For overwrite mode, remove existing files: ALL of them for a full overwrite, or only the files whose
         // partition values match `overwritePartitions` for an atomic partition-scoped overwrite (files outside
@@ -2309,6 +2352,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     }
                 }
 
+                touchedPartitions?.Add(CanonicalPartitionKey(trackedPartValues, logicalToPhysical));
+
                 // Build file path: partition subdirectory + UUID filename
                 string partDir = Partitioning.PartitionUtils.BuildPartitionPath(trackedPartValues);
                 string fileName = string.IsNullOrEmpty(partDir)
@@ -2357,6 +2402,29 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     Stats = stats,
                     BaseRowId = rowTrackingEnabled ? fileBaseRowId : null,
                     DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
+                });
+            }
+        }
+
+        // Dynamic partition overwrite: remove every currently-active file whose partition matches one the input
+        // touched (canonical physical-keyed comparison, tolerating older logical-keyed commits). Files in
+        // untouched partitions are kept. Same commit as the adds -> the swap is atomic per touched partition.
+        if (touchedPartitions is { Count: > 0 })
+        {
+            long removeNow = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            foreach (var existingFile in snapshot.ActiveFiles.Values)
+            {
+                if (!touchedPartitions.Contains(CanonicalPartitionKey(existingFile.PartitionValues, logicalToPhysical)))
+                    continue;
+                actions.Add(new RemoveFile
+                {
+                    Path = existingFile.Path,
+                    DeletionTimestamp = removeNow,
+                    DataChange = true,
+                    ExtendedFileMetadata = true,
+                    PartitionValues = existingFile.PartitionValues,
+                    Size = existingFile.Size,
+                    DeletionVector = existingFile.DeletionVector, // match the active (path, DV) entry
                 });
             }
         }
@@ -2440,11 +2508,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     public async ValueTask<long> CommitDataFilesAsync(
         IReadOnlyList<WrittenDataFile> files,
         DeltaWriteMode mode,
+        bool dynamicPartitionOverwrite = false,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        HonorWriterFeatures(mode == DeltaWriteMode.Append);
+        // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
+        HonorWriterFeatures(mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite);
+
+        if (dynamicPartitionOverwrite)
+        {
+            if (mode != DeltaWriteMode.Append)
+                throw new DeltaFormatException(
+                    "Dynamic partition overwrite is append-shaped (a full Overwrite already removes everything).");
+            if (CurrentSnapshot.Metadata.PartitionColumns.Count == 0)
+                throw new DeltaFormatException(
+                    "Dynamic partition overwrite requires a partitioned table (the table has no partition columns).");
+        }
 
         // Reject configurations that require write-time per-row processing the external writer did not do
         // (the caller should have checked SupportsExternalDataFileCommit first).
@@ -2462,12 +2542,41 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var actions = new List<DeltaAction>();
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-            // Overwrite: remove every currently-active file (full replace; partition-scoped overwrite is not
-            // handled here — the caller keeps that on the batch path).
+            // Overwrite: remove every currently-active file (full replace; STATIC partition-scoped overwrite is
+            // not handled here — the caller keeps replace_where on the batch path). DYNAMIC partition overwrite:
+            // remove only the active files whose partition matches one of the written files' partitions
+            // (canonical physical-keyed comparison; the externally-written files' partitionValues are already
+            // keyed physical under column mapping, per the SupportsExternalDataFileCommit caller contract).
             if (mode == DeltaWriteMode.Overwrite)
             {
                 foreach (var existingFile in snapshot.ActiveFiles.Values)
                 {
+                    actions.Add(new RemoveFile
+                    {
+                        Path = existingFile.Path,
+                        DeletionTimestamp = now,
+                        DataChange = true,
+                        ExtendedFileMetadata = true,
+                        PartitionValues = existingFile.PartitionValues,
+                        Size = existingFile.Size,
+                        DeletionVector = existingFile.DeletionVector,
+                    });
+                }
+            }
+            else if (dynamicPartitionOverwrite)
+            {
+                var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
+                    snapshot.Schema, ColumnMapping.GetMode(snapshot.Metadata.Configuration));
+                var touched = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var f in files)
+                {
+                    if (f.PartitionValues is { Count: > 0 } pv)
+                        touched.Add(CanonicalPartitionKey(pv, logicalToPhysical));
+                }
+                foreach (var existingFile in snapshot.ActiveFiles.Values)
+                {
+                    if (!touched.Contains(CanonicalPartitionKey(existingFile.PartitionValues, logicalToPhysical)))
+                        continue;
                     actions.Add(new RemoveFile
                     {
                         Path = existingFile.Path,

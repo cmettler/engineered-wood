@@ -7,6 +7,7 @@ using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
 using EngineeredWood.DeltaLake.Log;
+using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet;
 
@@ -22,6 +23,10 @@ internal static class CdfReader
     /// <summary>
     /// Reads changes from <paramref name="startVersion"/> to <paramref name="endVersion"/> (inclusive).
     /// Each batch includes <c>_change_type</c>, <c>_commit_version</c>, and <c>_commit_timestamp</c> columns.
+    /// <paramref name="snapshot"/> is the CURRENT snapshot: its schema names/types the feed's user columns
+    /// (column-mapping physical→logical rename), its partition columns are re-added to rows inferred from
+    /// DATA files (which exclude them — the values come from the action's <c>partitionValues</c>), and a
+    /// removed/added file's <b>deletion vector</b> is applied so already-deleted rows are not re-reported.
     /// </summary>
     public static async IAsyncEnumerable<RecordBatch> ReadChangesAsync(
         ITableFileSystem fs,
@@ -29,9 +34,16 @@ internal static class CdfReader
         long startVersion,
         long endVersion,
         ParquetReadOptions? readOptions,
-        Dictionary<string, string>? physicalToLogical = null,
+        Snapshot.Snapshot snapshot,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(snapshot.Schema, mappingMode);
+        var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        var arrowSchema = snapshot.ArrowSchema;
+        var dvReader = new DeletionVectors.DeletionVectorReader(fs);
+
         for (long version = startVersion; version <= endVersion; version++)
         {
             IReadOnlyList<DeltaAction> actions;
@@ -72,24 +84,40 @@ internal static class CdfReader
                 var removes = actions.OfType<RemoveFile>()
                     .Where(r => r.DataChange).ToList();
 
-                // Removed files → "delete" rows
+                // A DV-only "delete" commit re-adds the SAME file with a new deletion vector (remove old-DV +
+                // add new-DV) — inferring "all rows deleted + survivors re-inserted" from it would be wrong,
+                // but such commits are only produced with an explicit CDC file when CDF is enabled, so the
+                // inference below (removes → deletes, adds → inserts) only ever sees genuine add/remove data
+                // changes (append, overwrite, dynamic partition overwrite).
+
+                // Removed files → "delete" rows (excluding rows the file's DV had ALREADY deleted — those were
+                // reported as deletes when the DV was written).
                 foreach (var remove in removes)
                 {
+                    var deleted = remove.DeletionVector is not null
+                        ? await dvReader.ReadAsync(remove.DeletionVector, cancellationToken).ConfigureAwait(false)
+                        : null;
                     await foreach (var batch in ReadDataFileAsChangesAsync(
-                        fs, remove.Path, CdfConfig.Delete, version,
-                        commitTimestamp, readOptions, physicalToLogical, cancellationToken)
+                        fs, remove.Path, remove.PartitionValues ?? new Dictionary<string, string>(),
+                        deleted, CdfConfig.Delete, version,
+                        commitTimestamp, readOptions, physicalToLogical, logicalToPhysical,
+                        partitionColumns, arrowSchema, cancellationToken)
                         .ConfigureAwait(false))
                     {
                         yield return batch;
                     }
                 }
 
-                // Added files → "insert" rows
+                // Added files → "insert" rows (a freshly-added file's DV, if any, likewise excludes rows).
                 foreach (var add in adds)
                 {
+                    var deleted = add.DeletionVector is not null
+                        ? await dvReader.ReadAsync(add.DeletionVector, cancellationToken).ConfigureAwait(false)
+                        : null;
                     await foreach (var batch in ReadDataFileAsChangesAsync(
-                        fs, add.Path, CdfConfig.Insert, version,
-                        commitTimestamp, readOptions, physicalToLogical, cancellationToken)
+                        fs, add.Path, add.PartitionValues, deleted, CdfConfig.Insert, version,
+                        commitTimestamp, readOptions, physicalToLogical, logicalToPhysical,
+                        partitionColumns, arrowSchema, cancellationToken)
                         .ConfigureAwait(false))
                     {
                         yield return batch;
@@ -128,11 +156,16 @@ internal static class CdfReader
     private static async IAsyncEnumerable<RecordBatch> ReadDataFileAsChangesAsync(
         ITableFileSystem fs,
         string path,
+        IReadOnlyDictionary<string, string> partitionValues,
+        HashSet<long>? deletedRows,
         string changeType,
         long commitVersion,
         long? commitTimestamp,
         ParquetReadOptions? readOptions,
         Dictionary<string, string>? physicalToLogical,
+        Dictionary<string, string>? logicalToPhysical,
+        IReadOnlyList<string> partitionColumns,
+        Apache.Arrow.Schema arrowSchema,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         // Try to read the file — it may have been deleted already
@@ -143,6 +176,7 @@ internal static class CdfReader
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
 
+        long batchStartRow = 0;
         await foreach (var batch in reader.ReadAllAsync(
             cancellationToken: cancellationToken).ConfigureAwait(false))
         {
@@ -154,10 +188,30 @@ internal static class CdfReader
             // across change batches otherwise breaks strict consumers / the Arrow C-stream boundary).
             (cleanBatch, _) = RowTracking.RowTrackingWriter.StripRowIdColumn(cleanBatch);
 
+            // Exclude rows the file's deletion vector had already deleted — they are not part of THIS change
+            // (they were reported as deletes when the DV was committed). Positions are file-absolute.
+            long physicalRows = batch.Length;
+            if (deletedRows is not null)
+            {
+                cleanBatch = DeletionVectors.DeletionVectorFilter.Filter(cleanBatch, deletedRows, batchStartRow);
+            }
+            batchStartRow += physicalRows;
+            if (cleanBatch.Length == 0)
+                continue;
+
             // Column mapping: a DATA file stores physical column names — rename back to the logical names so
             // the change rows match the table schema (no-op without mapping / for already-logical batches).
             if (physicalToLogical is { Count: > 0 })
                 cleanBatch = Schema.ColumnMapping.RenameColumns(cleanBatch, physicalToLogical);
+
+            // A partitioned table's DATA files exclude the partition columns — re-add them as constant arrays
+            // from the action's partitionValues (dual logical|physical key lookup, like the normal read path),
+            // so the feed's user columns match the table schema.
+            if (partitionColumns.Count > 0)
+            {
+                cleanBatch = Partitioning.PartitionUtils.AddPartitionColumns(
+                    cleanBatch, arrowSchema, partitionValues, partitionColumns, logicalToPhysical);
+            }
 
             // Add _change_type, _commit_version, _commit_timestamp
             var withChangeType = CdfWriter.AddChangeTypeColumn(cleanBatch, changeType);
