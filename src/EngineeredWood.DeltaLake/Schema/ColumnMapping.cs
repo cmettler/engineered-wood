@@ -55,13 +55,15 @@ public static class ColumnMapping
     }
 
     /// <summary>
-    /// Gets the physical name for a field. In <c>name</c> mode, this is the
-    /// <c>delta.columnMapping.physicalName</c> metadata value. In other modes,
-    /// it is the logical name.
+    /// Gets the physical name for a field: the <c>delta.columnMapping.physicalName</c> metadata value whenever
+    /// column mapping is enabled (BOTH <c>name</c> and <c>id</c> mode — per the Delta protocol, writers must
+    /// write data files using the physical column names in both modes; <c>id</c> mode additionally stamps the
+    /// parquet <c>field_id</c>, which is what id-mode READERS resolve by). Without column mapping, the logical
+    /// name is the physical name.
     /// </summary>
     public static string GetPhysicalName(StructField field, ColumnMappingMode mode)
     {
-        if (mode == ColumnMappingMode.Name &&
+        if (mode != ColumnMappingMode.None &&
             field.Metadata is not null &&
             field.Metadata.TryGetValue(PhysicalNameKey, out string? physicalName))
         {
@@ -195,14 +197,15 @@ public static class ColumnMapping
         $"col-{Guid.NewGuid():N}";
 
     /// <summary>
-    /// Builds a mapping from physical column names to logical column names
-    /// for the given schema in <c>name</c> mode.
+    /// Builds a mapping from physical column names to logical column names for the given schema.
+    /// Populated whenever column mapping is enabled (<c>name</c> OR <c>id</c> mode — data files use
+    /// physical names in both); empty without mapping.
     /// </summary>
     public static Dictionary<string, string> BuildPhysicalToLogicalMap(
         StructType schema, ColumnMappingMode mode)
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
-        if (mode != ColumnMappingMode.Name)
+        if (mode == ColumnMappingMode.None)
             return map;
 
         foreach (var field in schema.Fields)
@@ -215,14 +218,15 @@ public static class ColumnMapping
     }
 
     /// <summary>
-    /// Builds a mapping from logical column names to physical column names
-    /// for the given schema in <c>name</c> mode.
+    /// Builds a mapping from logical column names to physical column names for the given schema.
+    /// Populated whenever column mapping is enabled (<c>name</c> OR <c>id</c> mode — data files use
+    /// physical names in both); empty without mapping.
     /// </summary>
     public static Dictionary<string, string> BuildLogicalToPhysicalMap(
         StructType schema, ColumnMappingMode mode)
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
-        if (mode != ColumnMappingMode.Name)
+        if (mode == ColumnMappingMode.None)
             return map;
 
         foreach (var field in schema.Fields)
@@ -321,10 +325,8 @@ public static class ColumnMapping
     {
         foreach (var field in deltaSchema.Fields)
         {
-            // In "name" mode, the Arrow field uses the physical name
-            string matchName = mode == ColumnMappingMode.Name
-                ? GetPhysicalName(field, mode)
-                : field.Name;
+            // With column mapping (either mode) the Arrow batch was renamed to PHYSICAL names before writing.
+            string matchName = GetPhysicalName(field, mode);
 
             if (matchName == arrowFieldName)
                 return GetFieldId(field);

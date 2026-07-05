@@ -29,6 +29,7 @@ internal static class CdfReader
         long startVersion,
         long endVersion,
         ParquetReadOptions? readOptions,
+        Dictionary<string, string>? physicalToLogical = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         for (long version = startVersion; version <= endVersion; version++)
@@ -57,7 +58,7 @@ internal static class CdfReader
                 {
                     await foreach (var batch in ReadCdcFileAsync(
                         fs, cdcFile, version, commitTimestamp, readOptions,
-                        cancellationToken).ConfigureAwait(false))
+                        physicalToLogical, cancellationToken).ConfigureAwait(false))
                     {
                         yield return batch;
                     }
@@ -76,7 +77,7 @@ internal static class CdfReader
                 {
                     await foreach (var batch in ReadDataFileAsChangesAsync(
                         fs, remove.Path, CdfConfig.Delete, version,
-                        commitTimestamp, readOptions, cancellationToken)
+                        commitTimestamp, readOptions, physicalToLogical, cancellationToken)
                         .ConfigureAwait(false))
                     {
                         yield return batch;
@@ -88,7 +89,7 @@ internal static class CdfReader
                 {
                     await foreach (var batch in ReadDataFileAsChangesAsync(
                         fs, add.Path, CdfConfig.Insert, version,
-                        commitTimestamp, readOptions, cancellationToken)
+                        commitTimestamp, readOptions, physicalToLogical, cancellationToken)
                         .ConfigureAwait(false))
                     {
                         yield return batch;
@@ -104,6 +105,7 @@ internal static class CdfReader
         long commitVersion,
         long? commitTimestamp,
         ParquetReadOptions? readOptions,
+        Dictionary<string, string>? physicalToLogical,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         await using var file = await fs.OpenReadAsync(cdcFile.Path, cancellationToken)
@@ -113,8 +115,13 @@ internal static class CdfReader
         await foreach (var batch in reader.ReadAllAsync(
             cancellationToken: cancellationToken).ConfigureAwait(false))
         {
-            // CDC files already have _change_type — add version and timestamp columns
-            yield return AddMetadataColumns(batch, commitVersion, commitTimestamp);
+            // CDC files already have _change_type — add version and timestamp columns. Column mapping: rename any
+            // physical column names back to logical (a Spark-written _change_data file uses physical names; our
+            // own CDC files are written from logical batches, so this no-ops).
+            var b = physicalToLogical is { Count: > 0 }
+                ? Schema.ColumnMapping.RenameColumns(batch, physicalToLogical)
+                : batch;
+            yield return AddMetadataColumns(b, commitVersion, commitTimestamp);
         }
     }
 
@@ -125,6 +132,7 @@ internal static class CdfReader
         long commitVersion,
         long? commitTimestamp,
         ParquetReadOptions? readOptions,
+        Dictionary<string, string>? physicalToLogical,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         // Try to read the file — it may have been deleted already
@@ -145,6 +153,11 @@ internal static class CdfReader
             // inferred change rows share the user-column schema with cdc-file-derived rows (a 6-vs-5-col mismatch
             // across change batches otherwise breaks strict consumers / the Arrow C-stream boundary).
             (cleanBatch, _) = RowTracking.RowTrackingWriter.StripRowIdColumn(cleanBatch);
+
+            // Column mapping: a DATA file stores physical column names — rename back to the logical names so
+            // the change rows match the table schema (no-op without mapping / for already-logical batches).
+            if (physicalToLogical is { Count: > 0 })
+                cleanBatch = Schema.ColumnMapping.RenameColumns(cleanBatch, physicalToLogical);
 
             // Add _change_type, _commit_version, _commit_timestamp
             var withChangeType = CdfWriter.AddChangeTypeColumn(cleanBatch, changeType);

@@ -45,6 +45,25 @@ internal static class CompactionExecutor
         var targetSchema = SchemaConverter.ToArrowSchema(
             DeltaSchemaSerializer.Parse(snapshot.Metadata.SchemaString));
 
+        // Column mapping: the data files store PHYSICAL column names (both name and id mode), and the compacted
+        // file must keep them + re-stamp each column's parquet field_id (readers resolve by physicalName/field_id;
+        // a compacted file without them would read as all-NULL). Widening therefore matches on the
+        // physical-renamed schema, and each batch is rebuilt CLEAN (reader field metadata dropped) before
+        // SetParquetFieldIds — re-stamping over reader-carried metadata malforms the footer.
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        if (mappingMode != ColumnMappingMode.None)
+        {
+            var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+            var physFields = new List<Field>(targetSchema.FieldsList.Count);
+            foreach (var f in targetSchema.FieldsList)
+            {
+                physFields.Add(logicalToPhysical.TryGetValue(f.Name, out var p) && p != f.Name
+                    ? new Field(p, f.DataType, f.IsNullable)
+                    : f);
+            }
+            targetSchema = new Apache.Arrow.Schema(physFields, null);
+        }
+
         // When the table declares materialized row tracking, compaction must PRESERVE each row's ORIGINAL stable
         // id AND commit version — rows from several source files mix into one compacted file, so the compacted
         // add's single baseRowId / defaultRowCommitVersion cannot represent them. Materialize both columns from
@@ -113,8 +132,28 @@ internal static class CompactionExecutor
                 batchStartRow += physicalRows;
                 if (userBatch.Length == 0)
                     continue; // whole batch was deleted
+                // Reconcile each source batch to the current (physical, under mapping) schema FIRST: candidate
+                // files of different vintages differ after ADD/DROP COLUMN — a missing column backfills NULL, a
+                // dropped one is removed — so every batch shares ONE column set (row count unchanged → the
+                // materialized id/version arrays stay aligned; widening below indexes against the full schema).
+                var outBatch = DeltaTable.BackfillMissingColumns(userBatch, targetSchema.FieldsList);
                 // Widen values from old files to match current schema (row order/count preserved → ids stay aligned)
-                allBatches.Add(TypeWidening.ValueWidener.WidenBatch(userBatch, targetSchema));
+                outBatch = TypeWidening.ValueWidener.WidenBatch(outBatch, targetSchema);
+                if (mappingMode != ColumnMappingMode.None)
+                {
+                    // Rebuild with a CLEAN schema (drop reader-carried field metadata), then stamp the field_ids
+                    // so the compacted file keeps the column-mapping identity its readers resolve by.
+                    var cleanFields = new List<Field>(outBatch.Schema.FieldsList.Count);
+                    foreach (var f in outBatch.Schema.FieldsList)
+                        cleanFields.Add(new Field(f.Name, f.DataType, f.IsNullable));
+                    var cleanArrays = new List<IArrowArray>(outBatch.ColumnCount);
+                    for (int c = 0; c < outBatch.ColumnCount; c++)
+                        cleanArrays.Add(outBatch.Column(c));
+                    outBatch = new RecordBatch(
+                        new Apache.Arrow.Schema(cleanFields, null), cleanArrays, outBatch.Length);
+                    outBatch = ColumnMapping.SetParquetFieldIds(outBatch, snapshot.Schema, mappingMode);
+                }
+                allBatches.Add(outBatch);
                 if (materialize)
                 {
                     batchIds!.Add(survivorIds!);
