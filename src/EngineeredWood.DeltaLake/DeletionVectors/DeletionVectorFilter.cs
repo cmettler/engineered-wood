@@ -149,6 +149,31 @@ public static class DeletionVectorFilter
                 foreach (int r in rows) { if (a.IsNull(r)) b.AppendNull(); else b.Append(a.GetBytes(r)); }
                 return b.Build();
             }
+            case StructArray a:
+            {
+                // A struct's children are aligned with the parent rows but do NOT incorporate the parent's
+                // logical offset (StructArray.Fields wraps Data.Children directly), so child rows are indexed
+                // at parentOffset + r. Each child is taken recursively; the struct's own validity is rebuilt.
+                int off = a.Data.Offset;
+                var childRows = off == 0 ? rows : rows.ConvertAll(r => r + off);
+                var childData = new ArrayData[a.Data.Children.Length];
+                for (int c = 0; c < a.Data.Children.Length; c++)
+                {
+                    childData[c] = TakeRows(ArrowArrayFactory.BuildArray(a.Data.Children[c]), childRows).Data;
+                }
+                var validity = new ArrowBuffer.BitmapBuilder(rows.Count);
+                int nullCount = 0;
+                foreach (int r in rows)
+                {
+                    bool isNull = a.IsNull(r);
+                    validity.Append(!isNull);
+                    if (isNull)
+                        nullCount++;
+                }
+                var data = new ArrayData(a.Data.DataType, rows.Count, nullCount, 0,
+                                         new[] { validity.Build() }, childData);
+                return ArrowArrayFactory.BuildArray(data);
+            }
             default:
             {
                 // Every other fixed-width type (unsigned ints, decimals, Date/Time/Timestamp, HalfFloat,

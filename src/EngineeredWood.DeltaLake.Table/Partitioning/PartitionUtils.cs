@@ -322,6 +322,31 @@ internal static class PartitionUtils
                 foreach (int r in rows) { if (bin.IsNull(r)) b.AppendNull(); else b.Append(bin.GetBytes(r)); }
                 return b.Build();
             }
+            case StructArray st:
+            {
+                // A struct's children are aligned with the parent rows but do NOT incorporate the parent's
+                // logical offset (StructArray.Fields wraps Data.Children directly), so child rows are indexed
+                // at parentOffset + r. Each child is taken recursively; the struct's own validity is rebuilt.
+                int off = st.Data.Offset;
+                var childRows = off == 0 ? rows : rows.ConvertAll(r => r + off);
+                var childData = new ArrayData[st.Data.Children.Length];
+                for (int c = 0; c < st.Data.Children.Length; c++)
+                {
+                    childData[c] = TakeRows(ArrowArrayFactory.BuildArray(st.Data.Children[c]), childRows).Data;
+                }
+                var validity = new ArrowBuffer.BitmapBuilder(rows.Count);
+                int nullCount = 0;
+                foreach (int r in rows)
+                {
+                    bool isNull = st.IsNull(r);
+                    validity.Append(!isNull);
+                    if (isNull)
+                        nullCount++;
+                }
+                var data = new ArrayData(st.Data.DataType, rows.Count, nullCount, 0,
+                                         new[] { validity.Build() }, childData);
+                return ArrowArrayFactory.BuildArray(data);
+            }
             default:
             {
                 // Every other fixed-width type (unsigned ints, decimals, Time/Duration, HalfFloat,

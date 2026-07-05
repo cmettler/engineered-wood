@@ -2407,12 +2407,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     }
                 }
 
-                // Collect stats from the data batch using logical names
+                // Collect stats from the data batch. Under column mapping the Delta-spec convention keys the
+                // per-file stats by the PHYSICAL column names (matching what the streaming writer emits and what
+                // spec readers use for data skipping) — collect over the top-level-renamed batch (stats cover
+                // top-level primitives only, so the flat rename suffices).
                 // IcebergCompat requires numRecords in stats regardless of options
                 string? stats = null;
                 if (_options.CollectStats ||
                     Schema.IcebergCompat.RequiresNumRecords(icebergVersion))
-                    stats = CollectStats(dataBatch);
+                    stats = CollectStats(mappingMode != ColumnMappingMode.None
+                        ? ColumnMapping.RenameToPhysical(dataBatch, logicalToPhysical)
+                        : dataBatch);
 
                 actions.Add(new AddFile
                 {
