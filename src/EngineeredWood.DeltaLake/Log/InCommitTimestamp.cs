@@ -66,6 +66,18 @@ public static class InCommitTimestamp
             timestampMs.ToString()).RootElement.Clone();
         values["operation"] = JsonDocument.Parse(
             $"\"{operation}\"").RootElement.Clone();
+        // Standard informational fields Spark/delta-rs write on every commit: engineInfo identifies the
+        // writer (surfaced by history views); operationParameters must at least be an empty object for
+        // history tooling that expects the key.
+        if (!values.ContainsKey("engineInfo"))
+        {
+            values["engineInfo"] = JsonDocument.Parse(
+                "\"EngineeredWood.DeltaLake\"").RootElement.Clone();
+        }
+        if (!values.ContainsKey("operationParameters"))
+        {
+            values["operationParameters"] = JsonDocument.Parse("{}").RootElement.Clone();
+        }
         if (includeInCommitTimestamp)
         {
             values["inCommitTimestamp"] = JsonDocument.Parse(

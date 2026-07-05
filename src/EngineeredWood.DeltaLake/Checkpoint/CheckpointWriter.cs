@@ -122,12 +122,20 @@ public sealed class CheckpointWriter
         {
             new Field("minReaderVersion", Int32Type.Default, true),
             new Field("minWriterVersion", Int32Type.Default, true),
+            // Required by the spec (and strict readers) when minReaderVersion==3 / minWriterVersion==7:
+            // a checkpoint that drops the feature lists corrupts the table protocol on replay.
+            new Field("readerFeatures", new ListType(new Field("element", StringType.Default, false)), true),
+            new Field("writerFeatures", new ListType(new Field("element", StringType.Default, false)), true),
         });
 
         // Format struct for metaData
         var formatType = new ArrowStructType(new List<Field>
         {
             new Field("provider", StringType.Default, true),
+            // REQUIRED by strict readers (delta-kernel): format.options must exist (an empty map).
+            new Field("options", new ArrowMapType(
+                new Field("key", StringType.Default, false),
+                new Field("value", StringType.Default, true)), true),
         });
 
         // MetaData struct
@@ -145,7 +153,17 @@ public sealed class CheckpointWriter
                 new Field("value", StringType.Default, true)), true),
         });
 
-        // Add struct
+        // Add struct. deletionVector + baseRowId/defaultRowCommitVersion MUST be preserved: a checkpoint
+        // that drops the DV resurrects the deleted rows for every reader replaying from it, and dropping the
+        // row-tracking fields breaks stable row ids past the checkpoint.
+        var dvType = new ArrowStructType(new List<Field>
+        {
+            new Field("storageType", StringType.Default, true),
+            new Field("pathOrInlineDv", StringType.Default, true),
+            new Field("offset", Int32Type.Default, true),
+            new Field("sizeInBytes", Int32Type.Default, true),
+            new Field("cardinality", Int64Type.Default, true),
+        });
         var addType = new ArrowStructType(new List<Field>
         {
             new Field("path", StringType.Default, true),
@@ -156,6 +174,9 @@ public sealed class CheckpointWriter
             new Field("modificationTime", Int64Type.Default, true),
             new Field("dataChange", BooleanType.Default, true),
             new Field("stats", StringType.Default, true),
+            new Field("deletionVector", dvType, true),
+            new Field("baseRowId", Int64Type.Default, true),
+            new Field("defaultRowCommitVersion", Int64Type.Default, true),
         });
 
         // Remove struct
@@ -199,12 +220,40 @@ public sealed class CheckpointWriter
 
     #region Array Builders
 
+    // Validity bitmap for a top-level action struct: TRUE exactly on the rows of that action type. The spec
+    // checkpoint schema makes each action struct NULLABLE (null on rows of other action types) with required
+    // fields inside — strict readers (delta-kernel) reject an always-present struct with null required
+    // children ("unmasked nulls for non-nullable field"). Relies on the parquet writer handling nullable
+    // structs correctly (the NestedLevelWriter null-struct fix).
+    private static (ArrowBuffer Bitmap, int NullCount) BuildActionValidity<T>(
+        List<DeltaAction> actions, int count) where T : DeltaAction
+    {
+        var validity = new ArrowBuffer.BitmapBuilder(count);
+        int nullCount = 0;
+        for (int i = 0; i < count; i++)
+        {
+            bool isType = actions[i] is T;
+            validity.Append(isType);
+            if (!isType)
+                nullCount++;
+        }
+        return (validity.Build(), nullCount);
+    }
+
     private static StructArray BuildProtocolColumn(List<DeltaAction> actions, int count)
     {
-        // Use nullable inner fields; non-protocol rows have null inner values.
-        // Struct itself is always non-null to avoid Parquet nested null issues.
         var minReaderBuilder = new Int32Array.Builder();
         var minWriterBuilder = new Int32Array.Builder();
+        var rfOffsets = new ArrowBuffer.Builder<int>();
+        var rfValues = new StringArray.Builder();
+        var rfValidity = new ArrowBuffer.BitmapBuilder(count);
+        int rfNulls = 0, rfOffset = 0;
+        var wfOffsets = new ArrowBuffer.Builder<int>();
+        var wfValues = new StringArray.Builder();
+        var wfValidity = new ArrowBuffer.BitmapBuilder(count);
+        int wfNulls = 0, wfOffset = 0;
+        rfOffsets.Append(0);
+        wfOffsets.Append(0);
 
         for (int i = 0; i < count; i++)
         {
@@ -212,25 +261,70 @@ public sealed class CheckpointWriter
             {
                 minReaderBuilder.Append(p.MinReaderVersion);
                 minWriterBuilder.Append(p.MinWriterVersion);
+                if (p.ReaderFeatures is { } rf)
+                {
+                    foreach (var f in rf)
+                    {
+                        rfValues.Append(f);
+                        rfOffset++;
+                    }
+                    rfValidity.Append(true);
+                }
+                else
+                {
+                    rfValidity.Append(false);
+                    rfNulls++;
+                }
+                rfOffsets.Append(rfOffset);
+                if (p.WriterFeatures is { } wf)
+                {
+                    foreach (var f in wf)
+                    {
+                        wfValues.Append(f);
+                        wfOffset++;
+                    }
+                    wfValidity.Append(true);
+                }
+                else
+                {
+                    wfValidity.Append(false);
+                    wfNulls++;
+                }
+                wfOffsets.Append(wfOffset);
             }
             else
             {
                 minReaderBuilder.AppendNull();
                 minWriterBuilder.AppendNull();
+                rfValidity.Append(false);
+                rfNulls++;
+                rfOffsets.Append(rfOffset);
+                wfValidity.Append(false);
+                wfNulls++;
+                wfOffsets.Append(wfOffset);
             }
         }
+
+        var featureListType = new ListType(new Field("element", StringType.Default, false));
+        var rfList = new ListArray(featureListType, count, rfOffsets.Build(), rfValues.Build(),
+            rfValidity.Build(), rfNulls);
+        var wfList = new ListArray(featureListType, count, wfOffsets.Build(), wfValues.Build(),
+            wfValidity.Build(), wfNulls);
 
         var fields = new List<Field>
         {
             new Field("minReaderVersion", Int32Type.Default, true),
             new Field("minWriterVersion", Int32Type.Default, true),
+            new Field("readerFeatures", featureListType, true),
+            new Field("writerFeatures", featureListType, true),
         };
 
+        var (validity, nullCount) = BuildActionValidity<ProtocolAction>(actions, count);
         return new StructArray(
             new ArrowStructType(fields),
             count,
-            [minReaderBuilder.Build(), minWriterBuilder.Build()],
-            ArrowBuffer.Empty, 0);
+            [minReaderBuilder.Build(), minWriterBuilder.Build(), rfList, wfList],
+            validity, nullCount);
     }
 
     private static StructArray BuildMetadataColumn(List<DeltaAction> actions, int count)
@@ -299,14 +393,32 @@ public sealed class CheckpointWriter
             }
         }
 
+        // format.options: always-empty map (REQUIRED field for strict readers — delta-kernel rejects a
+        // checkpoint whose format struct lacks it).
+        var optMapType = new ArrowMapType(
+            new Field("key", StringType.Default, false),
+            new Field("value", StringType.Default, true));
+        var optOffsets = new ArrowBuffer.Builder<int>();
+        for (int i = 0; i <= count; i++)
+        {
+            optOffsets.Append(0);
+        }
+        var optEntries = new StructArray(
+            new ArrowStructType(new List<Field> { optMapType.KeyField, optMapType.ValueField }),
+            0,
+            new IArrowArray[] { new StringArray.Builder().Build(), new StringArray.Builder().Build() },
+            ArrowBuffer.Empty);
+        var optMap = new MapArray(optMapType, count, optOffsets.Build(), optEntries, ArrowBuffer.Empty, 0);
+
         var formatFields = new List<Field>
         {
             new Field("provider", StringType.Default, true),
+            new Field("options", optMapType, true),
         };
         var formatStruct = new StructArray(
             new ArrowStructType(formatFields),
             count,
-            [formatProviderBuilder.Build()],
+            [formatProviderBuilder.Build(), optMap],
             ArrowBuffer.Empty, 0);
 
         var partColList = new ListArray(
@@ -343,13 +455,14 @@ public sealed class CheckpointWriter
                 new Field("value", StringType.Default, true)), true),
         };
 
+        var (validity, nullCount) = BuildActionValidity<MetadataAction>(actions, count);
         return new StructArray(
             new ArrowStructType(fields),
             count,
             [idBuilder.Build(), nameBuilder.Build(), descBuilder.Build(),
              formatStruct, schemaStringBuilder.Build(), partColList,
              createdTimeBuilder.Build(), configMap],
-            ArrowBuffer.Empty, 0);
+            validity, nullCount);
     }
 
     private static StructArray BuildAddColumn(List<DeltaAction> actions, int count)
@@ -359,6 +472,13 @@ public sealed class CheckpointWriter
         var modTimeBuilder = new Int64Array.Builder();
         var dataChangeBuilder = new BooleanArray.Builder();
         var statsBuilder = new StringArray.Builder();
+        var dvStorageBuilder = new StringArray.Builder();
+        var dvPathBuilder = new StringArray.Builder();
+        var dvOffsetBuilder = new Int32Array.Builder();
+        var dvSizeBuilder = new Int32Array.Builder();
+        var dvCardBuilder = new Int64Array.Builder();
+        var baseRowIdBuilder = new Int64Array.Builder();
+        var defaultRcvBuilder = new Int64Array.Builder();
 
         // partitionValues map
         var pvOffsetsBuilder = new ArrowBuffer.Builder<int>();
@@ -383,10 +503,32 @@ public sealed class CheckpointWriter
                 foreach (var kvp in a.PartitionValues)
                 {
                     pvKeys.Append(kvp.Key);
-                    pvValues.Append(kvp.Value);
+                    if (kvp.Value is null)
+                        pvValues.AppendNull();
+                    else
+                        pvValues.Append(kvp.Value);
                     pvOffset++;
                 }
                 pvOffsetsBuilder.Append(pvOffset);
+
+                if (a.DeletionVector is { } dv)
+                {
+                    dvStorageBuilder.Append(dv.StorageType);
+                    dvPathBuilder.Append(dv.PathOrInlineDv);
+                    if (dv.Offset is { } off) dvOffsetBuilder.Append(off); else dvOffsetBuilder.AppendNull();
+                    dvSizeBuilder.Append(dv.SizeInBytes);
+                    dvCardBuilder.Append(dv.Cardinality);
+                }
+                else
+                {
+                    dvStorageBuilder.AppendNull();
+                    dvPathBuilder.AppendNull();
+                    dvOffsetBuilder.AppendNull();
+                    dvSizeBuilder.AppendNull();
+                    dvCardBuilder.AppendNull();
+                }
+                if (a.BaseRowId is { } bri) baseRowIdBuilder.Append(bri); else baseRowIdBuilder.AppendNull();
+                if (a.DefaultRowCommitVersion is { } rcv) defaultRcvBuilder.Append(rcv); else defaultRcvBuilder.AppendNull();
             }
             else
             {
@@ -396,6 +538,13 @@ public sealed class CheckpointWriter
                 dataChangeBuilder.AppendNull();
                 statsBuilder.AppendNull();
                 pvOffsetsBuilder.Append(pvOffset);
+                dvStorageBuilder.AppendNull();
+                dvPathBuilder.AppendNull();
+                dvOffsetBuilder.AppendNull();
+                dvSizeBuilder.AppendNull();
+                dvCardBuilder.AppendNull();
+                baseRowIdBuilder.AppendNull();
+                defaultRcvBuilder.AppendNull();
             }
         }
 
@@ -412,6 +561,32 @@ public sealed class CheckpointWriter
         var pvMap = new MapArray(pvMapType, count,
             pvOffsetsBuilder.Build(), pvEntries, ArrowBuffer.Empty, 0);
 
+        var dvFields = new List<Field>
+        {
+            new Field("storageType", StringType.Default, true),
+            new Field("pathOrInlineDv", StringType.Default, true),
+            new Field("offset", Int32Type.Default, true),
+            new Field("sizeInBytes", Int32Type.Default, true),
+            new Field("cardinality", Int64Type.Default, true),
+        };
+        // The dv struct is NULLABLE (present only where the add carries a deletion vector) — its fields are
+        // required in strict readers, so an always-present struct with null children is rejected.
+        var dvValidity = new ArrowBuffer.BitmapBuilder(count);
+        int dvNulls = 0;
+        for (int i = 0; i < count; i++)
+        {
+            bool hasDv = actions[i] is AddFile af && af.DeletionVector is not null;
+            dvValidity.Append(hasDv);
+            if (!hasDv)
+                dvNulls++;
+        }
+        var dvStruct = new StructArray(
+            new ArrowStructType(dvFields),
+            count,
+            [dvStorageBuilder.Build(), dvPathBuilder.Build(), dvOffsetBuilder.Build(),
+             dvSizeBuilder.Build(), dvCardBuilder.Build()],
+            dvValidity.Build(), dvNulls);
+
         var fields = new List<Field>
         {
             new Field("path", StringType.Default, true),
@@ -422,14 +597,19 @@ public sealed class CheckpointWriter
             new Field("modificationTime", Int64Type.Default, true),
             new Field("dataChange", BooleanType.Default, true),
             new Field("stats", StringType.Default, true),
+            new Field("deletionVector", new ArrowStructType(dvFields), true),
+            new Field("baseRowId", Int64Type.Default, true),
+            new Field("defaultRowCommitVersion", Int64Type.Default, true),
         };
 
+        var (validity, nullCount) = BuildActionValidity<AddFile>(actions, count);
         return new StructArray(
             new ArrowStructType(fields),
             count,
             [pathBuilder.Build(), pvMap, sizeBuilder.Build(),
-             modTimeBuilder.Build(), dataChangeBuilder.Build(), statsBuilder.Build()],
-            ArrowBuffer.Empty, 0);
+             modTimeBuilder.Build(), dataChangeBuilder.Build(), statsBuilder.Build(),
+             dvStruct, baseRowIdBuilder.Build(), defaultRcvBuilder.Build()],
+            validity, nullCount);
     }
 
     private static StructArray BuildRemoveColumn(int count)
@@ -453,10 +633,15 @@ public sealed class CheckpointWriter
             new Field("dataChange", BooleanType.Default, true),
         };
 
+        var removeValidity = new ArrowBuffer.BitmapBuilder(count);
+        for (int i = 0; i < count; i++)
+        {
+            removeValidity.Append(false);
+        }
         return new StructArray(
             new ArrowStructType(fields), count,
             [pathBuilder.Build(), tsBuilder.Build(), dcBuilder.Build()],
-            ArrowBuffer.Empty, 0);
+            removeValidity.Build(), count);
     }
 
     private static StructArray BuildTxnColumn(List<DeltaAction> actions, int count)
@@ -488,10 +673,11 @@ public sealed class CheckpointWriter
             new Field("lastUpdated", Int64Type.Default, true),
         };
 
+        var (validity, nullCount) = BuildActionValidity<TransactionId>(actions, count);
         return new StructArray(
             new ArrowStructType(fields), count,
             [appIdBuilder.Build(), versionBuilder.Build(), lastUpdatedBuilder.Build()],
-            ArrowBuffer.Empty, 0);
+            validity, nullCount);
     }
 
     private static StructArray BuildDomainMetadataColumn(List<DeltaAction> actions, int count)
@@ -523,10 +709,11 @@ public sealed class CheckpointWriter
             new Field("removed", BooleanType.Default, true),
         };
 
+        var (validity, nullCount) = BuildActionValidity<Actions.DomainMetadata>(actions, count);
         return new StructArray(
             new ArrowStructType(fields), count,
             [domainBuilder.Build(), configBuilder.Build(), removedBuilder.Build()],
-            ArrowBuffer.Empty, 0);
+            validity, nullCount);
     }
 
     #endregion

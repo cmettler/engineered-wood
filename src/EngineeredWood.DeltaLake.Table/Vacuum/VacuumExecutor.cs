@@ -25,7 +25,10 @@ internal static class VacuumExecutor
         // Collect all referenced file paths from the current snapshot
         var referencedPaths = new HashSet<string>(StringComparer.Ordinal);
         foreach (var addFile in snapshot.ActiveFiles.Values)
+        {
             referencedPaths.Add(addFile.Path);
+            referencedPaths.Add(DeltaPath.Decode(addFile.Path)); // on-disk name (add.path is URL-encoded)
+        }
 
         // List all data files in the table directory
         // Data files are Parquet files not in _delta_log/

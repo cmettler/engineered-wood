@@ -43,9 +43,11 @@ internal static class PartitionUtils
 
             for (int p = 0; p < partitionColumns.Count; p++)
             {
-                string value = GetStringValue(batch.Column(partColIndices[p]), row) ?? "__HIVE_DEFAULT_PARTITION__";
-                partValues[partitionColumns[p]] = value;
-                keyParts[p] = value;
+                // A null partition value is stored as JSON null in add.partitionValues (the Delta spec /
+                // Spark convention); __HIVE_DEFAULT_PARTITION__ is only the DIRECTORY name.
+                string? value = GetStringValue(batch.Column(partColIndices[p]), row);
+                partValues[partitionColumns[p]] = value!;
+                keyParts[p] = value ?? "__HIVE_DEFAULT_PARTITION__";
             }
 
             string groupKey = string.Join("\0", keyParts);
@@ -84,7 +86,8 @@ internal static class PartitionUtils
             return "";
 
         return string.Join("/",
-            partitionValues.Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
+            partitionValues.Select(kv =>
+                $"{DeltaPath.EscapePathName(kv.Key)}={(kv.Value is null ? "__HIVE_DEFAULT_PARTITION__" : DeltaPath.EscapePathName(kv.Value))}"));
     }
 
     /// <summary>
@@ -116,12 +119,13 @@ internal static class PartitionUtils
 
             if (partColSet.Contains(field.Name))
             {
-                // Build a constant array from the partition value (logical key, else the physical key)
+                // Build a constant array from the partition value (logical key, else the physical key).
+                // A missing key means the writer omitted it — treated as null, like a JSON-null value.
                 if (!partitionValues.TryGetValue(field.Name, out var v)
                     && (logicalToPhysical is null || !logicalToPhysical.TryGetValue(field.Name, out var phys)
                         || !partitionValues.TryGetValue(phys, out v)))
                 {
-                    v = "";
+                    v = null;
                 }
                 columns.Add(BuildConstantArray(field.DataType, v, dataBatch.Length));
                 fields.Add(field);
@@ -180,7 +184,7 @@ internal static class PartitionUtils
             string physicalName = logicalToPhysical.TryGetValue(partCol, out string? pn)
                 ? pn : partCol;
 
-            string value = partitionValues.TryGetValue(partCol, out var v) ? v : "";
+            string? value = partitionValues.TryGetValue(partCol, out var v) ? v : null;
             columns.Add(BuildConstantArray(arrowType, value, dataBatch.Length));
             fields.Add(new Field(physicalName, arrowType, deltaField.Nullable));
         }
@@ -420,85 +424,157 @@ internal static class PartitionUtils
         {
             StringArray sa => sa.GetString(row),
             LargeStringArray lsa => lsa.GetString(row),
-            Int64Array i64 => i64.GetValue(row)!.Value.ToString(),
-            Int32Array i32 => i32.GetValue(row)!.Value.ToString(),
-            Int16Array i16 => i16.GetValue(row)!.Value.ToString(),
-            Int8Array i8 => i8.GetValue(row)!.Value.ToString(),
-            DoubleArray d => d.GetValue(row)!.Value.ToString(),
-            FloatArray f => f.GetValue(row)!.Value.ToString(),
+            Int64Array i64 => i64.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Int32Array i32 => i32.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Int16Array i16 => i16.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Int8Array i8 => i8.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            DoubleArray d => d.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            FloatArray f => f.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
             BooleanArray b => b.GetValue(row)!.Value ? "true" : "false",
             Date32Array d32 => DateTimeOffset.FromUnixTimeSeconds(
                 d32.GetValue(row)!.Value * 86400L).ToString("yyyy-MM-dd"),
             TimestampArray ts => FormatTimestampPartitionValue(ts, row),
-            _ => array.ToString() ?? "",
+            // Spec dot-notation decimal string.
+            Decimal128Array dec => dec.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            // A type we cannot encode per the spec (binary, nested, ...) must THROW, never fall back to
+            // .ToString() — that silently wrote the .NET type name as the partition value.
+            _ => throw new NotSupportedException(
+                $"Partition values of Arrow type {array.Data.DataType.TypeId} are not supported."),
         };
     }
 
     /// <summary>
     /// Builds a constant-value array of the given type and length.
-    /// Used to materialize partition columns on read.
+    /// Used to materialize partition columns on read. A null <paramref name="value"/>, the
+    /// <c>__HIVE_DEFAULT_PARTITION__</c> directory sentinel (some writers put it into
+    /// <c>partitionValues</c>), or an empty string for a non-string type all decode as SQL NULL.
     /// </summary>
-    private static IArrowArray BuildConstantArray(IArrowType type, string value, int length)
+    private static IArrowArray BuildConstantArray(IArrowType type, string? value, int length)
     {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        bool isNull = value is null
+            || value == "__HIVE_DEFAULT_PARTITION__"
+            || (value.Length == 0 && type is not StringType);
+
         switch (type)
         {
             case StringType:
             {
                 var builder = new StringArray.Builder();
                 for (int i = 0; i < length; i++)
-                    builder.Append(value);
+                {
+                    if (isNull) builder.AppendNull(); else builder.Append(value);
+                }
                 return builder.Build();
             }
             case Int64Type:
             {
-                long v = long.Parse(value);
+                long v = isNull ? 0 : long.Parse(value!, inv);
                 var builder = new Int64Array.Builder();
                 for (int i = 0; i < length; i++)
-                    builder.Append(v);
+                {
+                    if (isNull) builder.AppendNull(); else builder.Append(v);
+                }
                 return builder.Build();
             }
             case Int32Type:
             {
-                int v = int.Parse(value);
+                int v = isNull ? 0 : int.Parse(value!, inv);
                 var builder = new Int32Array.Builder();
                 for (int i = 0; i < length; i++)
-                    builder.Append(v);
+                {
+                    if (isNull) builder.AppendNull(); else builder.Append(v);
+                }
+                return builder.Build();
+            }
+            case Int16Type:
+            {
+                short v = isNull ? (short)0 : short.Parse(value!, inv);
+                var builder = new Int16Array.Builder();
+                for (int i = 0; i < length; i++)
+                {
+                    if (isNull) builder.AppendNull(); else builder.Append(v);
+                }
+                return builder.Build();
+            }
+            case Int8Type:
+            {
+                sbyte v = isNull ? (sbyte)0 : sbyte.Parse(value!, inv);
+                var builder = new Int8Array.Builder();
+                for (int i = 0; i < length; i++)
+                {
+                    if (isNull) builder.AppendNull(); else builder.Append(v);
+                }
+                return builder.Build();
+            }
+            case DoubleType:
+            {
+                double v = isNull ? 0 : double.Parse(value!, inv);
+                var builder = new DoubleArray.Builder();
+                for (int i = 0; i < length; i++)
+                {
+                    if (isNull) builder.AppendNull(); else builder.Append(v);
+                }
+                return builder.Build();
+            }
+            case FloatType:
+            {
+                float v = isNull ? 0 : float.Parse(value!, inv);
+                var builder = new FloatArray.Builder();
+                for (int i = 0; i < length; i++)
+                {
+                    if (isNull) builder.AppendNull(); else builder.Append(v);
+                }
+                return builder.Build();
+            }
+            case Decimal128Type decType:
+            {
+                decimal v = isNull ? 0m : decimal.Parse(value!, System.Globalization.NumberStyles.Number, inv);
+                var builder = new Decimal128Array.Builder(decType);
+                for (int i = 0; i < length; i++)
+                {
+                    if (isNull) builder.AppendNull(); else builder.Append(v);
+                }
                 return builder.Build();
             }
             case Date32Type:
             {
-                // Parse "yyyy-MM-dd" to days since epoch
-                var dt = DateTimeOffset.Parse(value);
-                int days = (int)(dt.ToUnixTimeSeconds() / 86400);
+                // "yyyy-MM-dd"
+                var dt = isNull ? default : DateTime.Parse(value!, inv,
+                    System.Globalization.DateTimeStyles.None);
                 var builder = new Date32Array.Builder();
                 for (int i = 0; i < length; i++)
-                    builder.Append(dt.DateTime);
+                {
+                    if (isNull) builder.AppendNull(); else builder.Append(dt);
+                }
                 return builder.Build();
             }
             case BooleanType:
             {
-                bool v = bool.Parse(value);
+                bool v = !isNull && bool.Parse(value!);
                 var builder = new BooleanArray.Builder();
                 for (int i = 0; i < length; i++)
-                    builder.Append(v);
+                {
+                    if (isNull) builder.AppendNull(); else builder.Append(v);
+                }
                 return builder.Build();
             }
             case TimestampType tsType:
             {
-                var dto = DateTimeOffset.Parse(value);
+                // "yyyy-MM-dd HH:mm:ss[.ffffff]" — no zone suffix; timestamps are stored UTC-normalized.
+                var dto = isNull ? default : DateTimeOffset.Parse(value!, inv,
+                    System.Globalization.DateTimeStyles.AssumeUniversal);
                 var builder = new TimestampArray.Builder(tsType);
                 for (int i = 0; i < length; i++)
-                    builder.Append(dto);
+                {
+                    if (isNull) builder.AppendNull(); else builder.Append(dto);
+                }
                 return builder.Build();
             }
             default:
-            {
-                // Fallback: use string
-                var builder = new StringArray.Builder();
-                for (int i = 0; i < length; i++)
-                    builder.Append(value);
-                return builder.Build();
-            }
+                // Falling back to a string column would mismatch the table schema downstream — throw.
+                throw new NotSupportedException(
+                    $"Partition columns of Arrow type {type.TypeId} are not supported on read.");
         }
     }
 
@@ -519,8 +595,10 @@ internal static class PartitionUtils
         var dto = DateTimeOffset.FromUnixTimeMilliseconds(asMicros / 1_000)
             .AddTicks((asMicros % 1_000) * 10);
 
+        // Both spec-legal forms; Spark omits the fraction when it is zero.
+        string fmt = asMicros % 1_000_000 == 0 ? "yyyy-MM-dd HH:mm:ss" : "yyyy-MM-dd HH:mm:ss.ffffff";
         return tsType.Timezone is not null
-            ? dto.ToString("yyyy-MM-dd HH:mm:ss.ffffff")
-            : dto.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss.ffffff");
+            ? dto.ToString(fmt, System.Globalization.CultureInfo.InvariantCulture)
+            : dto.UtcDateTime.ToString(fmt, System.Globalization.CultureInfo.InvariantCulture);
     }
 }

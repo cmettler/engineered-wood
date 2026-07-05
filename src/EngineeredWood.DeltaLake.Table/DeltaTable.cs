@@ -184,6 +184,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             minWriterVersion = 7;
             writerFeatureSet.Add("changeDataFeed");
         }
+        // timestamp_ntz (a naive TIMESTAMP column) is itself a table feature: the spec requires the
+        // 'timestampNtz' reader+writer feature whenever the schema contains the type — strict readers
+        // (Spark, delta-kernel) reject the table otherwise.
+        if (SchemaUsesTimestampNtz(deltaSchema))
+        {
+            minReaderVersion = 3;
+            minWriterVersion = 7;
+            writerFeatureSet.Add("timestampNtz");
+            readerFeatureList ??= new List<string>();
+            readerFeatureList.Add("timestampNtz");
+        }
         // Column mapping is BOTH a reader and writer feature. In table-features mode (reader v3 / writer v7 —
         // forced by deletionVectors/rowTracking/… above) it MUST be listed in BOTH feature lists, else a strict
         // reader (Spark) rejects the table ("feature enabled in metadata but not listed in protocol"). Absent any
@@ -425,11 +436,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 maxId = System.Math.Max(maxId, cfgMax);
             }
             int newId = maxId + 1;
-            var meta = new Dictionary<string, string>(newDeltaField.Metadata ?? new Dictionary<string, string>())
-            {
-                [ColumnMapping.FieldIdKey] = newId.ToString(),
-                [ColumnMapping.PhysicalNameKey] = $"col-{Guid.NewGuid():N}",
-            };
+            var meta = (newDeltaField.Metadata ?? new Dictionary<string, string>())
+                .ToDictionary(kv => kv.Key, kv => kv.Value);
+            meta[ColumnMapping.FieldIdKey] = newId.ToString();
+            meta[ColumnMapping.PhysicalNameKey] = $"col-{Guid.NewGuid():N}";
             var mappedField = new StructField
             {
                 Name = newDeltaField.Name, Type = newDeltaField.Type,
@@ -438,15 +448,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var fields = new List<StructField>(snapshot.Schema.Fields) { mappedField };
             newSchemaString = DeltaSchemaSerializer.Serialize(
                 new EngineeredWood.DeltaLake.Schema.StructType { Fields = fields });
-            var cfg = config is null ? new Dictionary<string, string>() : new Dictionary<string, string>(config);
+            var cfg = config is null
+                ? new Dictionary<string, string>()
+                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
             cfg[ColumnMapping.MaxColumnIdKey] = newId.ToString();
             newConfig = cfg;
         }
 
-        IReadOnlyList<DeltaAction> actions = new List<DeltaAction>
-        {
-            snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig },
-        };
+        // Adding a naive-timestamp column to a table whose protocol lacks the timestampNtz feature
+        // requires a protocol upgrade in the same commit.
+        var protocolUpgrade = SchemaUsesTimestampNtz(newDeltaField.Type)
+            ? UpgradeProtocolForTimestampNtz(snapshot.Protocol)
+            : null;
+
+        var actionList = new List<DeltaAction>();
+        if (protocolUpgrade is not null)
+            actionList.Add(protocolUpgrade);
+        actionList.Add(snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig });
+        IReadOnlyList<DeltaAction> actions = actionList;
         actions = Log.InCommitTimestamp.EnsureCommitInfo(
             actions, snapshot.Metadata.Configuration, "ADD COLUMNS");
 
@@ -502,7 +521,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
             var (mapped, newMax) = ColumnMapping.AssignColumnMapping(newDeltaSchema, startId);
             newDeltaSchema = mapped;
-            var cfg = config is null ? new Dictionary<string, string>() : new Dictionary<string, string>(config);
+            var cfg = config is null
+                ? new Dictionary<string, string>()
+                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
             cfg[ColumnMapping.MaxColumnIdKey] = newMax.ToString();
             newConfig = cfg;
         }
@@ -513,10 +534,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return snapshot.Version; // identical schema — nothing to commit
         }
 
-        IReadOnlyList<DeltaAction> actions = new List<DeltaAction>
-        {
-            snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig },
-        };
+        var protocolUpgrade = SchemaUsesTimestampNtz(newDeltaSchema)
+            ? UpgradeProtocolForTimestampNtz(snapshot.Protocol)
+            : null;
+
+        var actionList = new List<DeltaAction>();
+        if (protocolUpgrade is not null)
+            actionList.Add(protocolUpgrade);
+        actionList.Add(snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig });
+        IReadOnlyList<DeltaAction> actions = actionList;
         actions = Log.InCommitTimestamp.EnsureCommitInfo(
             actions, snapshot.Metadata.Configuration, "CHANGE COLUMNS");
 
@@ -840,7 +866,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var deletedRowBatches = new List<RecordBatch>(); // For CDC
             long rowOffset = 0;
 
-            await using var file = await _fs.OpenReadAsync(addFile.Path, cancellationToken)
+            await using var file = await _fs.OpenReadAsync(DeltaPath.Decode(addFile.Path), cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new Parquet.ParquetFileReader(
                 file, ownsFile: false, _options.ParquetReadOptions);
@@ -1002,7 +1028,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // present — the rowids came from a scan of this same snapshot).
                 deletedHere = positions.Count;
                 await foreach (var batch in _options.DataFileRewriter!
-                                   .ReadRewriteAsync(ordinal, addFile.Path, positions, cancellationToken)
+                                   .ReadRewriteAsync(ordinal, DeltaPath.Decode(addFile.Path), positions, cancellationToken)
                                    .ConfigureAwait(false))
                     keptBatches.Add(batch);
             }
@@ -1218,7 +1244,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 DataChange = true,
                 DeletionVector = addFile.DeletionVector,
             });
-            actions.Add(addFile with { DeletionVector = newDv, DataChange = true });
+            actions.Add(addFile with
+            {
+                DeletionVector = newDv,
+                DataChange = true,
+                Stats = StatsWithLooseBounds(addFile.Stats),
+            });
 
             // Change Data Feed: a DV delete doesn't rewrite data, so read the newly-deleted rows and emit a
             // "delete" change file. Read WITH the trailing rowid (absolute position) and match `rid & posMask`
@@ -1343,7 +1374,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     : (IReadOnlyCollection<long>)System.Array.Empty<long>();
                 var nativeBatches = new List<RecordBatch>();
                 await foreach (var batch in _options.DataFileRewriter!
-                                   .ReadRewriteAsync(ordinal, addFile.Path, dvPositions, cancellationToken)
+                                   .ReadRewriteAsync(ordinal, DeltaPath.Decode(addFile.Path), dvPositions, cancellationToken)
                                    .ConfigureAwait(false))
                     nativeBatches.Add(batch);
                 rewritten = nativeBatches;
@@ -1588,7 +1619,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 DataChange = true,
                 DeletionVector = addFile.DeletionVector,
             });
-            actions.Add(addFile with { DeletionVector = newDv, DataChange = true });
+            actions.Add(addFile with
+            {
+                DeletionVector = newDv,
+                DataChange = true,
+                Stats = StatsWithLooseBounds(addFile.Stats),
+            });
         }
 
         if (actions.Count == 0)
@@ -1662,6 +1698,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 BaseRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : null,
                 DefaultRowCommitVersion = rowTrackingEnabled ? snapshot.Version + 1 : null,
             });
+            if (rowTrackingEnabled)
+            {
+                actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(
+                    snapshot.RowIdHighWaterMark + appendRows));
+            }
         }
 
         var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
@@ -2204,7 +2245,106 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 throw new DeltaFormatException(
                     $"Column '{field.Name}' declares an invariant expression this writer cannot evaluate; write rejected.");
             }
+            if (field.Metadata is not null && field.Metadata.ContainsKey("delta.generationExpression"))
+            {
+                throw new DeltaFormatException(
+                    $"Column '{field.Name}' declares a generation expression this writer cannot evaluate; write rejected.");
+            }
         }
+    }
+
+    /// <summary>
+    /// A file carrying a deletion vector has stats computed over ALL physical rows, so min/max/nullCount may
+    /// reference DV-deleted rows — the spec marks such stats <c>tightBounds=false</c> (readers then treat the
+    /// bounds as loose supersets). numRecords stays the physical row count.
+    /// </summary>
+    private static string? StatsWithLooseBounds(string? stats)
+    {
+        if (string.IsNullOrEmpty(stats))
+            return stats;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(stats!);
+            using var stream = new MemoryStream();
+            using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
+            {
+                writer.WriteStartObject();
+                writer.WriteBoolean("tightBounds", false);
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (!prop.NameEquals("tightBounds"))
+                        prop.WriteTo(writer);
+                }
+                writer.WriteEndObject();
+            }
+            return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return stats;
+        }
+    }
+
+    /// <summary>True when the schema contains a <c>timestamp_ntz</c> column at any nesting depth.</summary>
+    private static bool SchemaUsesTimestampNtz(DeltaDataType type) => type switch
+    {
+        PrimitiveType p => string.Equals(p.TypeName, "timestamp_ntz", StringComparison.Ordinal),
+        EngineeredWood.DeltaLake.Schema.StructType st => st.Fields.Any(f => SchemaUsesTimestampNtz(f.Type)),
+        ArrayType at => SchemaUsesTimestampNtz(at.ElementType),
+        EngineeredWood.DeltaLake.Schema.MapType mt =>
+            SchemaUsesTimestampNtz(mt.KeyType) || SchemaUsesTimestampNtz(mt.ValueType),
+        _ => false,
+    };
+
+    /// <summary>
+    /// Builds the protocol action that adds the <c>timestampNtz</c> reader+writer feature, or null when the
+    /// current protocol already declares it. Upgrading a LEGACY-versioned protocol to table-features mode
+    /// (reader 3 / writer 7) must enumerate every feature the legacy version implied, else those capabilities
+    /// are silently lost on the upgraded table.
+    /// </summary>
+    private static ProtocolAction? UpgradeProtocolForTimestampNtz(ProtocolAction current)
+    {
+        bool hasReader = current.ReaderFeatures?.Contains("timestampNtz") == true;
+        bool hasWriter = current.WriterFeatures?.Contains("timestampNtz") == true;
+        if (hasReader && hasWriter)
+            return null;
+
+        var writerFeatures = new List<string>(
+            current.WriterFeatures ?? LegacyWriterFeatures(current.MinWriterVersion));
+        var readerFeatures = new List<string>(
+            current.ReaderFeatures ?? LegacyReaderFeatures(current.MinReaderVersion));
+        if (!writerFeatures.Contains("timestampNtz"))
+            writerFeatures.Add("timestampNtz");
+        if (!readerFeatures.Contains("timestampNtz"))
+            readerFeatures.Add("timestampNtz");
+
+        return new ProtocolAction
+        {
+            MinReaderVersion = 3,
+            MinWriterVersion = 7,
+            ReaderFeatures = readerFeatures,
+            WriterFeatures = writerFeatures,
+        };
+    }
+
+    /// <summary>Writer features implied by a legacy writer version (Delta spec upgrade table).</summary>
+    private static List<string> LegacyWriterFeatures(int minWriterVersion)
+    {
+        var features = new List<string>();
+        if (minWriterVersion >= 2) { features.Add("appendOnly"); features.Add("invariants"); }
+        if (minWriterVersion >= 3) { features.Add("checkConstraints"); }
+        if (minWriterVersion >= 4) { features.Add("changeDataFeed"); features.Add("generatedColumns"); }
+        if (minWriterVersion >= 5) { features.Add("columnMapping"); }
+        if (minWriterVersion >= 6) { features.Add("identityColumns"); }
+        return features;
+    }
+
+    /// <summary>Reader features implied by a legacy reader version (Delta spec upgrade table).</summary>
+    private static List<string> LegacyReaderFeatures(int minReaderVersion)
+    {
+        var features = new List<string>();
+        if (minReaderVersion >= 2) { features.Add("columnMapping"); }
+        return features;
     }
 
     private async ValueTask<long> WriteCoreAsync(
@@ -2421,7 +2561,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 actions.Add(new AddFile
                 {
-                    Path = fileName,
+                    // add.path is the URL-encoded form of the on-disk relative path (spec / Spark).
+                    Path = DeltaPath.Encode(fileName),
                     PartitionValues = trackedPartValues,
                     Size = fileSize,
                     ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
@@ -2469,6 +2610,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             string updatedSchemaString = DeltaSchemaSerializer.Serialize(updatedSchema);
             actions.Add(snapshot.Metadata with { SchemaString = updatedSchemaString });
+        }
+
+        // Row tracking: persist the advanced high-water mark as the delta.rowTracking domainMetadata (the
+        // spec-required source of truth; deriving it from active files alone under-counts after removes, so
+        // a mixed writer could reassign already-used row ids).
+        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        {
+            actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
         }
 
         // Prepend CommitInfo with inCommitTimestamp if enabled
@@ -2624,7 +2773,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 long fileBaseRowId = nextRowId;
                 actions.Add(new AddFile
                 {
-                    Path = f.RelativePath,
+                    Path = DeltaPath.Encode(f.RelativePath),
                     PartitionValues = f.PartitionValues ?? new Dictionary<string, string>(),
                     Size = f.SizeBytes,
                     ModificationTime = now,
@@ -2637,6 +2786,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 });
                 if (rowTrackingEnabled)
                     nextRowId += f.NumRecords;
+            }
+
+            if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+            {
+                actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
             }
 
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(actions, cfg, "WRITE");
@@ -2753,7 +2907,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             : null;
 
         // Open the file and read its Parquet schema for field_id resolution
-        await using var file = await _fs.OpenReadAsync(addFile.Path, cancellationToken)
+        await using var file = await _fs.OpenReadAsync(DeltaPath.Decode(addFile.Path), cancellationToken)
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(
             file, ownsFile: false, _options.ParquetReadOptions);

@@ -90,7 +90,7 @@ internal static class CompactionExecutor
             long baseId = addFile.BaseRowId ?? 0;
             long commitVer = addFile.DefaultRowCommitVersion ?? 0;
 
-            await using var file = await fs.OpenReadAsync(addFile.Path, cancellationToken)
+            await using var file = await fs.OpenReadAsync(DeltaPath.Decode(addFile.Path), cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
 
@@ -272,6 +272,11 @@ internal static class CompactionExecutor
                 currentWrite.Clear();
                 currentRowCount = 0;
             }
+        }
+
+        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        {
+            actions.Add(EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
         }
 
         // Commit

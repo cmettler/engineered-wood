@@ -19,6 +19,7 @@ public static class ProtocolVersions
     {
         "columnMapping",
         "deletionVectors",
+        "rowTracking",
         "timestampNtz",
         "typeWidening",
         "v2Checkpoint",
@@ -41,6 +42,7 @@ public static class ProtocolVersions
         "columnMapping",
         "deletionVectors",
         "domainMetadata",
+        "generatedColumns",
         "icebergCompatV1",
         "icebergCompatV2",
         "identityColumns",

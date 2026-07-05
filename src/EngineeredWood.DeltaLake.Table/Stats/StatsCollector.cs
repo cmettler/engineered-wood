@@ -70,28 +70,36 @@ internal static class StatsCollector
         writer.WriteStartObject();
         writer.WriteNumber("numRecords", numRecords);
 
-        // Write minValues
+        // Write minValues. Long strings are truncated to a 32-char prefix (a valid lower bound) —
+        // unbounded min/max strings bloat every commit and checkpoint (Spark truncates the same way).
         writer.WritePropertyName("minValues");
         writer.WriteStartObject();
         foreach (var kvp in minValues)
         {
-            if (kvp.Value is not null)
+            var value = kvp.Value is string smin && smin.Length > StringStatMaxLength
+                ? smin.Substring(0, StringStatMaxLength)
+                : kvp.Value;
+            if (value is not null)
             {
                 writer.WritePropertyName(kvp.Key);
-                WriteStatValue(writer, kvp.Value);
+                WriteStatValue(writer, value);
             }
         }
         writer.WriteEndObject();
 
-        // Write maxValues
+        // Write maxValues. A truncated max must stay an UPPER bound: take the 32-char prefix and
+        // increment its last incrementable char (omit the stat entirely when none can be incremented).
         writer.WritePropertyName("maxValues");
         writer.WriteStartObject();
         foreach (var kvp in maxValues)
         {
-            if (kvp.Value is not null)
+            var value = kvp.Value is string smax && smax.Length > StringStatMaxLength
+                ? (object?)TruncateMaxString(smax)
+                : kvp.Value;
+            if (value is not null)
             {
                 writer.WritePropertyName(kvp.Key);
-                WriteStatValue(writer, kvp.Value);
+                WriteStatValue(writer, value);
             }
         }
         writer.WriteEndObject();
@@ -107,6 +115,29 @@ internal static class StatsCollector
         writer.Flush();
 
         return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    private const int StringStatMaxLength = 32;
+
+    /// <summary>
+    /// Truncates a max-side string stat to an upper bound of at most <see cref="StringStatMaxLength"/>
+    /// characters: the prefix with its last incrementable char bumped by one (skipping chars whose
+    /// increment would create a lone surrogate). Returns null when no char can be incremented — the
+    /// caller omits the stat (always safe).
+    /// </summary>
+    private static string? TruncateMaxString(string value)
+    {
+        for (int i = StringStatMaxLength - 1; i >= 0; i--)
+        {
+            char c = value[i];
+            if (c == char.MaxValue)
+                continue;
+            char next = (char)(c + 1);
+            if (next is >= '\ud800' and <= '\udfff')
+                continue; // incrementing into the surrogate range would produce invalid UTF-16
+            return value.Substring(0, i) + next;
+        }
+        return null;
     }
 
     private static void CollectMinMax(

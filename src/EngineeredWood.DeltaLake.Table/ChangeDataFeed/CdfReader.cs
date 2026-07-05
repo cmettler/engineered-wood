@@ -136,7 +136,7 @@ internal static class CdfReader
         Dictionary<string, string>? physicalToLogical,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await using var file = await fs.OpenReadAsync(cdcFile.Path, cancellationToken)
+        await using var file = await fs.OpenReadAsync(DeltaPath.Decode(cdcFile.Path), cancellationToken)
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
 
@@ -172,7 +172,7 @@ internal static class CdfReader
         if (!await fs.ExistsAsync(path, cancellationToken).ConfigureAwait(false))
             yield break;
 
-        await using var file = await fs.OpenReadAsync(path, cancellationToken)
+        await using var file = await fs.OpenReadAsync(DeltaPath.Decode(path), cancellationToken)
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
 

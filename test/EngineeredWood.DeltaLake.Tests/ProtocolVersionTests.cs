@@ -112,11 +112,11 @@ public class ProtocolVersionTests
         {
             MinReaderVersion = 1,
             MinWriterVersion = 7,
-            WriterFeatures = ["generatedColumns"],
+            WriterFeatures = ["someFutureFeature"],
         };
 
         var ex = Assert.Throws<DeltaFormatException>(
             () => ProtocolVersions.ValidateWriteSupport(protocol));
-        Assert.Contains("generatedColumns", ex.Message);
+        Assert.Contains("someFutureFeature", ex.Message);
     }
 }

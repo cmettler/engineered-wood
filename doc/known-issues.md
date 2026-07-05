@@ -297,12 +297,13 @@ Spark SQL expression parser (Phase 9 of the predicate-pushdown design),
 which is not started. Even with the feature gate lifted, the runtime
 could not evaluate the expressions.
 
-**`rowTracking` classification.** `rowTracking` is a reader-writer
-feature in the spec but is only listed in `SupportedWriterFeatures`.
-Tables with `rowTracking` in `readerFeatures` will be rejected by
-`ValidateReadSupport`. The writer also does not emit the
-`delta.rowTracking` domain metadata that the spec requires for the
-row-ID high-water mark.
+**`rowTracking` — fixed.** `rowTracking` is accepted as a reader
+feature too, and every commit that assigns fresh `baseRowId`s (write,
+external-file commit, merge-on-read update, compaction) emits the
+`delta.rowTracking` domain metadata with the spec high-water mark
+(highest assigned row id). Snapshot rebuild takes the max of the
+domain value and the active-file derivation, so removes can no longer
+regress the mark (which could have reassigned used row ids).
 
 **Multi-part V1 checkpoints on write.** Read is supported
 (`CheckpointReader.cs`); write always emits a single
@@ -328,19 +329,24 @@ work), `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`.
 
 **Stats collection gaps.**
 
-- No string-stat truncation. `StatsCollector` writes unbounded min/max
-  strings, bloating commits for wide-text columns.
-- `tightBounds` is never written.
+- String min/max stats are truncated at 32 chars (min = prefix, max =
+  prefix with its last incrementable char bumped, omitted when
+  impossible) — Spark parity; unbounded strings no longer bloat commits.
+- `tightBounds: false` is written on adds that carry a deletion vector
+  (stats cover all physical rows, so bounds are loose); tight stats
+  omit the field (default true).
 - Stats do not recurse into nested struct / list / map leaf fields; only
   top-level primitives get stats.
 - `stats_parsed` is built by `StatsParsedBuilder` for checkpoint writes
   but `CheckpointReader.ExtractAdd` reads only the JSON `stats` string.
 
-**CommitInfo.** `InCommitTimestamp.CreateCommitInfo` populates only
-`timestamp`, `operation`, `inCommitTimestamp`. Spec-standard fields
-never emitted: `operationParameters`, `readVersion`, `isolationLevel`,
-`operationMetrics`, `engineInfo`, `userId`, `userName`, `txnId`,
-`clusterId`, `notebook`.
+**CommitInfo.** `InCommitTimestamp.CreateCommitInfo` populates
+`timestamp`, `operation`, `inCommitTimestamp`, `engineInfo`
+("EngineeredWood.DeltaLake") and an `operationParameters` object
+(empty unless the caller supplies values). Still never emitted:
+per-operation parameter payloads, `readVersion`, `isolationLevel`,
+`operationMetrics`, `userId`, `userName`, `txnId`, `clusterId`,
+`notebook`.
 
 **Post-creation protocol upgrades.** `DeltaTable.CreateAsync` bumps
 reader/writer versions only at create time when column mapping is
@@ -364,11 +370,16 @@ raw incremental-by-version-range read outside of CDF.
 add/drop/rename/reorder columns, change nullability, or add a column to
 a nested struct. Column mapping mode is fixed at `CreateAsync`.
 
-**Checkpoint content gaps.** `CheckpointWriter` drops `tags` and
-`deletionVector` from `AddFile` when building the checkpoint Parquet,
-and never emits a `remove` struct for unexpired tombstones. The spec
-requires tombstones within the retention window to be preserved in
-checkpoints.
+**Checkpoint content gaps.** `CheckpointWriter` now preserves
+`add.deletionVector`, `add.baseRowId`/`defaultRowCommitVersion` and the
+protocol `readerFeatures`/`writerFeatures` (dropping the DV silently
+resurrected deleted rows for any reader replaying from the checkpoint),
+emits the required `metaData.format.options`, and writes the top-level
+action structs as NULLABLE per the spec checkpoint schema (delta-kernel
+rejects an always-present struct with null required children).
+Remaining gaps: `add.tags` is still dropped, and no `remove` struct is
+emitted for unexpired tombstones — the spec requires tombstones within
+the retention window to be preserved in checkpoints.
 
 **Orphan deletion-vector files.** `VacuumExecutor` excludes
 `_delta_log/` from deletion. Abandoned DV `.bin` files written into
@@ -382,15 +393,30 @@ metadata.
 
 ### Correctness / interop issues
 
-**Partition value encoding.**
-`Partitioning/PartitionUtils.GetStringValue` and
-`FormatTimestampPartitionValue` use `yyyy-MM-dd HH:mm:ss.ffffff` for
-`timestamp` partitions; the spec's reference behavior is `yyyy-MM-dd
-HH:mm:ss` (without microseconds) for `timestamp` and microseconds only
-for `timestamp_ntz`. Decimal and binary partition values are not
-encoded on write and `BuildConstantArray` has no case for them on read.
-The `__HIVE_DEFAULT_PARTITION__` sentinel is written but not
-recognized on read for non-string types — parsing will throw.
+**Partition value encoding — largely fixed.** Null partition values
+are stored as JSON null in `add.partitionValues` (the directory name
+uses `__HIVE_DEFAULT_PARTITION__`); reads decode null / the sentinel /
+a missing key as a typed NULL column. Decimal partition values encode
+(dot notation) and decode; timestamps emit `yyyy-MM-dd HH:mm:ss` when
+the fraction is zero, else `.ffffff` (both spec forms accepted on
+read); numeric formatting/parsing is invariant-culture. Partition
+directory names use Spark's `escapePathName` (`DeltaPath.EscapePathName`
+— escapes `:` `%` `/` …, not space) and `add.path` is the URL-encoded
+form of the on-disk relative path per the spec (`DeltaPath.Encode`,
+decoded on every read — this also makes Spark-written tables with
+escaped paths readable, and vice versa). Remaining: binary partition
+values are rejected (clean error) rather than encoded; tables written
+by earlier versions whose `add.path` contained literal `%XX` sequences
+must be rewritten (the log form is now decoded on read).
+
+**`timestampNtz` feature — fixed.** A schema containing a
+`timestamp_ntz` column (any naive Arrow timestamp) now declares the
+`timestampNtz` reader+writer feature at `CreateAsync`, and
+`AddColumnAsync`/`SetSchemaAsync` emit a protocol upgrade in the same
+commit when the evolved schema first introduces the type (legacy
+protocol versions are upgraded to table-features mode with their
+implied features enumerated). Previously the feature was omitted and
+strict readers (Spark, delta-kernel) rejected the table.
 
 **V2 sidecar discovery.** `CheckpointReader.ReadV2CheckpointAsync`
 rebuilds sidecar paths as `_delta_log/_sidecars/{name}` by a slash

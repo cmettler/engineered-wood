@@ -783,7 +783,13 @@ internal static class ActionSerializer
             writer.WritePropertyName(propertyName);
             writer.WriteStartObject();
             foreach (var kvp in dict)
-                writer.WriteString(kvp.Key, kvp.Value);
+            {
+                // A null partition value is JSON null per the spec (not the directory sentinel).
+                if (kvp.Value is null)
+                    writer.WriteNull(kvp.Key);
+                else
+                    writer.WriteString(kvp.Key, kvp.Value);
+            }
             writer.WriteEndObject();
         }
 
