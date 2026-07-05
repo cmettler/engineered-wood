@@ -530,16 +530,38 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     // The schema's LOGICAL signature — field names + types + nullability, with column-mapping metadata (ids /
-    // physical names) stripped from the top-level fields — so two schemas that differ only in assigned ids compare
-    // equal. Used to no-op SetSchema on a column-mapping table when the logical shape is unchanged.
+    // physical names) stripped RECURSIVELY (nested struct fields carry their own ids/physicalNames) — so two
+    // schemas that differ only in assigned ids compare equal. Used to no-op SetSchema on a column-mapping table
+    // when the logical shape is unchanged (without the recursive strip, a fresh nested CTAS falsely "differed"
+    // and re-assigned every column id).
     private static string LogicalSchemaString(EngineeredWood.DeltaLake.Schema.StructType schema)
+    {
+        return DeltaSchemaSerializer.Serialize(StripMetadata(schema));
+    }
+
+    private static EngineeredWood.DeltaLake.Schema.StructType StripMetadata(
+        EngineeredWood.DeltaLake.Schema.StructType schema)
     {
         var stripped = new List<StructField>(schema.Fields.Count);
         foreach (var f in schema.Fields)
-            stripped.Add(new StructField { Name = f.Name, Type = f.Type, Nullable = f.Nullable, Metadata = null });
-        return DeltaSchemaSerializer.Serialize(
-            new EngineeredWood.DeltaLake.Schema.StructType { Fields = stripped });
+            stripped.Add(new StructField
+            {
+                Name = f.Name, Type = StripMetadata(f.Type), Nullable = f.Nullable, Metadata = null,
+            });
+        return new EngineeredWood.DeltaLake.Schema.StructType { Fields = stripped };
     }
+
+    private static DeltaDataType StripMetadata(DeltaDataType type) => type switch
+    {
+        EngineeredWood.DeltaLake.Schema.StructType st => StripMetadata(st),
+        ArrayType at => new ArrayType { ElementType = StripMetadata(at.ElementType), ContainsNull = at.ContainsNull },
+        EngineeredWood.DeltaLake.Schema.MapType mt => new EngineeredWood.DeltaLake.Schema.MapType
+        {
+            KeyType = StripMetadata(mt.KeyType), ValueType = StripMetadata(mt.ValueType),
+            ValueContainsNull = mt.ValueContainsNull,
+        },
+        _ => type,
+    };
 
     /// <summary>
     /// Renames a column as a metadata-only commit (a new <c>metaData</c> action changing only the field's logical
