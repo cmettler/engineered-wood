@@ -184,6 +184,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             minWriterVersion = 7;
             writerFeatureSet.Add("changeDataFeed");
         }
+        // Column mapping is BOTH a reader and writer feature. In table-features mode (reader v3 / writer v7 —
+        // forced by deletionVectors/rowTracking/… above) it MUST be listed in BOTH feature lists, else a strict
+        // reader (Spark) rejects the table ("feature enabled in metadata but not listed in protocol"). Absent any
+        // other table feature, legacy versioning (reader v2 / writer v5, no lists — set above) is used instead.
+        if (columnMappingMode != ColumnMappingMode.None)
+        {
+            bool tableFeatures = minWriterVersion >= 7 || minReaderVersion >= 3
+                                 || writerFeatureSet.Count > 0 || readerFeatureList is not null;
+            if (tableFeatures)
+            {
+                minReaderVersion = Math.Max(minReaderVersion, 3);
+                minWriterVersion = 7;
+                if (!writerFeatureSet.Contains("columnMapping"))
+                    writerFeatureSet.Add("columnMapping");
+                readerFeatureList ??= new List<string>();
+                if (!readerFeatureList.Contains("columnMapping"))
+                    readerFeatureList.Add("columnMapping");
+            }
+        }
+
         IReadOnlyList<string>? writerFeatures = writerFeatureSet.Count > 0 ? writerFeatureSet : null;
         IReadOnlyList<string>? readerFeatures = readerFeatureList;
 
@@ -232,6 +252,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         DeltaTableOptions? options = null,
         IReadOnlyList<string>? partitionColumns = null,
         IReadOnlyDictionary<string, string>? configuration = null,
+        ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
         CancellationToken cancellationToken = default)
     {
         options ??= DeltaTableOptions.Default;
@@ -244,8 +265,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return await OpenAsync(fileSystem, options, cancellationToken)
                 .ConfigureAwait(false);
 
+        // New table: honor the requested column-mapping mode (name/id assigns physical names + bumps the protocol).
         return await CreateAsync(fileSystem, schema, options, partitionColumns,
-            configuration: configuration, cancellationToken: cancellationToken).ConfigureAwait(false);
+            columnMappingMode: columnMappingMode, configuration: configuration,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
