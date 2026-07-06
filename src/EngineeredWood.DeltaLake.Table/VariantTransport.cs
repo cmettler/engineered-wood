@@ -4,6 +4,8 @@
 using System;
 using System.Collections.Generic;
 using Apache.Arrow;
+using Apache.Arrow.Operations.Shredding;
+using Apache.Arrow.Scalars.Variant;
 using EngineeredWood.DeltaLake.Schema;
 
 namespace EngineeredWood.DeltaLake.Table;
@@ -17,6 +19,14 @@ namespace EngineeredWood.DeltaLake.Table;
 /// lets the BUILT-IN parquet codec read and write variant columns: the writer takes VariantArray columns
 /// (emitting the spec annotation), the reader returns the bare storage struct, and the Delta read
 /// pipeline converts back to the transport blob the embedding host expects.
+///
+/// <para><b>Shredding</b> (the VariantShredding spec) is handled through <c>Apache.Arrow.Operations</c>:
+/// the WRITE side infers a per-file shredding schema from the column's values
+/// (<see cref="ShredSchemaInferer"/>) and, when one applies, shreds each row into typed columns plus a
+/// residual (<see cref="VariantShredder"/> — the shared metadata dictionary keeps residual field-name
+/// references valid); the READ side reassembles ANY spec layout — unshredded, partially or fully shredded,
+/// ours or a foreign writer's — via <see cref="VariantArrayShreddingExtensions.GetLogicalVariantValue"/>.
+/// SQL NULL rows ride the storage struct's validity (distinct from a variant JSON null).</para>
 /// </summary>
 internal static class VariantTransport
 {
@@ -79,19 +89,7 @@ internal static class VariantTransport
                 for (int i = 0; i < batch.ColumnCount; i++)
                     arrays.Add(batch.Column(i));
             }
-            var builder = new VariantArray.Builder();
-            for (int r = 0; r < blob.Length; r++)
-            {
-                if (blob.IsNull(r))
-                {
-                    builder.AppendNull();
-                    continue;
-                }
-                var bytes = blob.GetBytes(r);
-                int metaLen = MetadataLength(bytes);
-                builder.Append(bytes.Slice(0, metaLen), bytes.Slice(metaLen));
-            }
-            var variant = builder.Build();
+            var variant = BuildVariantColumn(blob);
             // Keep the field metadata (column-mapping physicalName/PARQUET:field_id survive) — only the
             // type changes to the extension; the transport marker is harmless alongside it.
             fields[c] = new Field(f.Name, variant.Data.DataType, f.IsNullable, f.Metadata);
@@ -133,41 +131,66 @@ internal static class VariantTransport
                 continue;
 
             var structType = (Apache.Arrow.Types.StructType)st.Data.DataType;
-            BinaryArray? meta = null, val = null;
-            for (int i = 0; i < structType.Fields.Count; i++)
-            {
-                string name = structType.Fields[i].Name;
-                if (string.Equals(name, "typed_value", StringComparison.Ordinal))
-                {
-                    throw new DeltaFormatException(
-                        $"column '{f.Name}' is a SHREDDED variant — the built-in reader cannot reassemble "
-                        + "shredded variants; read the table with a variant-capable host reader.");
-                }
-                var child = ArrowArrayFactory.BuildArray(st.Data.Children[i]) as BinaryArray;
-                if (string.Equals(name, "metadata", StringComparison.Ordinal))
-                    meta = child;
-                else if (string.Equals(name, "value", StringComparison.Ordinal))
-                    val = child;
-            }
-            if (meta is null || val is null)
-                throw new DeltaFormatException(
-                    $"column '{f.Name}' is annotated VARIANT but lacks binary metadata/value children.");
-
+            bool shredded = structType.GetFieldIndex("typed_value") >= 0
+                            || structType.GetFieldIndex("value") < 0;
             int off = st.Data.Offset; // struct children do NOT incorporate the parent's offset
             var builder = new BinaryArray.Builder();
-            for (int r = 0; r < st.Length; r++)
+            if (shredded)
             {
-                if (st.IsNull(r) || meta.IsNull(off + r) || val.IsNull(off + r))
+                // Shredded layout (typed_value present, or a fully-shredded file without a value column):
+                // reassemble each row into logical variant bytes via Apache.Arrow.Operations (merges typed
+                // columns + residual bytes per the VariantShredding spec, ours or a foreign writer's).
+                if (off != 0)
+                    throw new DeltaFormatException(
+                        $"column '{f.Name}': shredded variant reassembly over an offset struct slice is "
+                        + "not supported (fresh reader batches are never sliced).");
+                var shreddedVariant = new VariantArray(ArrowArrayFactory.BuildArray(st.Data));
+                var encoder = new VariantBuilder();
+                for (int r = 0; r < st.Length; r++)
                 {
-                    builder.AppendNull();
-                    continue;
+                    if (st.IsNull(r))
+                    {
+                        builder.AppendNull();
+                        continue;
+                    }
+                    var logical = shreddedVariant.GetLogicalVariantValue(r);
+                    var (em, ev) = encoder.Encode(logical);
+                    var combined = new byte[em.Length + ev.Length];
+                    em.CopyTo(combined, 0);
+                    ev.CopyTo(combined, em.Length);
+                    builder.Append(combined.AsSpan());
                 }
-                var m = meta.GetBytes(off + r);
-                var v = val.GetBytes(off + r);
-                var combined = new byte[m.Length + v.Length];
-                m.CopyTo(combined);
-                v.CopyTo(combined.AsSpan(m.Length));
-                builder.Append(combined.AsSpan());
+            }
+            else
+            {
+                BinaryArray? meta = null, val = null;
+                for (int i = 0; i < structType.Fields.Count; i++)
+                {
+                    string name = structType.Fields[i].Name;
+                    var child = ArrowArrayFactory.BuildArray(st.Data.Children[i]) as BinaryArray;
+                    if (string.Equals(name, "metadata", StringComparison.Ordinal))
+                        meta = child;
+                    else if (string.Equals(name, "value", StringComparison.Ordinal))
+                        val = child;
+                }
+                if (meta is null || val is null)
+                    throw new DeltaFormatException(
+                        $"column '{f.Name}' is annotated VARIANT but lacks binary metadata/value children.");
+
+                for (int r = 0; r < st.Length; r++)
+                {
+                    if (st.IsNull(r) || meta.IsNull(off + r) || val.IsNull(off + r))
+                    {
+                        builder.AppendNull();
+                        continue;
+                    }
+                    var m = meta.GetBytes(off + r);
+                    var v = val.GetBytes(off + r);
+                    var combined = new byte[m.Length + v.Length];
+                    m.CopyTo(combined);
+                    v.CopyTo(combined.AsSpan(m.Length));
+                    builder.Append(combined.AsSpan());
+                }
             }
 
             if (fields is null)
@@ -195,6 +218,89 @@ internal static class VariantTransport
         foreach (var f in fields)
             sb.Field(f);
         return new RecordBatch(sb.Build(), arrays!, batch.Length);
+    }
+
+    /// <summary>
+    /// Builds the codec-facing variant column from a transport-blob column. The column's values are parsed
+    /// once; when the inferred shredding schema applies (uniform objects/primitives/arrays per
+    /// <see cref="ShredSchemaInferer"/>), the rows are shredded into typed columns + residuals — data
+    /// skipping on shredded leaves is the variant "superpower" spec readers (Spark, DuckDB) exploit.
+    /// Mixed-shape columns stay unshredded. SQL NULL rows become null STORAGE rows (validity), which is
+    /// distinct from a variant JSON null riding in the value bytes.
+    /// </summary>
+    private static VariantArray BuildVariantColumn(BinaryArray blob)
+    {
+        int n = blob.Length;
+        var values = new VariantValue[n];
+        var isNull = new bool[n];
+        var nonNull = new List<VariantValue>(n);
+        for (int r = 0; r < n; r++)
+        {
+            if (blob.IsNull(r))
+            {
+                isNull[r] = true;
+                values[r] = VariantValue.Null; // placeholder; masked by validity below
+                continue;
+            }
+            var bytes = blob.GetBytes(r);
+            int metaLen = MetadataLength(bytes);
+            var reader = new VariantReader(bytes.Slice(0, metaLen), bytes.Slice(metaLen));
+            values[r] = reader.ToVariantValue();
+            nonNull.Add(values[r]);
+        }
+
+        var schema = nonNull.Count > 0
+            ? new ShredSchemaInferer().Infer(nonNull)
+            : ShredSchema.Unshredded();
+
+        VariantArray variant;
+        if (schema.TypedValueType == ShredType.None)
+        {
+            // Unshredded: pass the original bytes through untouched (no re-encode).
+            var builder = new VariantArray.Builder();
+            for (int r = 0; r < n; r++)
+            {
+                if (isNull[r])
+                {
+                    builder.AppendNull();
+                    continue;
+                }
+                var bytes = blob.GetBytes(r);
+                int metaLen = MetadataLength(bytes);
+                builder.Append(bytes.Slice(0, metaLen), bytes.Slice(metaLen));
+            }
+            return builder.Build();
+        }
+
+        var (metadata, rows) = VariantShredder.Shred(values, schema);
+        variant = ShreddedVariantArrayBuilder.Build(schema, metadata, rows);
+        // Re-apply the SQL-null rows as STORAGE validity (the shredder saw a variant-null placeholder).
+        int nulls = 0;
+        foreach (var b in isNull)
+        {
+            if (b) { nulls++; }
+        }
+        if (nulls > 0)
+        {
+            variant = (VariantArray)WithValidity(variant, isNull, nulls);
+        }
+        return variant;
+    }
+
+    // Rebuilds the extension array's storage struct with a validity bitmap marking the SQL-null rows
+    // (buffers and children shared — only the top-level validity changes).
+    private static IArrowArray WithValidity(VariantArray variant, bool[] isNull, int nullCount)
+    {
+        var storage = variant.StorageArray.Data;
+        var validity = new ArrowBuffer.BitmapBuilder(isNull.Length);
+        foreach (var b in isNull)
+        {
+            validity.Append(!b);
+        }
+        var newStorage = new ArrayData(
+            storage.DataType, storage.Length, nullCount, storage.Offset,
+            new[] { validity.Build() }, storage.Children, storage.Dictionary);
+        return new VariantArray(variant.VariantType, ArrowArrayFactory.BuildArray(newStorage));
     }
 
     /// <summary>True when any top-level Delta field is a variant (the cheap gate for the transforms).</summary>
