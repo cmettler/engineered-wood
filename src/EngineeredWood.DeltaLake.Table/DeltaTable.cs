@@ -2606,21 +2606,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 }
                 else
                 {
-                    if (SchemaUsesVariant(snapshot.Schema))
-                    {
-                        // The codec parquet writer emits no VARIANT logical-type annotation — the file would
-                        // hold a plain struct group that spec readers (Spark, delta-kernel) read as a struct,
-                        // silently losing variant-ness. Variant data files require a host DataFileWriter.
-                        throw new DeltaFormatException(
-                            "Writing data to a table with VARIANT columns requires a host data-file writer "
-                            + "(the built-in parquet writer cannot emit the VARIANT annotation).");
-                    }
+                    // Variant columns arrive as the transport blob; the codec writer takes VariantArray
+                    // columns, emitting the spec VARIANT-annotated group (see VariantTransport).
+                    var codecBatch = VariantTransport.ToVariantArrays(physicalBatch);
                     await using (var file = await _fs.CreateAsync(
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false))
                     {
                         await using var writer = new ParquetFileWriter(
                             file, ownsFile: false, _options.ParquetWriteOptions);
-                        await writer.WriteRowGroupAsync(physicalBatch, cancellationToken)
+                        await writer.WriteRowGroupAsync(codecBatch, cancellationToken)
                             .ConfigureAwait(false);
 
                         // DisposeAsync writes the Parquet footer before we read Position
@@ -3150,6 +3144,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
             {
                 result = ColumnMappingRecursive.ToLogical(result, snapshot.Schema, mappingMode);
+            }
+            // Variant columns: the registry-less codec reader surfaces the VARIANT-annotated group as a bare
+            // struct — convert back to the transport blob (a pluggable host reader already delivers the blob,
+            // which passes through untouched). A 1:1 per-row transform, so positions below are unaffected.
+            if (VariantTransport.SchemaHasVariant(snapshot.Schema))
+            {
+                result = VariantTransport.FromStorageStructs(result, snapshot.Schema);
             }
 
             // Compute the ABSOLUTE parquet positions of the rows that survive DV filtering (in order), so the
