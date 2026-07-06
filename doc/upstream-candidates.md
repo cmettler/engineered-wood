@@ -21,6 +21,10 @@ independent review, roughly in ascending dependency order; each slice is default
 - **All-null pages declared a delta encoding with a 0-byte payload**: DELTA_BINARY_PACKED /
   DELTA_LENGTH_BYTE_ARRAY require a header even for zero values → readers underrun ("Out of buffer"). An
   all-null page now declares PLAIN.
+- **`VariantType.specification_version` written explicitly (= 1)**: the annotation was emitted as an
+  empty thrift struct; Spark's parquet variant reader rejects that (a generic `FAILED_READ_FILE`), while
+  delta-kernel/DuckDB tolerate it. Isolated live on Fabric Spark 4.1 (only variant-annotated files
+  failed; setting the version fixed both test tables).
 - ns-timestamp/time `converted_type` OMITTED (no ns variant exists — was mislabeled micros, a 1000×
   error for converted_type-trusting readers); deprecated `Statistics.min`/`max` restricted to
   signed-order-safe types (parquet-mr parity); `SchemaConverter.FromArrowField` preserves per-field
