@@ -390,8 +390,8 @@ back.
 **Schema round-trip.** `SchemaConverter.FromArrowField` preserves
 per-field metadata (comments, column-mapping IDs, invariants) when
 converting Arrow → Delta, filtering out `PARQUET:*` transport keys
-(e.g. `PARQUET:field_id`). `ToArrowField` (Delta → Arrow) still drops
-metadata.
+(e.g. `PARQUET:field_id`). `ToArrowField` (Delta → Arrow) preserves
+metadata too (recursively), so schemas round-trip losslessly.
 
 ### Correctness / interop issues
 
