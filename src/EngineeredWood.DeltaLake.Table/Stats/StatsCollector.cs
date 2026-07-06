@@ -45,9 +45,11 @@ internal static class StatsCollector
                 var field = batch.Schema.FieldsList[col];
                 var array = batch.Column(col);
 
-                if (array is StructArray structCol)
+                if (array is StructArray structCol && !Schema.SchemaConverter.IsVariantArrowField(field))
                 {
                     // Nested stats: recurse into struct leaves (list/map subtrees carry no per-column stats).
+                    // A variant column is EXCLUDED: its transport struct (metadata/value blobs) is opaque —
+                    // the Delta stats leaf for a variant column is nullCount only (min/max are meaningless).
                     var nMin = GetOrAddNested(minValues, field.Name);
                     var nMax = GetOrAddNested(maxValues, field.Name);
                     var nNull = GetOrAddNestedCounts(nullCounts, field.Name);
@@ -151,7 +153,7 @@ internal static class StatsCollector
                     nulls++;
             }
 
-            if (child is StructArray nestedStruct)
+            if (child is StructArray nestedStruct && !Schema.SchemaConverter.IsVariantArrowField(structType.Fields[c]))
             {
                 var nMin = GetOrAddNested(minValues, childName);
                 var nMax = GetOrAddNested(maxValues, childName);

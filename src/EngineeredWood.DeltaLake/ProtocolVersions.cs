@@ -24,6 +24,7 @@ public static class ProtocolVersions
         "typeWidening",
         "v2Checkpoint",
         "vacuumProtocolCheck",
+        "variantType",
     };
 
     /// <summary>Named writer features supported by this implementation.</summary>
@@ -52,6 +53,7 @@ public static class ProtocolVersions
         "typeWidening",
         "v2Checkpoint",
         "vacuumProtocolCheck",
+        "variantType",
     };
 
     /// <summary>

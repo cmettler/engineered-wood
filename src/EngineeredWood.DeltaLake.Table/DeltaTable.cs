@@ -195,6 +195,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             readerFeatureList ??= new List<string>();
             readerFeatureList.Add("timestampNtz");
         }
+        // variant is likewise a reader+writer table feature ('variantType') whenever the schema contains it.
+        if (SchemaUsesVariant(deltaSchema))
+        {
+            minReaderVersion = 3;
+            minWriterVersion = 7;
+            writerFeatureSet.Add("variantType");
+            readerFeatureList ??= new List<string>();
+            readerFeatureList.Add("variantType");
+        }
         // Column mapping is BOTH a reader and writer feature. In table-features mode (reader v3 / writer v7 —
         // forced by deletionVectors/rowTracking/… above) it MUST be listed in BOTH feature lists, else a strict
         // reader (Spark) rejects the table ("feature enabled in metadata but not listed in protocol"). Absent any
@@ -455,11 +464,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             newConfig = cfg;
         }
 
-        // Adding a naive-timestamp column to a table whose protocol lacks the timestampNtz feature
-        // requires a protocol upgrade in the same commit.
-        var protocolUpgrade = SchemaUsesTimestampNtz(newDeltaField.Type)
-            ? UpgradeProtocolForTimestampNtz(snapshot.Protocol)
-            : null;
+        // Adding a column whose type requires a schema-driven table feature (timestampNtz / variantType)
+        // to a table whose protocol lacks it requires a protocol upgrade in the same commit.
+        var protocolUpgrade =
+            UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
 
         var actionList = new List<DeltaAction>();
         if (protocolUpgrade is not null)
@@ -534,9 +542,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return snapshot.Version; // identical schema — nothing to commit
         }
 
-        var protocolUpgrade = SchemaUsesTimestampNtz(newDeltaSchema)
-            ? UpgradeProtocolForTimestampNtz(snapshot.Protocol)
-            : null;
+        var protocolUpgrade = UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaSchema));
 
         var actionList = new List<DeltaAction>();
         if (protocolUpgrade is not null)
@@ -976,6 +982,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
         HonorWriterFeatures(isAppend: false);
+        ThrowIfVariantRewrite("copy-on-write DELETE");
 
         var snapshot = CurrentSnapshot;
         if (rowIds.Count == 0)
@@ -1314,6 +1321,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
         HonorWriterFeatures(isAppend: false);
+        ThrowIfVariantRewrite("UPDATE");
 
         var snapshot = CurrentSnapshot;
         if (rowIds.Count == 0)
@@ -2300,26 +2308,73 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     };
 
     /// <summary>
-    /// Builds the protocol action that adds the <c>timestampNtz</c> reader+writer feature, or null when the
-    /// current protocol already declares it. Upgrading a LEGACY-versioned protocol to table-features mode
-    /// (reader 3 / writer 7) must enumerate every feature the legacy version implied, else those capabilities
-    /// are silently lost on the upgraded table.
+    /// Rejects a data-rewriting operation on a table with VARIANT columns. The rewrite READ half goes through
+    /// the codec parquet reader, which is blind to the parquet VARIANT logical-type annotation — a rewritten
+    /// file would carry a plain struct group, silently stripping variant-ness for spec readers (Spark,
+    /// delta-kernel). Deletion-vector DELETE is exempt (it writes no data file). Lifting this requires a
+    /// variant-aware read half (e.g. the host's native rewriter) on every affected path.
     /// </summary>
-    private static ProtocolAction? UpgradeProtocolForTimestampNtz(ProtocolAction current)
+    private void ThrowIfVariantRewrite(string operation)
     {
-        bool hasReader = current.ReaderFeatures?.Contains("timestampNtz") == true;
-        bool hasWriter = current.WriterFeatures?.Contains("timestampNtz") == true;
-        if (hasReader && hasWriter)
+        if (SchemaUsesVariant(CurrentSnapshot.Schema))
+        {
+            throw new DeltaFormatException(
+                $"{operation} on a table with VARIANT columns is not supported yet (the rewrite would strip "
+                + "the parquet VARIANT annotation). Deletion-vector DELETE works; for updates, delete + insert.");
+        }
+    }
+
+    /// <summary>True when the schema contains a <c>variant</c> column at any nesting depth.</summary>
+    private static bool SchemaUsesVariant(DeltaDataType type) => type switch
+    {
+        PrimitiveType p => string.Equals(p.TypeName, "variant", StringComparison.Ordinal),
+        EngineeredWood.DeltaLake.Schema.StructType st => st.Fields.Any(f => SchemaUsesVariant(f.Type)),
+        ArrayType at => SchemaUsesVariant(at.ElementType),
+        EngineeredWood.DeltaLake.Schema.MapType mt =>
+            SchemaUsesVariant(mt.KeyType) || SchemaUsesVariant(mt.ValueType),
+        _ => false,
+    };
+
+    /// <summary>
+    /// The schema-driven reader+writer table features <paramref name="type"/> requires per the Delta spec
+    /// (<c>timestampNtz</c> for a naive timestamp, <c>variantType</c> for a variant column).
+    /// </summary>
+    private static List<string> RequiredSchemaFeatures(DeltaDataType type)
+    {
+        var features = new List<string>();
+        if (SchemaUsesTimestampNtz(type))
+            features.Add("timestampNtz");
+        if (SchemaUsesVariant(type))
+            features.Add("variantType");
+        return features;
+    }
+
+    /// <summary>
+    /// Builds the protocol action that adds the given reader+writer features, or null when the current
+    /// protocol already declares them all (or none are required). Upgrading a LEGACY-versioned protocol to
+    /// table-features mode (reader 3 / writer 7) must enumerate every feature the legacy version implied,
+    /// else those capabilities are silently lost on the upgraded table.
+    /// </summary>
+    private static ProtocolAction? UpgradeProtocolForFeatures(
+        ProtocolAction current, IReadOnlyList<string> features)
+    {
+        var missing = features.Where(f =>
+            current.ReaderFeatures?.Contains(f) != true
+            || current.WriterFeatures?.Contains(f) != true).ToList();
+        if (missing.Count == 0)
             return null;
 
         var writerFeatures = new List<string>(
             current.WriterFeatures ?? LegacyWriterFeatures(current.MinWriterVersion));
         var readerFeatures = new List<string>(
             current.ReaderFeatures ?? LegacyReaderFeatures(current.MinReaderVersion));
-        if (!writerFeatures.Contains("timestampNtz"))
-            writerFeatures.Add("timestampNtz");
-        if (!readerFeatures.Contains("timestampNtz"))
-            readerFeatures.Add("timestampNtz");
+        foreach (var feature in missing)
+        {
+            if (!writerFeatures.Contains(feature))
+                writerFeatures.Add(feature);
+            if (!readerFeatures.Contains(feature))
+                readerFeatures.Add(feature);
+        }
 
         return new ProtocolAction
         {
@@ -2536,6 +2591,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 }
                 else
                 {
+                    if (SchemaUsesVariant(snapshot.Schema))
+                    {
+                        // The codec parquet writer emits no VARIANT logical-type annotation — the file would
+                        // hold a plain struct group that spec readers (Spark, delta-kernel) read as a struct,
+                        // silently losing variant-ness. Variant data files require a host DataFileWriter.
+                        throw new DeltaFormatException(
+                            "Writing data to a table with VARIANT columns requires a host data-file writer "
+                            + "(the built-in parquet writer cannot emit the VARIANT annotation).");
+                    }
                     await using (var file = await _fs.CreateAsync(
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false))
                     {
@@ -2842,6 +2906,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ThrowIfVariantRewrite("OPTIMIZE (compaction)");
 
         options ??= CompactionOptions.Default;
         var result = await Compaction.CompactionExecutor.ExecuteAsync(

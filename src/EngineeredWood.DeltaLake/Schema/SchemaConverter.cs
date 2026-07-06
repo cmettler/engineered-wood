@@ -15,6 +15,28 @@ namespace EngineeredWood.DeltaLake.Schema;
 /// </summary>
 public static class SchemaConverter
 {
+    /// <summary>
+    /// The Arrow extension name marking a Delta <c>variant</c> column's transport form: ONE self-delimiting
+    /// binary value per row — the parquet-variant metadata bytes immediately followed by the value bytes
+    /// (the metadata header carries its own size, so the halves split without a length prefix). The Delta
+    /// type is a primitive ("variant"), but Arrow has no variant type in the C data interface, so the value
+    /// crosses as this blob discriminated by the FIELD-metadata marker (Arrow types carry no metadata).
+    /// Deliberately NOT the canonical arrow.parquet.variant (whose storage is struct&lt;metadata,value&gt;) —
+    /// the single-blob transport is the host boundary's contract.
+    /// </summary>
+    public const string VariantExtensionName = "arrownet.variant";
+
+    private const string ArrowExtensionNameKey = "ARROW:extension:name";
+
+    /// <summary>True when the Arrow field is a variant transport struct (carries the extension marker).</summary>
+    public static bool IsVariantArrowField(Field field) =>
+        field.Metadata is { } md
+        && md.TryGetValue(ArrowExtensionNameKey, out var ext)
+        && string.Equals(ext, VariantExtensionName, StringComparison.Ordinal);
+
+    /// <summary>The variant transport storage: one binary value per row (metadata bytes ++ value bytes).</summary>
+    public static IArrowType VariantStorageType() => BinaryType.Default;
+
     private static readonly Regex s_decimalPattern = new(
         @"^decimal\((\d+),(\d+)\)$", RegexOptions.Compiled);
 
@@ -42,6 +64,18 @@ public static class SchemaConverter
 
     private static Field ToArrowField(StructField field)
     {
+        // variant is a Delta primitive whose Arrow transport is the unshredded parquet-variant struct,
+        // discriminated by the canonical extension name in the FIELD metadata (see VariantExtensionName).
+        if (field.Type is PrimitiveType pv && string.Equals(pv.TypeName, "variant", StringComparison.Ordinal))
+        {
+            var vmeta = new Dictionary<string, string> { [ArrowExtensionNameKey] = VariantExtensionName };
+            if (field.Metadata is { Count: > 0 } vsrc)
+            {
+                foreach (var kvp in vsrc)
+                    vmeta[kvp.Key] = kvp.Value;
+            }
+            return new Field(field.Name, VariantStorageType(), field.Nullable, vmeta);
+        }
         var arrowType = ToArrowType(field.Type);
         // Preserve per-field Delta metadata (comments, column-mapping id/physicalName, invariants) on the
         // Arrow field — the reverse of FromArrowField's preservation, so schemas round-trip losslessly.
@@ -97,6 +131,11 @@ public static class SchemaConverter
             "date" => Date32Type.Default,
             "timestamp" => new TimestampType(TimeUnit.Microsecond, (string?)"UTC"),
             "timestamp_ntz" => new TimestampType(TimeUnit.Microsecond, (string?)null),
+            // variant is field-level (the marker lives in field metadata) — handled in ToArrowField for
+            // top-level + struct-nested columns. A list/map ELEMENT has no field to carry the marker, so
+            // that placement is rejected rather than silently degraded to a plain struct.
+            "variant" => throw new DeltaLake.DeltaFormatException(
+                "variant is only supported as a top-level or struct-nested column (not a list/map element)."),
             _ => throw new DeltaLake.DeltaFormatException(
                 $"Unknown Delta primitive type: {typeName}"),
         };
@@ -106,12 +145,17 @@ public static class SchemaConverter
         new()
         {
             Name = field.Name,
-            Type = FromArrowType(field.DataType),
+            // The variant marker (field metadata) wins over the storage struct: without it a plain
+            // struct<metadata,value> stays an ordinary struct — the marker is the only discriminator.
+            Type = IsVariantArrowField(field)
+                ? new PrimitiveType { TypeName = "variant" }
+                : FromArrowType(field.DataType),
             Nullable = field.IsNullable,
             // Preserve per-field metadata (comments, delta.columnMapping.id/physicalName, invariants, ...) —
             // dropping it silently loses column-mapping identities on any Arrow -> Delta round-trip. Writer
-            // internals (the parquet codec's "PARQUET:*" keys, e.g. PARQUET:field_id) are transport hints, not
-            // Delta schema metadata — those are filtered out.
+            // internals (the parquet codec's "PARQUET:*" keys, e.g. PARQUET:field_id) and Arrow transport
+            // markers ("ARROW:extension:*", e.g. the variant discriminator) are transport hints, not Delta
+            // schema metadata — those are filtered out.
             Metadata = FilterArrowMetadata(field.Metadata),
         };
 
@@ -123,6 +167,8 @@ public static class SchemaConverter
         foreach (var kv in metadata)
         {
             if (kv.Key.StartsWith("PARQUET:", StringComparison.Ordinal))
+                continue;
+            if (kv.Key.StartsWith("ARROW:extension:", StringComparison.Ordinal))
                 continue;
             (result ??= new Dictionary<string, string>())[kv.Key] = kv.Value;
         }
