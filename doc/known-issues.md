@@ -335,8 +335,11 @@ work), `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`.
 - `tightBounds: false` is written on adds that carry a deletion vector
   (stats cover all physical rows, so bounds are loose); tight stats
   omit the field (default true).
-- Stats do not recurse into nested struct / list / map leaf fields; only
-  top-level primitives get stats.
+- Stats recurse into STRUCT leaves (nested JSON objects per the spec;
+  nullCount is exact — a row counts as null when the parent OR the child
+  slot is null; min/max reuse the flat collectors, which is superset-safe
+  even for parent-null slots). List/map subtrees carry no per-column
+  stats (per the spec).
 - `stats_parsed` is built by `StatsParsedBuilder` for checkpoint writes
   but `CheckpointReader.ExtractAdd` reads only the JSON `stats` string.
 

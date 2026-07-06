@@ -2558,9 +2558,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 string? stats = null;
                 if (_options.CollectStats ||
                     Schema.IcebergCompat.RequiresNumRecords(icebergVersion))
-                    stats = CollectStats(mappingMode != ColumnMappingMode.None
-                        ? ColumnMapping.RenameToPhysical(dataBatch, logicalToPhysical)
-                        : dataBatch);
+                    // Stats keys are PHYSICAL at every level under mapping (nested struct leaves included).
+                    stats = CollectStats(ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode));
 
                 actions.Add(new AddFile
                 {
