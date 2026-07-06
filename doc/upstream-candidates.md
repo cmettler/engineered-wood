@@ -113,6 +113,15 @@ instead of silently returning unfiltered (wrong-length columns); parquet `TIME(m
 commit (operation + timestamp — enables timestamp time travel on plain tables); struct-aware
 `TakeRows`/`PartitionUtils` (offset-correct child indexing).
 
+Thrift WIRE-TYPE guards in `MetadataDecoder` (`case N when type == ThriftType.X`): field dispatch was
+by id only, so a foreign writer reusing a field id with a DIFFERENT type desynchronized the whole
+stream — Impala's `dict-page-offset-zero.parquet` (parquet-testing) carries a LIST at ColumnMetaData
+field 15 (modern parquet.thrift: `bloom_filter_length: i32`); reading its list header as a varint made
+the reader fail four suite tests with "unknown Thrift type 14". Mismatches now fall to `default` →
+`Skip(type)`, exactly like Thrift-generated readers. Also: the ALP decoder is validated BIT-EXACT
+against apache/parquet-testing PR #100's arade/spotify1 files (unmerged upstream — the tests fetch
+notes are in `AlpDecoderTests`, and they no-op when the data is absent). Parquet.Tests: 585/585.
+
 Nested-stats PRUNING (consumption side of the nested `StatsCollector` output): `ColumnStats.Parse`
 flattens nested minValues/maxValues/nullCount objects into dotted keys ("s.a") — nested nullCount
 objects were previously DROPPED at parse — and `DeltaFilePruner` registers struct leaves under their
