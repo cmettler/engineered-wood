@@ -3088,6 +3088,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
+        // Tolerant projection: a requested column may be ABSENT from this file (a partial-column INSERT
+        // wrote only the supplied columns, or the column was ADDed after the file was written). The parquet
+        // reader throws on unknown names, so intersect with the file's actual top-level columns —
+        // BackfillMissingColumns reconciles the absent ones to typed NULLs. An intersection that comes up
+        // EMPTY falls back to a full read (the row count must still come from the file).
+        if (fileColumns is not null)
+        {
+            parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+            var present = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var child in parquetSchema.Root.Children)
+                present.Add(child.Name);
+            var kept = fileColumns.Where(present.Contains).ToList();
+            fileColumns = kept.Count > 0 ? kept : null;
+        }
+
         if (parquetSchema is null && isIdMode)
         {
             parquetSchema = await reader.GetSchemaAsync(cancellationToken)
