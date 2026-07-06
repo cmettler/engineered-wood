@@ -1153,7 +1153,13 @@ public class CrossValidationTests : IDisposable
         await using var file = new LocalRandomAccessFile(path);
         await using var reader = new ParquetFileReader(file, ownsFile: false);
         var readBatch = await reader.ReadRowGroupAsync(0);
-        var resultArray = (Decimal32Array)readBatch.Column(0);
+        // The reader widens every decimal to the classic Decimal128 regardless of the parquet physical
+        // width (narrow Decimal32/64 are mishandled over the Arrow C interface); precision/scale and the
+        // unscaled values survive the round-trip losslessly.
+        var resultType = Assert.IsType<Decimal128Type>(readBatch.Schema.GetFieldByName("value").DataType);
+        Assert.Equal(decType.Precision, resultType.Precision);
+        Assert.Equal(decType.Scale, resultType.Scale);
+        var resultArray = (Decimal128Array)readBatch.Column(0);
 
         for (int i = 0; i < count; i++)
             Assert.Equal(decArray.GetValue(i), resultArray.GetValue(i));
@@ -1188,7 +1194,11 @@ public class CrossValidationTests : IDisposable
         await using var file = new LocalRandomAccessFile(path);
         await using var reader = new ParquetFileReader(file, ownsFile: false);
         var readBatch = await reader.ReadRowGroupAsync(0);
-        var resultArray = (Decimal64Array)readBatch.Column(0);
+        // Read back as Decimal128 (see Roundtrip_Decimal32_Int32) — type widened, values lossless.
+        var resultType = Assert.IsType<Decimal128Type>(readBatch.Schema.GetFieldByName("value").DataType);
+        Assert.Equal(decType.Precision, resultType.Precision);
+        Assert.Equal(decType.Scale, resultType.Scale);
+        var resultArray = (Decimal128Array)readBatch.Column(0);
 
         for (int i = 0; i < count; i++)
             Assert.Equal(decArray.GetValue(i), resultArray.GetValue(i));

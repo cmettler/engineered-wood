@@ -12,9 +12,12 @@ namespace EngineeredWood.Tests.Parquet.Data;
 public class DecimalReadTests
 {
     [Fact]
-    public async Task Int32Decimal_ReadsAsDecimal32()
+    public async Task Int32Decimal_ReadsAsDecimal128()
     {
-        // int32_decimal.parquet: 24 rows, precision=4, scale=2, physical INT32
+        // int32_decimal.parquet: 24 rows, precision=4, scale=2, physical INT32.
+        // The reader always surfaces the classic Decimal128 regardless of the parquet physical width
+        // (the narrow Decimal32/64 Arrow types are mishandled by consumers of the Arrow C interface);
+        // widening the unscaled value is lossless, and precision/scale are preserved.
         await using var file = new LocalRandomAccessFile(TestData.GetPath("int32_decimal.parquet"));
         using var reader = new ParquetFileReader(file, ownsFile: false);
 
@@ -22,15 +25,13 @@ public class DecimalReadTests
 
         Assert.Equal(24, batch.Length);
         var field = batch.Schema.GetFieldByName("value");
-        var decType = Assert.IsType<Decimal32Type>(field.DataType);
+        var decType = Assert.IsType<Decimal128Type>(field.DataType);
         Assert.Equal(4, decType.Precision);
         Assert.Equal(2, decType.Scale);
 
-        var array = (Decimal32Array)batch.Column("value");
+        var array = (Decimal128Array)batch.Column("value");
         Assert.Equal(24, array.Length);
 
-        // Values are 1.00 .. 24.00 (stored as unscaled ints 100..2400)
-        // Decimal32Array stores 4-byte LE values; read raw and verify
         for (int i = 0; i < 24; i++)
         {
             Assert.False(array.IsNull(i), $"Row {i} should not be null");
@@ -38,9 +39,10 @@ public class DecimalReadTests
     }
 
     [Fact]
-    public async Task Int64Decimal_ReadsAsDecimal64()
+    public async Task Int64Decimal_ReadsAsDecimal128()
     {
-        // int64_decimal.parquet: 24 rows, precision=10, scale=2, physical INT64
+        // int64_decimal.parquet: 24 rows, precision=10, scale=2, physical INT64 — surfaced as
+        // Decimal128 (see Int32Decimal_ReadsAsDecimal128), precision/scale preserved.
         await using var file = new LocalRandomAccessFile(TestData.GetPath("int64_decimal.parquet"));
         using var reader = new ParquetFileReader(file, ownsFile: false);
 
@@ -48,11 +50,11 @@ public class DecimalReadTests
 
         Assert.Equal(24, batch.Length);
         var field = batch.Schema.GetFieldByName("value");
-        var decType = Assert.IsType<Decimal64Type>(field.DataType);
+        var decType = Assert.IsType<Decimal128Type>(field.DataType);
         Assert.Equal(10, decType.Precision);
         Assert.Equal(2, decType.Scale);
 
-        var array = (Decimal64Array)batch.Column("value");
+        var array = (Decimal128Array)batch.Column("value");
         Assert.Equal(24, array.Length);
 
         for (int i = 0; i < 24; i++)
@@ -132,7 +134,7 @@ public class DecimalReadTests
         using var reader = new ParquetFileReader(file, ownsFile: false);
 
         var batch = await reader.ReadRowGroupAsync(0);
-        var array = (Decimal32Array)batch.Column("value");
+        var array = (Decimal128Array)batch.Column("value");
 
         for (int i = 0; i < 24; i++)
         {
@@ -150,7 +152,7 @@ public class DecimalReadTests
         using var reader = new ParquetFileReader(file, ownsFile: false);
 
         var batch = await reader.ReadRowGroupAsync(0);
-        var array = (Decimal64Array)batch.Column("value");
+        var array = (Decimal128Array)batch.Column("value");
 
         for (int i = 0; i < 24; i++)
         {
