@@ -201,6 +201,15 @@ public static class SchemaConverter
         {
             Fields = s.Fields.Select(f => FromArrowField(f)).ToList(),
         },
+        // A variant marker on a list/map INNER field would be lost through the type-level conversion below
+        // (silently degrading the element to plain binary) — reject the placement instead. Struct-nested
+        // variant maps fine (struct children go through FromArrowField, which sees the marker).
+        ListType l when IsVariantArrowField(l.ValueField) =>
+            throw new DeltaLake.DeltaFormatException(
+                "variant is not supported as a list element (only top-level or struct-nested columns)."),
+        ArrowMapType m0 when IsVariantArrowField(m0.KeyField) || IsVariantArrowField(m0.ValueField) =>
+            throw new DeltaLake.DeltaFormatException(
+                "variant is not supported as a map key/value (only top-level or struct-nested columns)."),
         ListType l => new ArrayType
         {
             ElementType = FromArrowType(l.ValueDataType),
