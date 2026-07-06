@@ -29,7 +29,8 @@ internal static class CompactionExecutor
         ParquetWriteOptions parquetOptions,
         ParquetReadOptions parquetReadOptions,
         CancellationToken cancellationToken,
-        IDataFileWriter? dataFileWriter = null)
+        IDataFileWriter? dataFileWriter = null,
+        IDataFileReader? dataFileReader = null)
     {
         // Select small files as compaction candidates
         var candidates = snapshot.ActiveFiles.Values
@@ -90,13 +91,26 @@ internal static class CompactionExecutor
             long baseId = addFile.BaseRowId ?? 0;
             long commitVer = addFile.DefaultRowCommitVersion ?? 0;
 
-            await using var file = await fs.OpenReadAsync(DeltaPath.Decode(addFile.Path), cancellationToken)
-                .ConfigureAwait(false);
-            using var reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
-
+            // Pluggable read half: raw physical batches in file order (positions drive the DV exclusion and
+            // the row-id materialization below) — the same contract as the built-in reader.
+            IRandomAccessFile? file = null;
+            ParquetFileReader? reader = null;
+            IAsyncEnumerable<RecordBatch> rawBatches;
+            if (dataFileReader is not null)
+            {
+                rawBatches = dataFileReader.ReadAsync(DeltaPath.Decode(addFile.Path), null, cancellationToken);
+            }
+            else
+            {
+                file = await fs.OpenReadAsync(DeltaPath.Decode(addFile.Path), cancellationToken)
+                    .ConfigureAwait(false);
+                reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
+                rawBatches = reader.ReadAllAsync(cancellationToken: cancellationToken);
+            }
+            try
+            {
             long batchStartRow = 0;
-            await foreach (var batch in reader.ReadAllAsync(
-                cancellationToken: cancellationToken).ConfigureAwait(false))
+            await foreach (var batch in rawBatches.ConfigureAwait(false))
             {
                 // Drop the internal row-id column (no-op when absent) — count physical rows for DV positions first.
                 var (userBatch, srcRowIds) = RowTracking.RowTrackingWriter.StripRowIdColumn(batch);
@@ -145,7 +159,7 @@ internal static class CompactionExecutor
                     // so the compacted file keeps the column-mapping identity its readers resolve by.
                     var cleanFields = new List<Field>(outBatch.Schema.FieldsList.Count);
                     foreach (var f in outBatch.Schema.FieldsList)
-                        cleanFields.Add(new Field(f.Name, f.DataType, f.IsNullable));
+                        cleanFields.Add(DeltaTable.CleanField(f));
                     var cleanArrays = new List<IArrowArray>(outBatch.ColumnCount);
                     for (int c = 0; c < outBatch.ColumnCount; c++)
                         cleanArrays.Add(outBatch.Column(c));
@@ -158,6 +172,15 @@ internal static class CompactionExecutor
                 {
                     batchIds!.Add(survivorIds!);
                     batchVers!.Add(survivorVers!);
+                }
+            }
+            }
+            finally
+            {
+                reader?.Dispose();
+                if (file is not null)
+                {
+                    await file.DisposeAsync().ConfigureAwait(false);
                 }
             }
         }

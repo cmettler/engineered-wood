@@ -204,6 +204,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             readerFeatureList ??= new List<string>();
             readerFeatureList.Add("variantType");
         }
+        // Identity columns (delta.identity.* field metadata) are a WRITER-only feature ('identityColumns',
+        // legacy writer v6) — readers see an ordinary long column. Declared whenever the schema carries one,
+        // so a strict writer (Spark) recognizes the table's generation contract.
+        if (deltaSchema.Fields.Any(IdentityColumn.IsIdentityColumn))
+        {
+            minWriterVersion = 7;
+            writerFeatureSet.Add("identityColumns");
+        }
         // Column mapping is BOTH a reader and writer feature. In table-features mode (reader v3 / writer v7 —
         // forced by deletionVectors/rowTracking/… above) it MUST be listed in BOTH feature lists, else a strict
         // reader (Spark) rejects the table ("feature enabled in metadata but not listed in protocol"). Absent any
@@ -1105,7 +1113,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     // emits a malformed footer (TProtocolException) on reader-sourced batches.
                     var cleanFields = new List<Field>(b.Schema.FieldsList.Count);
                     foreach (var f in b.Schema.FieldsList)
-                        cleanFields.Add(new Field(f.Name, f.DataType, f.IsNullable));
+                        cleanFields.Add(CleanField(f));
                     var cleanArrays = new List<IArrowArray>(b.ColumnCount);
                     for (int c = 0; c < b.ColumnCount; c++)
                         cleanArrays.Add(b.Column(c));
@@ -1418,7 +1426,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // else the parquet footer is malformed for delta-kernel/Spark/Fabric.
                 var cleanFields = new List<Field>(b.Schema.FieldsList.Count);
                 foreach (var f in b.Schema.FieldsList)
-                    cleanFields.Add(new Field(f.Name, f.DataType, f.IsNullable));
+                    cleanFields.Add(CleanField(f));
                 var cleanArrays = new List<IArrowArray>(b.ColumnCount);
                 for (int c = 0; c < b.ColumnCount; c++)
                     cleanArrays.Add(b.Column(c));
@@ -1655,7 +1663,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 var cleanFields = new List<Field>(b.Schema.FieldsList.Count);
                 foreach (var f in b.Schema.FieldsList)
-                    cleanFields.Add(new Field(f.Name, f.DataType, f.IsNullable));
+                    cleanFields.Add(CleanField(f));
                 var cleanArrays = new List<IArrowArray>(b.ColumnCount);
                 for (int c = 0; c < b.ColumnCount; c++)
                     cleanArrays.Add(b.Column(c));
@@ -2316,6 +2324,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     private void ThrowIfVariantRewrite(string operation)
     {
+        if (_options.DataFileReader is not null && _options.DataFileWriter is not null)
+        {
+            // Fully host-codec rewrite: the read AND write halves both go through the pluggable seams, which
+            // preserve the parquet VARIANT annotation end to end (the host decodes/encodes the annotated
+            // group; the transport marker survives the clean rebuild via CleanField) — no gate needed.
+            return;
+        }
         if (SchemaUsesVariant(CurrentSnapshot.Schema))
         {
             throw new DeltaFormatException(
@@ -2912,7 +2927,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var result = await Compaction.CompactionExecutor.ExecuteAsync(
             _fs, _log, CurrentSnapshot, options,
             _options.ParquetWriteOptions, _options.ParquetReadOptions,
-            cancellationToken, _options.DataFileWriter).ConfigureAwait(false);
+            cancellationToken, _options.DataFileWriter, _options.DataFileReader).ConfigureAwait(false);
 
         if (result.HasValue)
         {
@@ -2972,6 +2987,52 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var fieldIdToLogical = isIdMode
             ? ColumnMapping.BuildFieldIdToLogicalMap(snapshot.Schema)
             : null;
+
+        // Load the deletion vector first — it is independent of the byte source.
+        HashSet<long>? deletedRows = null;
+        if (addFile.DeletionVector is not null)
+        {
+            deletedRows = await _dvReader.ReadAsync(
+                addFile.DeletionVector, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (_options.DataFileReader is { } dataFileReader)
+        {
+            // Pluggable codec read: raw physical batches in file order (DV rows included). Projection resolves
+            // by PHYSICAL NAME in every mode — id-mode field-id resolution needs the parquet footer, which the
+            // seam deliberately hides; Delta-spec files carry physicalName in BOTH modes, so name resolution is
+            // exact for spec-written files. parquetSchema stays null, so the logical rename in the pipeline
+            // falls to the (equivalent for spec files) name-based path.
+            IReadOnlyList<string>? seamColumns = null;
+            if (columns is not null)
+            {
+                var partSet = hasPartitions
+                    ? new HashSet<string>(partitionColumns, StringComparer.Ordinal)
+                    : new HashSet<string>();
+                seamColumns = columns
+                    .Where(c => !partSet.Contains(c))
+                    .Select(c => logicalToPhysical.TryGetValue(c, out var p) ? p : c)
+                    .ToList();
+            }
+            else if (hasPartitions)
+            {
+                var partSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
+                seamColumns = snapshot.Schema.Fields
+                    .Where(f => !partSet.Contains(f.Name))
+                    .Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
+                    .ToList();
+            }
+            var seamBatches = dataFileReader.ReadAsync(
+                DeltaPath.Decode(addFile.Path), seamColumns, cancellationToken);
+            await foreach (var processed in ProcessFileBatchesAsync(
+                seamBatches, addFile, snapshot, columns, includeRowId, fileOrdinal, mappingMode, isIdMode,
+                physicalToLogical, logicalToPhysical, fieldIdToLogical, parquetSchema: null, deletedRows,
+                partitionColumns, hasPartitions, cancellationToken).ConfigureAwait(false))
+            {
+                yield return processed;
+            }
+            yield break;
+        }
 
         // Open the file and read its Parquet schema for field_id resolution
         await using var file = await _fs.OpenReadAsync(DeltaPath.Decode(addFile.Path), cancellationToken)
@@ -3033,25 +3094,47 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        // Load deletion vector if present
-        HashSet<long>? deletedRows = null;
-        if (addFile.DeletionVector is not null)
-        {
-            deletedRows = await _dvReader.ReadAsync(
-                addFile.DeletionVector, cancellationToken).ConfigureAwait(false);
-        }
-
         if (parquetSchema is null && isIdMode)
         {
             parquetSchema = await reader.GetSchemaAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
 
+        await foreach (var processed in ProcessFileBatchesAsync(
+            reader.ReadAllAsync(columnNames: fileColumns, cancellationToken: cancellationToken),
+            addFile, snapshot, columns, includeRowId, fileOrdinal, mappingMode, isIdMode,
+            physicalToLogical, logicalToPhysical, fieldIdToLogical, parquetSchema, deletedRows,
+            partitionColumns, hasPartitions, cancellationToken).ConfigureAwait(false))
+        {
+            yield return processed;
+        }
+    }
+
+    // The per-batch read pipeline shared by the built-in ParquetFileReader and a pluggable IDataFileReader:
+    // logical rename (field-id when a parquet schema is available, else by physical name), DV filtering with
+    // absolute-position tracking, type widening, partition-column re-add, row-tracking strip, schema-evolution
+    // backfill, and the transient rowid. Raw batches MUST arrive in file order (positions are counted).
+    private async IAsyncEnumerable<RecordBatch> ProcessFileBatchesAsync(
+        IAsyncEnumerable<RecordBatch> rawBatches,
+        AddFile addFile,
+        Snapshot.Snapshot snapshot,
+        IReadOnlyList<string>? columns,
+        bool includeRowId,
+        long fileOrdinal,
+        ColumnMappingMode mappingMode,
+        bool isIdMode,
+        Dictionary<string, string> physicalToLogical,
+        Dictionary<string, string> logicalToPhysical,
+        Dictionary<int, string>? fieldIdToLogical,
+        Parquet.Schema.SchemaDescriptor? parquetSchema,
+        HashSet<long>? deletedRows,
+        IReadOnlyList<string> partitionColumns,
+        bool hasPartitions,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         long batchStartRow = 0;
 
-        await foreach (var batch in reader.ReadAllAsync(
-            columnNames: fileColumns, cancellationToken: cancellationToken)
-            .ConfigureAwait(false))
+        await foreach (var batch in rawBatches.ConfigureAwait(false))
         {
             // Rename columns back to logical names (flat, top level), then recursively for nested struct
             // children (the flat renames leave them under their physical names).
@@ -3170,6 +3253,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 builder.Field(field);
         }
         return builder.Build();
+    }
+
+    /// <summary>
+    /// A field stripped to name/type/nullability for the clean-rebuild before a re-write: reader-carried
+    /// metadata (e.g. an existing <c>PARQUET:field_id</c>) malforms the footer when the writer re-stamps ids,
+    /// so it is dropped — EXCEPT the <c>ARROW:extension:*</c> transport markers (e.g. the variant
+    /// discriminator), which type the column for a pluggable host codec and must survive every rewrite.
+    /// </summary>
+    internal static Field CleanField(Field f)
+    {
+        Dictionary<string, string>? kept = null;
+        if (f.Metadata is { } md)
+        {
+            foreach (var kv in md)
+            {
+                if (kv.Key.StartsWith("ARROW:extension:", StringComparison.Ordinal))
+                    (kept ??= new Dictionary<string, string>())[kv.Key] = kv.Value;
+            }
+        }
+        return new Field(f.Name, f.DataType, f.IsNullable, kept);
     }
 
     /// <summary>

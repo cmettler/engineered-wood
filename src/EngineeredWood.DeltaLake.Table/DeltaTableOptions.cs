@@ -48,4 +48,11 @@ public sealed record DeltaTableOptions
     /// file with its own reader; stats, the data-file writer, row tracking, CDF, and the commit are unchanged.
     /// Default: null (use the built-in reader + in-process transform).</summary>
     public IDataFileRewriter? DataFileRewriter { get; init; }
+
+    /// <summary>Optional pluggable reader for data-file bytes — the read-side counterpart of
+    /// <see cref="DataFileWriter"/>. When set, the table decodes each data file through it (raw physical
+    /// batches in file order; see <see cref="IDataFileReader"/>) instead of the built-in
+    /// <c>ParquetFileReader</c>; all processing above the decode (column-mapping rename, DV filtering,
+    /// backfill, partition re-add, rowids) is unchanged. Default: null (use the built-in reader).</summary>
+    public IDataFileReader? DataFileReader { get; init; }
 }
