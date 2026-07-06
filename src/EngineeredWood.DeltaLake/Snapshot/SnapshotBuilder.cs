@@ -19,6 +19,7 @@ public sealed class SnapshotBuilder
     private readonly Dictionary<string, AddFile> _activeFiles = new();
     private readonly Dictionary<string, TransactionId> _appTransactions = new();
     private readonly Dictionary<string, DomainMetadata> _domainMetadata = new();
+    private readonly Dictionary<string, RemoveFile> _tombstones = new();
     private long _version = -1;
     private long? _inCommitTimestamp;
 
@@ -206,6 +207,9 @@ public sealed class SnapshotBuilder
         foreach (var kvp in snapshot.DomainMetadata)
             builder._domainMetadata[kvp.Key] = kvp.Value;
 
+        foreach (var kvp in snapshot.Tombstones)
+            builder._tombstones[kvp.Key] = kvp.Value;
+
         return builder;
     }
 
@@ -231,10 +235,12 @@ public sealed class SnapshotBuilder
 
                 case AddFile add:
                     _activeFiles[add.ReconciliationKey] = add;
+                    _tombstones.Remove(add.ReconciliationKey);
                     break;
 
                 case RemoveFile remove:
                     _activeFiles.Remove(remove.ReconciliationKey);
+                    _tombstones[remove.ReconciliationKey] = remove;
                     break;
 
                 case TransactionId txn:
@@ -280,6 +286,7 @@ public sealed class SnapshotBuilder
             ActiveFiles = activeFiles,
             AppTransactions = new Dictionary<string, TransactionId>(_appTransactions),
             DomainMetadata = new Dictionary<string, DomainMetadata>(_domainMetadata),
+            Tombstones = new Dictionary<string, RemoveFile>(_tombstones),
             InCommitTimestamp = _inCommitTimestamp,
             // The delta.rowTracking domainMetadata is the spec source of truth for the high-water mark;
             // the active-file derivation alone under-counts after removes (a later writer could then

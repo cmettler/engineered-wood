@@ -45,6 +45,14 @@ public sealed class Snapshot
     public required IReadOnlyDictionary<string, DomainMetadata> DomainMetadata { get; init; }
 
     /// <summary>
+    /// Remove tombstones (files removed from the table but not yet expired), keyed by
+    /// <see cref="RemoveFile.ReconciliationKey"/>. The spec requires tombstones within the retention
+    /// window to be preserved in checkpoints so concurrent readers / VACUUM stay correct.
+    /// </summary>
+    public IReadOnlyDictionary<string, RemoveFile> Tombstones { get; init; } =
+        new Dictionary<string, RemoveFile>();
+
+    /// <summary>
     /// The in-commit timestamp for this snapshot's version, if available.
     /// Milliseconds since epoch. Only present when the table has
     /// <c>delta.enableInCommitTimestamps</c> enabled.

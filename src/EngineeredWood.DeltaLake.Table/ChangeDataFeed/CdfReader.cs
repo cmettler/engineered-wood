@@ -39,6 +39,9 @@ internal static class CdfReader
     {
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(snapshot.Schema, mappingMode);
+        // The flat rename handles the top level; nested struct children need the recursive pass.
+        bool nestedMapping = mappingMode != ColumnMappingMode.None
+            && ColumnMappingRecursive.HasNestedFields(snapshot.Schema);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
         var partitionColumns = snapshot.Metadata.PartitionColumns;
         var arrowSchema = snapshot.ArrowSchema;
@@ -72,7 +75,9 @@ internal static class CdfReader
                         fs, cdcFile, version, commitTimestamp, readOptions,
                         physicalToLogical, cancellationToken).ConfigureAwait(false))
                     {
-                        yield return batch;
+                        yield return nestedMapping
+                            ? ColumnMappingRecursive.ToLogical(batch, snapshot.Schema, mappingMode)
+                            : batch;
                     }
                 }
             }
@@ -104,7 +109,9 @@ internal static class CdfReader
                         partitionColumns, arrowSchema, cancellationToken)
                         .ConfigureAwait(false))
                     {
-                        yield return batch;
+                        yield return nestedMapping
+                            ? ColumnMappingRecursive.ToLogical(batch, snapshot.Schema, mappingMode)
+                            : batch;
                     }
                 }
 
@@ -120,7 +127,9 @@ internal static class CdfReader
                         partitionColumns, arrowSchema, cancellationToken)
                         .ConfigureAwait(false))
                     {
-                        yield return batch;
+                        yield return nestedMapping
+                            ? ColumnMappingRecursive.ToLogical(batch, snapshot.Schema, mappingMode)
+                            : batch;
                     }
                 }
             }

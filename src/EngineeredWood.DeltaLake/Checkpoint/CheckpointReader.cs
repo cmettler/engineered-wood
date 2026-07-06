@@ -216,6 +216,15 @@ public sealed class CheckpointReader
         // partitionValues is a map<string, string>
         var partitionValues = GetStringMapField(structArray, "partitionValues", row);
 
+        int tagsIdx = FindFieldIndex(structArray, "tags");
+        Dictionary<string, string>? tags = null;
+        if (tagsIdx >= 0 && !structArray.Fields[tagsIdx].IsNull(row))
+        {
+            var t = GetStringMapField(structArray, "tags", row);
+            if (t.Count > 0)
+                tags = t;
+        }
+
         // deletionVector (nested struct; null storageType = none) + row-tracking fields. A checkpoint written
         // before these were preserved simply lacks the columns — the lookups return null and the add behaves as
         // before (but its DV/base-row-id information is already lost in that checkpoint).
@@ -230,7 +239,7 @@ public sealed class CheckpointReader
             {
                 dv = new DeletionVector
                 {
-                    StorageType = storageType,
+                    StorageType = storageType!, // guarded by IsNullOrEmpty above (no flow attribute on netstandard2.0)
                     PathOrInlineDv = GetStringField(dvArray, "pathOrInlineDv", dvRow) ?? "",
                     Offset = (int?)GetInt32Field(dvArray, "offset", dvRow),
                     SizeInBytes = (int)(GetInt32Field(dvArray, "sizeInBytes", dvRow) ?? 0),
@@ -247,6 +256,7 @@ public sealed class CheckpointReader
             ModificationTime = modTime,
             DataChange = dataChange,
             Stats = stats,
+            Tags = tags,
             DeletionVector = dv,
             BaseRowId = GetInt64Field(structArray, "baseRowId", row),
             DefaultRowCommitVersion = GetInt64Field(structArray, "defaultRowCommitVersion", row),

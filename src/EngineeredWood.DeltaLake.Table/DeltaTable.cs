@@ -879,6 +879,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 cancellationToken: cancellationToken).ConfigureAwait(false))
             {
                 var logicalBatch = ColumnMapping.RenameColumns(batch, physicalToLogical);
+                if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
+                    logicalBatch = ColumnMappingRecursive.ToLogical(logicalBatch, snapshot.Schema, mappingMode);
                 var mask = predicate(logicalBatch);
                 var matchRows = new List<int>();
 
@@ -934,7 +936,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 foreach (var deletedBatch in deletedRowBatches)
                 {
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                        _fs, snapshot, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
                         cancellationToken).ConfigureAwait(false);
                     actions.Add(cdcAction);
@@ -1102,8 +1104,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         cleanArrays.Add(b.Column(c));
                     var clean = new RecordBatch(new Apache.Arrow.Schema(cleanFields, null), cleanArrays, b.Length);
 
-                    var physicalBatch = ColumnMapping.RenameToPhysical(clean, logicalToPhysical);
-                    physicalBatch = ColumnMapping.SetParquetFieldIds(physicalBatch, snapshot.Schema, mappingMode);
+                    var physicalBatch = ColumnMappingRecursive.ToPhysical(clean, snapshot.Schema, mappingMode);
                     physicalBatches.Add(physicalBatch);
                 }
 
@@ -1147,7 +1148,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 foreach (var deletedBatch in deletedBatches)
                 {
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                        _fs, snapshot, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
                         cancellationToken).ConfigureAwait(false);
                     actions.Add(cdcAction);
@@ -1277,7 +1278,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 foreach (var deletedBatch in deletedBatches)
                 {
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                        _fs, snapshot, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
                         addFile.PartitionValues, _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false);
                     actions.Add(cdcAction);
                 }
@@ -1415,8 +1416,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     cleanArrays.Add(b.Column(c));
                 var clean = new RecordBatch(new Apache.Arrow.Schema(cleanFields, null), cleanArrays, b.Length);
 
-                var physicalBatch = ColumnMapping.RenameToPhysical(clean, logicalToPhysical);
-                physicalBatch = ColumnMapping.SetParquetFieldIds(physicalBatch, snapshot.Schema, mappingMode);
+                // Recursive: physical names + field ids at EVERY level (a substituted nested struct arrives
+                // logical-named; pass-through columns read from data files are already physical — the
+                // tolerant matching stamps their ids without renaming).
+                var physicalBatch = ColumnMappingRecursive.ToPhysical(clean, snapshot.Schema, mappingMode);
                 physicalBatches.Add(physicalBatch);
             }
 
@@ -1490,11 +1493,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     var postBatch = TakeRowsFromBatch(rew, matched);
 
                     var preCdc = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, preBatch, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
+                        _fs, snapshot, preBatch, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false);
                     actions.Add(preCdc);
                     var postCdc = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, postBatch, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
+                        _fs, snapshot, postBatch, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false);
                     actions.Add(postCdc);
                 }
@@ -1649,8 +1652,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 for (int c = 0; c < b.ColumnCount; c++)
                     cleanArrays.Add(b.Column(c));
                 var clean = new RecordBatch(new Apache.Arrow.Schema(cleanFields, null), cleanArrays, b.Length);
-                var physicalBatch = ColumnMapping.RenameToPhysical(clean, logicalToPhysical);
-                physicalBatch = ColumnMapping.SetParquetFieldIds(physicalBatch, snapshot.Schema, mappingMode);
+                // Recursive: physical names + field ids at EVERY level (a substituted nested struct arrives
+                // logical-named; pass-through columns read from data files are already physical — the
+                // tolerant matching stamps their ids without renaming).
+                var physicalBatch = ColumnMappingRecursive.ToPhysical(clean, snapshot.Schema, mappingMode);
                 if (appendRowIds is not null)
                 {
                     // Materialize the ORIGINAL stable ids (preserve row id across UPDATE) — the declared
@@ -1817,9 +1822,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 foreach (var batch in outputBatches)
                 {
                     // Rename to physical names for Parquet storage
-                    var physicalBatch = ColumnMapping.RenameToPhysical(batch, logicalToPhysical);
-                    physicalBatch = ColumnMapping.SetParquetFieldIds(
-                        physicalBatch, snapshot.Schema, mappingMode);
+                    var physicalBatch = ColumnMappingRecursive.ToPhysical(batch, snapshot.Schema, mappingMode);
 
                     // Strip row tracking column if present
                     var (cleanBatch, _) = RowTracking.RowTrackingWriter.StripRowIdColumn(physicalBatch);
@@ -1860,7 +1863,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 foreach (var pre in preimages)
                 {
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
+                        _fs, snapshot, pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
                         cancellationToken).ConfigureAwait(false);
                     actions.Add(cdcAction);
@@ -1868,7 +1871,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 foreach (var post in postimages)
                 {
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
+                        _fs, snapshot, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
                         addFile.PartitionValues, _options.ParquetWriteOptions,
                         cancellationToken).ConfigureAwait(false);
                     actions.Add(cdcAction);
@@ -2475,8 +2478,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         $"({string.Join(", ", overwritePartitions.Select(kv => kv.Key + "=" + kv.Value))}).");
                 }
 
-                // Rename logical columns to physical names for Parquet storage
-                var physicalBatch = ColumnMapping.RenameToPhysical(dataBatch, logicalToPhysical);
+                // Rename logical columns to physical names + stamp field ids, at EVERY level (nested struct
+                // children included — the top-level-only pair left them logical-named/id-less).
+                var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode);
 
                 // IcebergCompat: materialize partition columns into Parquet file
                 if (Schema.IcebergCompat.RequiresPartitionMaterialization(icebergVersion) &&
@@ -2487,9 +2491,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         logicalToPhysical);
                 }
 
-                // Set PARQUET:field_id metadata for column mapping (both id and name modes)
-                physicalBatch = ColumnMapping.SetParquetFieldIds(
-                    physicalBatch, snapshot.Schema, mappingMode);
+                // (field ids already stamped recursively above; IcebergCompat-appended partition columns are
+                // physical-named by AppendPartitionColumns and carry no mapping ids of their own)
 
                 // Assign row IDs if row tracking is enabled
                 long fileBaseRowId = nextRowId;
@@ -2986,7 +2989,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             columnNames: fileColumns, cancellationToken: cancellationToken)
             .ConfigureAwait(false))
         {
-            // Rename columns back to logical names
+            // Rename columns back to logical names (flat, top level), then recursively for nested struct
+            // children (the flat renames leave them under their physical names).
             RecordBatch result;
             if (isIdMode && fieldIdToLogical is not null && parquetSchema is not null)
             {
@@ -2995,6 +2999,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             else
             {
                 result = ColumnMapping.RenameColumns(batch, physicalToLogical);
+            }
+            if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
+            {
+                result = ColumnMappingRecursive.ToLogical(result, snapshot.Schema, mappingMode);
             }
 
             // Compute the ABSOLUTE parquet positions of the rows that survive DV filtering (in order), so the

@@ -74,13 +74,24 @@ public sealed class CheckpointWriter
     private static RecordBatch BuildCheckpointBatch(
         Snapshot.Snapshot snapshot, out long actionCount)
     {
-        // Collect all actions: 1 protocol + 1 metadata + N adds + N txns + N domainMetadata
+        // Collect all actions: 1 protocol + 1 metadata + N adds + N unexpired removes + N txns + N domainMetadata
         var allActions = new List<DeltaAction>();
         allActions.Add(snapshot.Protocol);
         allActions.Add(snapshot.Metadata);
 
         foreach (var add in snapshot.ActiveFiles.Values)
             allActions.Add(add);
+
+        // The spec requires remove tombstones within the retention window to be preserved in
+        // checkpoints (a reader replaying only from the checkpoint would otherwise lose them and
+        // VACUUM safety / streaming readers break). Expired tombstones are reconciled away here.
+        long expiryCutoffMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            - (long)TombstoneRetention(snapshot.Metadata.Configuration).TotalMilliseconds;
+        foreach (var remove in snapshot.Tombstones.Values)
+        {
+            if (remove.DeletionTimestamp is null || remove.DeletionTimestamp.Value >= expiryCutoffMs)
+                allActions.Add(remove);
+        }
 
         foreach (var txn in snapshot.AppTransactions.Values)
             allActions.Add(txn);
@@ -98,7 +109,7 @@ public sealed class CheckpointWriter
         var protocolArray = BuildProtocolColumn(allActions, count);
         var metadataArray = BuildMetadataColumn(allActions, count);
         var addArray = BuildAddColumn(allActions, count);
-        var removeArray = BuildRemoveColumn(count); // No removes in checkpoints
+        var removeArray = BuildRemoveColumn(allActions, count);
         var txnArray = BuildTxnColumn(allActions, count);
         var domainMetadataArray = BuildDomainMetadataColumn(allActions, count);
 
@@ -174,6 +185,9 @@ public sealed class CheckpointWriter
             new Field("modificationTime", Int64Type.Default, true),
             new Field("dataChange", BooleanType.Default, true),
             new Field("stats", StringType.Default, true),
+            new Field("tags", new ArrowMapType(
+                new Field("key", StringType.Default, false),
+                new Field("value", StringType.Default, true)), true),
             new Field("deletionVector", dvType, true),
             new Field("baseRowId", Int64Type.Default, true),
             new Field("defaultRowCommitVersion", Int64Type.Default, true),
@@ -487,6 +501,15 @@ public sealed class CheckpointWriter
         pvOffsetsBuilder.Append(0);
         int pvOffset = 0;
 
+        // tags map (null per row when the add carries no tags)
+        var tagOffsetsBuilder = new ArrowBuffer.Builder<int>();
+        var tagKeys = new StringArray.Builder();
+        var tagValues = new StringArray.Builder();
+        var tagValidity = new ArrowBuffer.BitmapBuilder(count);
+        int tagNulls = 0;
+        tagOffsetsBuilder.Append(0);
+        int tagOffset = 0;
+
         for (int i = 0; i < count; i++)
         {
             if (actions[i] is AddFile a)
@@ -510,6 +533,26 @@ public sealed class CheckpointWriter
                     pvOffset++;
                 }
                 pvOffsetsBuilder.Append(pvOffset);
+
+                if (a.Tags is { } tags)
+                {
+                    foreach (var kvp in tags)
+                    {
+                        tagKeys.Append(kvp.Key);
+                        if (kvp.Value is null)
+                            tagValues.AppendNull();
+                        else
+                            tagValues.Append(kvp.Value);
+                        tagOffset++;
+                    }
+                    tagValidity.Append(true);
+                }
+                else
+                {
+                    tagValidity.Append(false);
+                    tagNulls++;
+                }
+                tagOffsetsBuilder.Append(tagOffset);
 
                 if (a.DeletionVector is { } dv)
                 {
@@ -538,6 +581,9 @@ public sealed class CheckpointWriter
                 dataChangeBuilder.AppendNull();
                 statsBuilder.AppendNull();
                 pvOffsetsBuilder.Append(pvOffset);
+                tagValidity.Append(false);
+                tagNulls++;
+                tagOffsetsBuilder.Append(tagOffset);
                 dvStorageBuilder.AppendNull();
                 dvPathBuilder.AppendNull();
                 dvOffsetBuilder.AppendNull();
@@ -560,6 +606,19 @@ public sealed class CheckpointWriter
             ArrowBuffer.Empty);
         var pvMap = new MapArray(pvMapType, count,
             pvOffsetsBuilder.Build(), pvEntries, ArrowBuffer.Empty, 0);
+
+        var tagMapType = new ArrowMapType(
+            new Field("key", StringType.Default, false),
+            new Field("value", StringType.Default, true));
+        var tagKeysArray = tagKeys.Build();
+        var tagValuesArray = tagValues.Build();
+        var tagEntries = new StructArray(
+            new ArrowStructType(new List<Field> { tagMapType.KeyField, tagMapType.ValueField }),
+            tagKeysArray.Length,
+            new IArrowArray[] { tagKeysArray, tagValuesArray },
+            ArrowBuffer.Empty);
+        var tagMap = new MapArray(tagMapType, count,
+            tagOffsetsBuilder.Build(), tagEntries, tagValidity.Build(), tagNulls);
 
         var dvFields = new List<Field>
         {
@@ -597,6 +656,7 @@ public sealed class CheckpointWriter
             new Field("modificationTime", Int64Type.Default, true),
             new Field("dataChange", BooleanType.Default, true),
             new Field("stats", StringType.Default, true),
+            new Field("tags", tagMapType, true),
             new Field("deletionVector", new ArrowStructType(dvFields), true),
             new Field("baseRowId", Int64Type.Default, true),
             new Field("defaultRowCommitVersion", Int64Type.Default, true),
@@ -608,22 +668,58 @@ public sealed class CheckpointWriter
             count,
             [pathBuilder.Build(), pvMap, sizeBuilder.Build(),
              modTimeBuilder.Build(), dataChangeBuilder.Build(), statsBuilder.Build(),
-             dvStruct, baseRowIdBuilder.Build(), defaultRcvBuilder.Build()],
+             tagMap, dvStruct, baseRowIdBuilder.Build(), defaultRcvBuilder.Build()],
             validity, nullCount);
     }
 
-    private static StructArray BuildRemoveColumn(int count)
+    /// <summary>
+    /// Default tombstone retention (mirrors <c>delta.deletedFileRetentionDuration</c>'s default of
+    /// one week); the table property is honored when parseable ("interval N days|hours|minutes|weeks").
+    /// </summary>
+    private static TimeSpan TombstoneRetention(IReadOnlyDictionary<string, string>? configuration)
     {
-        // Checkpoints don't contain remove actions (they're reconciled away)
+        if (configuration is not null
+            && configuration.TryGetValue("delta.deletedFileRetentionDuration", out var raw)
+            && raw is not null)
+        {
+            var parts = raw.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 3
+                && string.Equals(parts[0], "interval", StringComparison.OrdinalIgnoreCase)
+                && long.TryParse(parts[1], out long n) && n >= 0)
+            {
+                switch (parts[2].ToLowerInvariant())
+                {
+                    case "week": case "weeks": return TimeSpan.FromDays(n * 7);
+                    case "day": case "days": return TimeSpan.FromDays(n);
+                    case "hour": case "hours": return TimeSpan.FromHours(n);
+                    case "minute": case "minutes": return TimeSpan.FromMinutes(n);
+                    case "second": case "seconds": return TimeSpan.FromSeconds(n);
+                }
+            }
+        }
+        return TimeSpan.FromDays(7);
+    }
+
+    private static StructArray BuildRemoveColumn(List<DeltaAction> actions, int count)
+    {
         var pathBuilder = new StringArray.Builder();
         var tsBuilder = new Int64Array.Builder();
         var dcBuilder = new BooleanArray.Builder();
 
         for (int i = 0; i < count; i++)
         {
-            pathBuilder.AppendNull();
-            tsBuilder.AppendNull();
-            dcBuilder.AppendNull();
+            if (actions[i] is RemoveFile r)
+            {
+                pathBuilder.Append(r.Path);
+                if (r.DeletionTimestamp is { } ts) tsBuilder.Append(ts); else tsBuilder.AppendNull();
+                dcBuilder.Append(r.DataChange);
+            }
+            else
+            {
+                pathBuilder.AppendNull();
+                tsBuilder.AppendNull();
+                dcBuilder.AppendNull();
+            }
         }
 
         var fields = new List<Field>
@@ -633,15 +729,11 @@ public sealed class CheckpointWriter
             new Field("dataChange", BooleanType.Default, true),
         };
 
-        var removeValidity = new ArrowBuffer.BitmapBuilder(count);
-        for (int i = 0; i < count; i++)
-        {
-            removeValidity.Append(false);
-        }
+        var (validity, nullCount) = BuildActionValidity<RemoveFile>(actions, count);
         return new StructArray(
             new ArrowStructType(fields), count,
             [pathBuilder.Build(), tsBuilder.Build(), dcBuilder.Build()],
-            removeValidity.Build(), count);
+            validity, nullCount);
     }
 
     private static StructArray BuildTxnColumn(List<DeltaAction> actions, int count)

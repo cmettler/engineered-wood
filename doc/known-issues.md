@@ -322,7 +322,7 @@ effectively unused on write.
 
 **Table-property honoring.** The following properties are accepted in
 table metadata but not acted on by the runtime: `delta.logRetentionDuration`,
-`delta.deletedFileRetentionDuration`, `delta.enableExpiredLogCleanup`,
+`delta.enableExpiredLogCleanup`,
 `delta.randomizeFilePrefixes`, `delta.checkpointInterval` (as a table
 property; the .NET option `DeltaTableOptions.CheckpointInterval` does
 work), `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`.
@@ -370,16 +370,18 @@ raw incremental-by-version-range read outside of CDF.
 add/drop/rename/reorder columns, change nullability, or add a column to
 a nested struct. Column mapping mode is fixed at `CreateAsync`.
 
-**Checkpoint content gaps.** `CheckpointWriter` now preserves
-`add.deletionVector`, `add.baseRowId`/`defaultRowCommitVersion` and the
-protocol `readerFeatures`/`writerFeatures` (dropping the DV silently
-resurrected deleted rows for any reader replaying from the checkpoint),
-emits the required `metaData.format.options`, and writes the top-level
-action structs as NULLABLE per the spec checkpoint schema (delta-kernel
-rejects an always-present struct with null required children).
-Remaining gaps: `add.tags` is still dropped, and no `remove` struct is
-emitted for unexpired tombstones — the spec requires tombstones within
-the retention window to be preserved in checkpoints.
+**Checkpoint content gaps — fixed.** `CheckpointWriter` preserves
+`add.deletionVector`, `add.tags`, `add.baseRowId`/
+`defaultRowCommitVersion` and the protocol
+`readerFeatures`/`writerFeatures` (dropping the DV silently resurrected
+deleted rows for any reader replaying from the checkpoint), emits the
+required `metaData.format.options`, writes the top-level action structs
+as NULLABLE per the spec checkpoint schema (delta-kernel rejects an
+always-present struct with null required children), and includes
+`remove` tombstones within the retention window (snapshots track
+tombstones; `delta.deletedFileRetentionDuration` is honored when
+parseable, default one week). `CheckpointReader` reads all of these
+back.
 
 **Orphan deletion-vector files.** `VacuumExecutor` excludes
 `_delta_log/` from deletion. Abandoned DV `.bin` files written into

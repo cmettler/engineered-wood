@@ -5,6 +5,7 @@ using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
+using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet;
 
@@ -22,12 +23,22 @@ internal static class CdfWriter
     /// </summary>
     public static async ValueTask<CdcFile> WriteAsync(
         ITableFileSystem fs,
+        Snapshot.Snapshot snapshot,
         RecordBatch rows,
         string changeType,
         IReadOnlyDictionary<string, string> partitionValues,
         ParquetWriteOptions? parquetOptions,
         CancellationToken cancellationToken)
     {
+        // Under column mapping the _change_data files follow the table's file layout: PHYSICAL column
+        // names + parquet field_ids, exactly like data files (Spark reads cdc parquet through the same
+        // mapping). The synthetic _change_type column is added AFTER the rename so it stays unmapped.
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        if (mappingMode != ColumnMappingMode.None)
+        {
+            rows = ColumnMappingRecursive.ToPhysical(rows, snapshot.Schema, mappingMode);
+        }
+
         // Add _change_type column
         var batchWithChangeType = AddChangeTypeColumn(rows, changeType);
 
