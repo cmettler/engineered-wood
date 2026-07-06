@@ -113,6 +113,14 @@ instead of silently returning unfiltered (wrong-length columns); parquet `TIME(m
 commit (operation + timestamp — enables timestamp time travel on plain tables); struct-aware
 `TakeRows`/`PartitionUtils` (offset-correct child indexing).
 
+Nested-stats PRUNING (consumption side of the nested `StatsCollector` output): `ColumnStats.Parse`
+flattens nested minValues/maxValues/nullCount objects into dotted keys ("s.a") — nested nullCount
+objects were previously DROPPED at parse — and `DeltaFilePruner` registers struct leaves under their
+dotted path (dual logical|physical under column mapping), so a predicate referencing `s.a` file-prunes
+like a top-level column; the Parquet `StatisticsAccessor`/bloom probe already resolved dotted leaf paths.
+A literal dotted column name colliding with a struct path is POISONED (removed — never guessed).
+Tests: `NestedStatsPruningTests`.
+
 ## Suggested order
 
 1 → 2 → 3 are independent pure bugfixes (start there; each has a one-line repro). 4 and 5 are small and

@@ -20,22 +20,61 @@ public sealed class DeltaFilePruner
     {
         var typeMap = new Dictionary<string, string>(StringComparer.Ordinal);
         var logicalToPhysical = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var field in schema.Fields)
+        var collided = new HashSet<string>(StringComparer.Ordinal);
+        // Struct leaves register under their dotted path ("s.a") — matching the flattened stats keys —
+        // so a nested reference resolves with the same flat lookup as a top-level column.
+        AddFields(schema, logicalPrefix: "", physicalPrefix: "", typeMap, logicalToPhysical, collided);
+        // A literal dotted column name colliding with a struct leaf path is ambiguous — drop the key
+        // (an unresolvable reference evaluates Unknown => the file is kept; pruning must never guess).
+        foreach (var key in collided)
         {
-            if (field.Type is PrimitiveType pt)
-                typeMap[field.Name] = pt.TypeName;
-            // Column mapping: partitionValues + stats in the log are keyed by the PHYSICAL column name
-            // (older engineered-wood commits used logical keys) — the accessor looks values up under both.
-            if (field.Metadata is not null
-                && field.Metadata.TryGetValue(ColumnMapping.PhysicalNameKey, out var phys)
-                && !string.IsNullOrEmpty(phys) && phys != field.Name)
-            {
-                logicalToPhysical[field.Name] = phys;
-            }
+            typeMap.Remove(key);
+            logicalToPhysical.Remove(key);
         }
 
         var partitionSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
         _accessor = new DeltaFileStatsAccessor(typeMap, partitionSet, logicalToPhysical);
+    }
+
+    private static void AddFields(
+        StructType schema, string logicalPrefix, string physicalPrefix,
+        Dictionary<string, string> typeMap, Dictionary<string, string> logicalToPhysical,
+        HashSet<string> collided)
+    {
+        foreach (var field in schema.Fields)
+        {
+            string logical = logicalPrefix.Length == 0 ? field.Name : logicalPrefix + "." + field.Name;
+            // Column mapping: partitionValues + stats in the log are keyed by the PHYSICAL column name at
+            // EVERY level (older engineered-wood commits used logical keys) — the accessor looks values up
+            // under both, so track the dotted physical path alongside the logical one.
+            string physName = field.Name;
+            if (field.Metadata is not null
+                && field.Metadata.TryGetValue(ColumnMapping.PhysicalNameKey, out var phys)
+                && !string.IsNullOrEmpty(phys))
+            {
+                physName = phys;
+            }
+            string physical = physicalPrefix.Length == 0 ? physName : physicalPrefix + "." + physName;
+
+            if (field.Type is PrimitiveType pt)
+            {
+                if (typeMap.ContainsKey(logical))
+                {
+                    collided.Add(logical);
+                }
+                else
+                {
+                    typeMap[logical] = pt.TypeName;
+                    if (physical != logical)
+                        logicalToPhysical[logical] = physical;
+                }
+            }
+            else if (field.Type is StructType st)
+            {
+                AddFields(st, logical, physical, typeMap, logicalToPhysical, collided);
+            }
+            // list/map: stats only cover struct leaves — nothing to register.
+        }
     }
 
     /// <summary>

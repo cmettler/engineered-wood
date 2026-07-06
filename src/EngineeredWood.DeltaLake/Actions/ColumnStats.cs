@@ -64,10 +64,44 @@ public sealed record ColumnStats
             || element.ValueKind != JsonValueKind.Object)
             return null;
 
+        // Nested (struct) stats are JSON objects mirroring the schema; flatten their leaves into
+        // dotted keys ("s.a") so evaluators can resolve nested references with the same flat lookup.
+        // The top-level object entry is kept as-is for any consumer that inspects it directly.
         var map = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        var collided = new HashSet<string>(StringComparer.Ordinal);
         foreach (var prop in element.EnumerateObject())
-            map[prop.Name] = prop.Value.Clone();
+        {
+            AddValue(map, collided, prop.Name, prop.Value);
+            if (prop.Value.ValueKind == JsonValueKind.Object)
+                FlattenValues(map, collided, prop.Name, prop.Value);
+        }
+        // A literal dotted column name colliding with a flattened struct path is ambiguous —
+        // drop the key entirely (no stat => no pruning on it; pruning must never guess).
+        foreach (var key in collided)
+            map.Remove(key);
         return map;
+    }
+
+    private static void FlattenValues(
+        Dictionary<string, JsonElement> map, HashSet<string> collided, string prefix, JsonElement obj)
+    {
+        foreach (var prop in obj.EnumerateObject())
+        {
+            string key = prefix + "." + prop.Name;
+            if (prop.Value.ValueKind == JsonValueKind.Object)
+                FlattenValues(map, collided, key, prop.Value);
+            else
+                AddValue(map, collided, key, prop.Value);
+        }
+    }
+
+    private static void AddValue(
+        Dictionary<string, JsonElement> map, HashSet<string> collided, string key, JsonElement value)
+    {
+        if (map.ContainsKey(key))
+            collided.Add(key);
+        else
+            map[key] = value.Clone();
     }
 
     private static IReadOnlyDictionary<string, long>? ReadCountMap(
@@ -78,11 +112,31 @@ public sealed record ColumnStats
             return null;
 
         var map = new Dictionary<string, long>(StringComparer.Ordinal);
-        foreach (var prop in element.EnumerateObject())
-        {
-            if (prop.Value.ValueKind == JsonValueKind.Number)
-                map[prop.Name] = prop.Value.GetInt64();
-        }
+        var collided = new HashSet<string>(StringComparer.Ordinal);
+        FlattenCounts(map, collided, "", element);
+        foreach (var key in collided)
+            map.Remove(key);
         return map;
+    }
+
+    private static void FlattenCounts(
+        Dictionary<string, long> map, HashSet<string> collided, string prefix, JsonElement obj)
+    {
+        foreach (var prop in obj.EnumerateObject())
+        {
+            string key = prefix.Length == 0 ? prop.Name : prefix + "." + prop.Name;
+            if (prop.Value.ValueKind == JsonValueKind.Number)
+            {
+                if (map.ContainsKey(key))
+                    collided.Add(key);
+                else
+                    map[key] = prop.Value.GetInt64();
+            }
+            else if (prop.Value.ValueKind == JsonValueKind.Object)
+            {
+                // Nested (struct) null counts: an object per struct, numbers at the leaves.
+                FlattenCounts(map, collided, key, prop.Value);
+            }
+        }
     }
 }
