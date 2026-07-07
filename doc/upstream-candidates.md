@@ -113,6 +113,18 @@ instead of silently returning unfiltered (wrong-length columns); parquet `TIME(m
 commit (operation + timestamp — enables timestamp time travel on plain tables); struct-aware
 `TakeRows`/`PartitionUtils` (offset-correct child indexing).
 
+Maintenance history commits (Spark parity): `CompactionExecutor` now writes the always-on commitInfo
+(`operation: OPTIMIZE`) like every other commit path — it was the ONLY silent one (history showed a
+NULL operation, and timestamp time travel had no timestamp to resolve through a compaction commit);
+`VacuumExecutor` writes the Spark `VACUUM START` (retention params + files/bytes-to-delete metrics) /
+`VACUUM END` (`status: COMPLETED` + deleted metrics) commitInfo-only pair around the physical deletes
+(dry run writes nothing; versions allocated with a bounded conflict-retry — commitInfo-only commits are
+safe to re-attempt at the next version). Without the pair, another engine's history shows no trace of
+why older versions stopped being physically readable. Verified live against a Fabric AUTOSET-VORDER
+table: unknown configuration keys (`delta.parquet.vorder.enabled`, Spark's materialized row-tracking
+column names) survive every metaData rewrite by construction (the schema-change paths copy the full
+config dict) — checked key-for-key after ADD COLUMN, and Spark reconfirms the property afterwards.
+
 Thrift WIRE-TYPE guards in `MetadataDecoder` (`case N when type == ThriftType.X`): field dispatch was
 by id only, so a foreign writer reusing a field id with a DIFFERENT type desynchronized the whole
 stream — Impala's `dict-page-offset-zero.parquet` (parquet-testing) carries a LIST at ColumnMetaData

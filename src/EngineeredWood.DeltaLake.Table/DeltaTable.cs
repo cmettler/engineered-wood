@@ -2948,9 +2948,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ProtocolVersions.ValidateVacuumSupport(CurrentSnapshot.Protocol);
 
         var retention = retentionPeriod ?? _options.VacuumRetention;
-        return await Vacuum.VacuumExecutor.ExecuteAsync(
-            _fs, CurrentSnapshot, retention, dryRun, cancellationToken)
+        var result = await Vacuum.VacuumExecutor.ExecuteAsync(
+            _fs, _log, CurrentSnapshot, retention, dryRun, cancellationToken)
             .ConfigureAwait(false);
+        if (!dryRun)
+        {
+            // A non-dry-run vacuum wrote the VACUUM START/END history commits — pick them up so the next
+            // operation's version allocation starts past them.
+            _currentSnapshot = await SnapshotBuilder.UpdateAsync(
+                CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
+        }
+        return result;
     }
 
     private async IAsyncEnumerable<RecordBatch> ReadFileAsync(

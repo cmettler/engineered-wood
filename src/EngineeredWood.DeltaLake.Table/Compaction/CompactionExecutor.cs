@@ -302,9 +302,12 @@ internal static class CompactionExecutor
             actions.Add(EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
         }
 
-        // Commit
+        // Commit — with the always-on commitInfo (operation + timestamp) every other commit path writes:
+        // history readers surface the operation, and timestamp time travel resolves through this commit.
         long newVersion = snapshot.Version + 1;
-        await log.WriteCommitAsync(newVersion, actions, cancellationToken)
+        IReadOnlyList<DeltaAction> commitActions =
+            InCommitTimestamp.EnsureCommitInfo(actions, snapshot.Metadata.Configuration, "OPTIMIZE");
+        await log.WriteCommitAsync(newVersion, commitActions, cancellationToken)
             .ConfigureAwait(false);
 
         return newVersion;
