@@ -46,10 +46,17 @@ fails to read.
 - `JSON` and `ENUM` are never emitted (Arrow has no enum type and we
   always write `StringType` as `StringType`).
 
-**Geospatial and Variant types.** The `GEOMETRY` / `GEOGRAPHY` types
-added to the Parquet spec in late 2024 are not supported. The `VARIANT`
-logical type is not supported. Neither read nor write paths recognize
-these annotations.
+**Geospatial types.** The `GEOMETRY` / `GEOGRAPHY` types added to the
+Parquet spec in late 2024 are not supported on either path.
+
+**Variant — supported.** The `VARIANT` logical type is read and written
+(the `arrow.parquet.variant` Arrow extension ⇄ a VARIANT-annotated
+group; the thrift annotation carries the required
+`specification_version = 1` — Spark rejects the empty form). Unshredded
+round-trips at the Parquet layer (`VariantArrayRoundTripTests`); full
+SHREDDED read/write lives at the Delta layer (`VariantTransport` over
+`Apache.Arrow.Operations` — infer/shred on write, per-row reassembly on
+read), cross-validated against Spark 4.x, delta-kernel and DuckDB.
 
 **Encoding strategies on write.** The decoder supports
 `BYTE_STREAM_SPLIT` for `INT32`/`INT64`/`FIXED_LEN_BYTE_ARRAY`, but
@@ -73,9 +80,22 @@ and `ListViewType`.
 
 ### Correctness / interop issues
 
-**Nanosecond time on read.** `ArrowSchemaConverter` maps any non-millis
-`TIME` logical type to `Time32Type(Microsecond)`; nanosecond values are
-silently truncated to microseconds.
+**TIME units — fixed.** `TIME` maps to the Arrow-correct width per
+unit: millis → `Time32`, micros/nanos → `Time64` (previously a
+malformed `Time32(Microsecond)` with nanos truncated).
+
+**Decimals always surface as Decimal128/256 on read (deliberate).**
+The reader widens every decimal to the classic `Decimal128` (≤ 38
+digits) / `Decimal256` regardless of the parquet physical width — the
+narrow Arrow `Decimal32`/`Decimal64` types are mishandled by consumers
+of the Arrow C interface, and widening the unscaled value is lossless.
+Precision/scale are preserved; callers expecting the narrow types get
+the wide ones.
+
+**ALP encoding: decode only.** The (proposed) ALP-encoded float/double
+pages decode bit-exact (validated against apache/parquet-testing
+PR #100's arade/spotify1 reference data — the fetch recipe is in
+`AlpDecoderTests`); the writer never emits ALP.
 
 **Deprecated `min`/`max` restricted to signed-order types.** The
 deprecated `Statistics.min`/`max` fields (defined with signed byte
@@ -280,22 +300,37 @@ features appear in the Delta protocol but are absent from
 
 | Feature | Role | Impact |
 |---|---|---|
-| `checkConstraints` | Writer | Tables with CHECK constraints rejected on write. |
-| `generatedColumns` | Writer | Tables with generated columns rejected on write. |
-| `invariants` | Writer | Legacy invariant constraints not validated. |
-| `appendOnly` | Writer | Append-only enforcement not applied. |
 | `allowColumnDefaults` / `columnDefaults` | Writer | Column default values on write not supported. |
 | `clustering` (liquid clustering) | Writer | Not supported. |
-| `variantType` | Reader-Writer | Variant (semi-structured) column type not supported. |
 | `collations` | Writer | String collations not supported. |
 | `catalogOwned` / `catalogOwned-preview` | Reader-Writer | Catalog-owned contracts not supported on either side. |
 | `coordinatedCommits` / `managedCommits` | Writer | No commit-coordinator client; plain rename-based commits only. |
 | `checkpointProtection` | Reader-Writer | Vacuum-guarded checkpoints not honored. |
 
-CHECK-constraint and generated-column support additionally depend on a
-Spark SQL expression parser (Phase 9 of the predicate-pushdown design),
-which is not started. Even with the feature gate lifted, the runtime
-could not evaluate the expressions.
+`appendOnly`, `invariants`, `checkConstraints` and `generatedColumns`
+are ALLOWLISTED (a writer-v7 upgrade enumerates the legacy features
+even when inactive — merely listing them must not reject writes) and
+enforced per table by `HonorWriterFeatures`: `appendOnly` rejects
+non-append writes only when `delta.appendOnly = true`; invariants /
+CHECK constraints / generated columns REJECT the write only when a
+column or table actually declares one — their Spark SQL expressions
+cannot be evaluated without the SparkSql parser (Phase 9 of the
+predicate-pushdown design, not started), and writing possibly-violating
+data silently would be worse. `variantType` is fully supported
+(reader + writer — see the Parquet section).
+
+**Write-side NOT NULL enforcement.** `WriteCoreAsync` does not validate
+batches against the schema's declared nullability — a direct library
+user can append a NULL into a `nullable: false` column (a spec
+violation; Spark trusts non-nullable schemas on read). The downstream
+ArrowNet bridge enforces this (top-level + nested struct/list/map
+constraints) before handing data in; an in-core validation pass is the
+proper home.
+
+**Commit files must be NDJSON.** The log reader parses one action per
+line per the spec. Pretty-printed multi-line JSON commit files (found
+in the wild in duckdb-delta's test fixtures; delta-kernel tolerates
+them) are rejected.
 
 **`rowTracking` — fixed.** `rowTracking` is accepted as a reader
 feature too, and every commit that assigns fresh `baseRowId`s (write,
@@ -345,18 +380,25 @@ work), `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`.
 
 **CommitInfo.** `InCommitTimestamp.CreateCommitInfo` populates
 `timestamp`, `operation`, `inCommitTimestamp`, `engineInfo`
-("EngineeredWood.DeltaLake") and an `operationParameters` object
-(empty unless the caller supplies values). Still never emitted:
-per-operation parameter payloads, `readVersion`, `isolationLevel`,
-`operationMetrics`, `userId`, `userName`, `txnId`, `clusterId`,
+("EngineeredWood.DeltaLake") and an `operationParameters` object.
+Every commit path writes one (incl. compaction, `operation: OPTIMIZE`),
+and a non-dry-run vacuum writes the Spark-parity `VACUUM START`
+(retention parameters + files/bytes-to-delete metrics) / `VACUUM END`
+(`status: COMPLETED` + deleted-file metrics) commitInfo-only pair.
+Still never emitted: per-operation parameter payloads for the data
+operations (WRITE/DELETE/UPDATE carry an empty object), `readVersion`,
+`isolationLevel`, `userId`, `userName`, `txnId`, `clusterId`,
 `notebook`.
 
-**Post-creation protocol upgrades.** `DeltaTable.CreateAsync` bumps
-reader/writer versions only at create time when column mapping is
-requested. There is no public API for enabling `deletionVectors` /
-`rowTracking` / `typeWidening` / `inCommitTimestamp` on an existing
-table, or for adding entries to `protocol.readerFeatures` /
-`writerFeatures` after create.
+**Post-creation protocol upgrades.** `CreateAsync` declares the
+requested features (column mapping, deletion vectors, row tracking,
+in-commit timestamps, CDF, identity, and the schema-driven
+`timestampNtz`/`variantType`) at create, and `AddColumnAsync` /
+`SetSchemaAsync` emit a protocol UPGRADE commit automatically when an
+evolved schema first requires a schema-driven feature. There is still
+no general public API for enabling an arbitrary feature
+(`deletionVectors` / `rowTracking` / `typeWidening` / …) on an existing
+table.
 
 **Exactly-once transactional writes.** `SetTransaction` actions are
 read, written, and reconciled in snapshots, but `DeltaTable` has no
@@ -369,9 +411,13 @@ RESTORE (committing a time-travel state as the current version), no
 CLONE (shallow/deep). `ReadChangesAsync` exists for CDF but there is no
 raw incremental-by-version-range read outside of CDF.
 
-**Schema evolution API.** No public ALTER TABLE for
-add/drop/rename/reorder columns, change nullability, or add a column to
-a nested struct. Column mapping mode is fixed at `CreateAsync`.
+**Schema evolution API — largely present.** `AddColumnAsync` (nullable
+columns; assigns a fresh column-mapping id when mapping is on),
+`RenameColumnAsync` / `DropColumnAsync` (metadata-only; require column
+mapping) and `SetSchemaAsync` (adopt a whole new schema — the REPLACE
+primitive) are public. Still missing: column reorder, nullability
+change, adding a column to a nested struct, and changing the column
+mapping mode after `CreateAsync`.
 
 **Checkpoint content gaps — fixed.** `CheckpointWriter` preserves
 `add.deletionVector`, `add.tags`, `add.baseRowId`/
