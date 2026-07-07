@@ -735,6 +735,261 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Adds a nullable field INSIDE a nested struct column as a metadata-only commit — the nested analog of
+    /// <see cref="AddColumnAsync"/>. <paramref name="containerPath"/> names the CONTAINING struct (top-level
+    /// column first, e.g. <c>["s","inner"]</c> adds a member to <c>s.inner</c>). Old files lack the member —
+    /// the read path reconciles it to a typed NULL child (recursive
+    /// <see cref="BackfillMissingColumns"/>). Under column mapping the new field gets a fresh column id +
+    /// physical name (struct-typed additions are rejected there — their descendants would need ids too).
+    /// </summary>
+    public async ValueTask<long> AddFieldAsync(
+        IReadOnlyList<string> containerPath, Field newField, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (containerPath.Count == 0)
+            throw new ArgumentException("containerPath must name the containing struct column.", nameof(containerPath));
+        if (!newField.IsNullable)
+            throw new InvalidOperationException(
+                $"ADD COLUMN '{PathText(containerPath)}.{newField.Name}' must be nullable — existing rows have no value for a new field.");
+
+        var snapshot = CurrentSnapshot;
+        var config = snapshot.Metadata.Configuration;
+        var mappingMode = ColumnMapping.GetMode(config);
+
+        var newDeltaField = SchemaConverter.FromArrowSchema(
+            new Apache.Arrow.Schema(new[] { newField }, null)).Fields[0];
+
+        var newConfig = config;
+        if (mappingMode != ColumnMappingMode.None)
+        {
+            if (ContainsStructType(newDeltaField.Type))
+                throw new InvalidOperationException(
+                    "Adding a struct-typed field to a column-mapping table is not supported — every nested "
+                    + "descendant would need its own column id.");
+            int maxId = ColumnMapping.GetMaxColumnId(snapshot.Schema);
+            if (config is not null && config.TryGetValue(ColumnMapping.MaxColumnIdKey, out var maxStr)
+                && int.TryParse(maxStr, out var cfgMax))
+            {
+                maxId = System.Math.Max(maxId, cfgMax);
+            }
+            int newId = maxId + 1;
+            var meta = (newDeltaField.Metadata ?? new Dictionary<string, string>())
+                .ToDictionary(kv => kv.Key, kv => kv.Value);
+            meta[ColumnMapping.FieldIdKey] = newId.ToString();
+            meta[ColumnMapping.PhysicalNameKey] = $"col-{Guid.NewGuid():N}";
+            newDeltaField = new StructField
+            {
+                Name = newDeltaField.Name, Type = newDeltaField.Type,
+                Nullable = newDeltaField.Nullable, Metadata = meta,
+            };
+            var cfg = config is null
+                ? new Dictionary<string, string>()
+                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
+            cfg[ColumnMapping.MaxColumnIdKey] = newId.ToString();
+            newConfig = cfg;
+        }
+
+        var addedField = newDeltaField;
+        var newSchema = TransformStructAt(snapshot.Schema, containerPath, 0, fields =>
+        {
+            foreach (var f in fields)
+            {
+                if (string.Equals(f.Name, addedField.Name, StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        $"Field '{PathText(containerPath)}.{addedField.Name}' already exists.");
+            }
+            var result = new List<StructField>(fields) { addedField };
+            return result;
+        });
+        string newSchemaString = DeltaSchemaSerializer.Serialize(newSchema);
+
+        // A new field whose type requires a schema-driven table feature (timestampNtz / variantType) may
+        // need a protocol upgrade in the same commit.
+        var protocolUpgrade =
+            UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
+
+        var actionList = new List<DeltaAction>();
+        if (protocolUpgrade is not null)
+            actionList.Add(protocolUpgrade);
+        actionList.Add(snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig });
+        IReadOnlyList<DeltaAction> actions = actionList;
+        actions = Log.InCommitTimestamp.EnsureCommitInfo(
+            actions, snapshot.Metadata.Configuration, "ADD COLUMNS");
+
+        long newVersion = snapshot.Version + 1;
+        await _log.WriteCommitAsync(newVersion, actions, cancellationToken).ConfigureAwait(false);
+        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
+            snapshot, _log, cancellationToken).ConfigureAwait(false);
+        return newVersion;
+    }
+
+    /// <summary>
+    /// Renames a field INSIDE a nested struct column as a metadata-only commit — the nested analog of
+    /// <see cref="RenameColumnAsync"/>. <paramref name="fieldPath"/> is the FULL path of the field (length
+    /// ≥ 2). Requires column mapping (the field keeps its column id + physical name, so old files keep
+    /// resolving). Returns the new version.
+    /// </summary>
+    public async ValueTask<long> RenameFieldAsync(
+        IReadOnlyList<string> fieldPath, string newName, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (fieldPath.Count < 2)
+            throw new ArgumentException("fieldPath must name a NESTED field (use RenameColumnAsync for top-level columns).");
+
+        var snapshot = CurrentSnapshot;
+        if (ColumnMapping.GetMode(snapshot.Metadata.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "RENAME of a nested field requires column mapping (enable it at table creation) — a plain table "
+                + "would need to rewrite every data file since the logical name is the physical parquet name.");
+        }
+
+        string oldName = fieldPath[fieldPath.Count - 1];
+        var containerPath = fieldPath.Take(fieldPath.Count - 1).ToList();
+        var newSchema = TransformStructAt(snapshot.Schema, containerPath, 0, fields =>
+        {
+            StructField? target = null;
+            foreach (var f in fields)
+            {
+                if (string.Equals(f.Name, newName, StringComparison.Ordinal))
+                    throw new InvalidOperationException($"Field '{PathText(containerPath)}.{newName}' already exists.");
+                if (string.Equals(f.Name, oldName, StringComparison.Ordinal))
+                    target = f;
+            }
+            if (target is null)
+                throw new InvalidOperationException($"Field '{PathText(fieldPath)}' does not exist.");
+            var result = new List<StructField>(fields.Count);
+            foreach (var f in fields)
+            {
+                result.Add(ReferenceEquals(f, target)
+                    ? new StructField { Name = newName, Type = f.Type, Nullable = f.Nullable, Metadata = f.Metadata }
+                    : f);
+            }
+            return result;
+        });
+        string newSchemaString = DeltaSchemaSerializer.Serialize(newSchema);
+
+        IReadOnlyList<DeltaAction> actions = new List<DeltaAction>
+        {
+            snapshot.Metadata with { SchemaString = newSchemaString },
+        };
+        actions = Log.InCommitTimestamp.EnsureCommitInfo(
+            actions, snapshot.Metadata.Configuration, "RENAME COLUMN");
+
+        long newVersion = snapshot.Version + 1;
+        await _log.WriteCommitAsync(newVersion, actions, cancellationToken).ConfigureAwait(false);
+        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
+            snapshot, _log, cancellationToken).ConfigureAwait(false);
+        return newVersion;
+    }
+
+    /// <summary>
+    /// Drops a field INSIDE a nested struct column as a metadata-only commit — the nested analog of
+    /// <see cref="DropColumnAsync"/>. <paramref name="fieldPath"/> is the FULL path (length ≥ 2). Requires
+    /// column mapping; the containing struct must not become empty; the retired column id is never reused
+    /// (maxColumnId is not decremented). Old files still carry the physical column — readers reconcile it
+    /// away. Returns the new version.
+    /// </summary>
+    public async ValueTask<long> DropFieldAsync(
+        IReadOnlyList<string> fieldPath, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (fieldPath.Count < 2)
+            throw new ArgumentException("fieldPath must name a NESTED field (use DropColumnAsync for top-level columns).");
+
+        var snapshot = CurrentSnapshot;
+        if (ColumnMapping.GetMode(snapshot.Metadata.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "DROP of a nested field requires column mapping (enable it at table creation) — a plain table "
+                + "would need to rewrite every data file since the logical name is the physical parquet name.");
+        }
+
+        string name = fieldPath[fieldPath.Count - 1];
+        var containerPath = fieldPath.Take(fieldPath.Count - 1).ToList();
+        var newSchema = TransformStructAt(snapshot.Schema, containerPath, 0, fields =>
+        {
+            var result = new List<StructField>(fields.Count);
+            bool found = false;
+            foreach (var f in fields)
+            {
+                if (string.Equals(f.Name, name, StringComparison.Ordinal)) { found = true; continue; }
+                result.Add(f);
+            }
+            if (!found)
+                throw new InvalidOperationException($"Field '{PathText(fieldPath)}' does not exist.");
+            if (result.Count == 0)
+                throw new InvalidOperationException(
+                    $"Cannot drop the only field of struct '{PathText(containerPath)}'.");
+            return result;
+        });
+        string newSchemaString = DeltaSchemaSerializer.Serialize(newSchema);
+
+        IReadOnlyList<DeltaAction> actions = new List<DeltaAction>
+        {
+            snapshot.Metadata with { SchemaString = newSchemaString },
+        };
+        actions = Log.InCommitTimestamp.EnsureCommitInfo(
+            actions, snapshot.Metadata.Configuration, "DROP COLUMNS");
+
+        long newVersion = snapshot.Version + 1;
+        await _log.WriteCommitAsync(newVersion, actions, cancellationToken).ConfigureAwait(false);
+        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
+            snapshot, _log, cancellationToken).ConfigureAwait(false);
+        return newVersion;
+    }
+
+    // Rebuilds the schema with the struct at `containerPath` transformed via `transform` on its field list
+    // (every non-terminal segment must be a struct field). Fields outside the path are untouched.
+    private static EngineeredWood.DeltaLake.Schema.StructType TransformStructAt(
+        EngineeredWood.DeltaLake.Schema.StructType current, IReadOnlyList<string> containerPath, int depth,
+        Func<IReadOnlyList<StructField>, List<StructField>> transform)
+    {
+        if (depth == containerPath.Count)
+            return new EngineeredWood.DeltaLake.Schema.StructType { Fields = transform(current.Fields) };
+
+        string segment = containerPath[depth];
+        var newFields = new List<StructField>(current.Fields.Count);
+        bool found = false;
+        foreach (var f in current.Fields)
+        {
+            if (!found && string.Equals(f.Name, segment, StringComparison.Ordinal))
+            {
+                found = true;
+                if (f.Type is not EngineeredWood.DeltaLake.Schema.StructType st)
+                    throw new InvalidOperationException(
+                        $"'{PathText(containerPath.Take(depth + 1).ToList())}' is not a STRUCT column.");
+                var newSt = TransformStructAt(st, containerPath, depth + 1, transform);
+                newFields.Add(new StructField
+                {
+                    Name = f.Name, Type = newSt, Nullable = f.Nullable, Metadata = f.Metadata,
+                });
+            }
+            else
+            {
+                newFields.Add(f);
+            }
+        }
+        if (!found)
+            throw new InvalidOperationException(
+                $"Column '{PathText(containerPath.Take(depth + 1).ToList())}' does not exist.");
+        return new EngineeredWood.DeltaLake.Schema.StructType { Fields = newFields };
+    }
+
+    private static bool ContainsStructType(EngineeredWood.DeltaLake.Schema.DeltaDataType type) => type switch
+    {
+        EngineeredWood.DeltaLake.Schema.StructType => true,
+        EngineeredWood.DeltaLake.Schema.ArrayType at => ContainsStructType(at.ElementType),
+        EngineeredWood.DeltaLake.Schema.MapType mt => ContainsStructType(mt.KeyType) || ContainsStructType(mt.ValueType),
+        _ => false,
+    };
+
+    private static string PathText(IReadOnlyList<string> path) => string.Join(".", path);
+
+    /// <summary>
     /// Gets a snapshot at a specific version (time travel).
     /// </summary>
     public async ValueTask<Snapshot.Snapshot> GetSnapshotAtVersionAsync(
@@ -3313,26 +3568,81 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         for (int i = 0; i < batch.Schema.FieldsList.Count; i++)
             present[batch.Schema.FieldsList[i].Name] = i;
 
-        bool anyMissing = false;
-        foreach (var f in expectedFields)
-        {
-            if (!present.ContainsKey(f.Name)) { anyMissing = true; break; }
-        }
-        // Rebuild when a column is missing (ADD) OR the batch carries extras (DROP — count mismatch; a
-        // simultaneous missing+extra is caught by anyMissing).
-        if (!anyMissing && batch.Schema.FieldsList.Count == expectedFields.Count)
-            return batch; // common path — file matches the current column set, no rebuild.
-
+        // Reconcile every expected column (recursing into STRUCT children — a field ADDed/DROPped inside a
+        // nested struct after this file was written must be backfilled/removed at its nesting level too).
+        bool changed = batch.Schema.FieldsList.Count != expectedFields.Count;
         var arrays = new List<IArrowArray>(expectedFields.Count);
         var schemaBuilder = new Apache.Arrow.Schema.Builder();
         foreach (var f in expectedFields)
         {
             schemaBuilder.Field(f);
-            arrays.Add(present.TryGetValue(f.Name, out int idx)
-                ? batch.Column(idx)
-                : MakeNullArray(f.DataType, batch.Length));
+            IArrowArray reconciled;
+            if (present.TryGetValue(f.Name, out int idx))
+            {
+                var column = batch.Column(idx);
+                reconciled = ReconcileColumn(column, f.DataType, batch.Length);
+                if (!ReferenceEquals(reconciled, column))
+                    changed = true;
+            }
+            else
+            {
+                reconciled = MakeNullArray(f.DataType, batch.Length);
+                changed = true;
+            }
+            arrays.Add(reconciled);
         }
+        if (!changed)
+            return batch; // common path — file matches the current schema, no rebuild.
         return new RecordBatch(schemaBuilder.Build(), arrays, batch.Length);
+    }
+
+    // Reconciles ONE column against its expected type: a STRUCT whose child set differs from the expected
+    // struct (nested ADD/DROP after the file was written) is rebuilt — missing children backfilled as typed
+    // all-NULL arrays, extra children dropped, children recursed. Non-structs (and matching structs) pass
+    // through unchanged (reference-equal). Struct children are NOT sliced with the parent, so backfilled
+    // child arrays are sized to the PHYSICAL child length (parent offset + length; see the TakeRows
+    // convention) and the parent's offset/validity are preserved on the rebuilt array.
+    private static IArrowArray ReconcileColumn(IArrowArray column, IArrowType expectedType, int logicalLength)
+    {
+        if (expectedType is not Apache.Arrow.Types.StructType expectedStruct || column is not StructArray sa)
+            return column;
+
+        var actualStruct = (Apache.Arrow.Types.StructType)sa.Data.DataType;
+        var childIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int i = 0; i < actualStruct.Fields.Count; i++)
+            childIndex[actualStruct.Fields[i].Name] = i;
+
+        int physicalLength = sa.Data.Offset + sa.Length;
+        foreach (var child in sa.Fields)
+            physicalLength = System.Math.Max(physicalLength, child.Length);
+
+        bool changed = actualStruct.Fields.Count != expectedStruct.Fields.Count;
+        var children = new List<IArrowArray>(expectedStruct.Fields.Count);
+        for (int i = 0; i < expectedStruct.Fields.Count; i++)
+        {
+            var expectedChild = expectedStruct.Fields[i];
+            IArrowArray reconciled;
+            if (childIndex.TryGetValue(expectedChild.Name, out int idx))
+            {
+                if (idx != i)
+                    changed = true; // reordered relative to the expected layout
+                var child = sa.Fields[idx];
+                reconciled = ReconcileColumn(child, expectedChild.DataType, child.Length);
+                if (!ReferenceEquals(reconciled, child))
+                    changed = true;
+            }
+            else
+            {
+                reconciled = MakeNullArray(expectedChild.DataType, physicalLength);
+                changed = true;
+            }
+            children.Add(reconciled);
+        }
+        if (!changed)
+            return column;
+
+        return new StructArray(
+            expectedStruct, sa.Length, children, sa.NullBitmapBuffer, sa.NullCount, sa.Data.Offset);
     }
 
     /// <summary>Builds an all-NULL array of the given Arrow type and length (for schema-evolution backfill).</summary>
@@ -3370,10 +3680,44 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             { var b = new TimestampArray.Builder(ts); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
             case BinaryType:
             { var b = new BinaryArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
+            case Decimal256Type dec:
+            { var b = new Decimal256Array.Builder(dec); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
+            case Date64Type:
+            { var b = new Date64Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
+            case Time32Type t32:
+            { var b = new Time32Array.Builder(t32); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
+            case Time64Type t64:
+            { var b = new Time64Array.Builder(t64); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
+            case Apache.Arrow.Types.StructType st:
+            {
+                // An all-null struct: zeroed validity + typed all-null children (children length == the
+                // struct's own length; the caller passes the PHYSICAL length when backfilling a child).
+                var children = new List<IArrowArray>(st.Fields.Count);
+                foreach (var f in st.Fields)
+                    children.Add(MakeNullArray(f.DataType, length));
+                return new StructArray(st, length, children, AllNullBitmap(length), nullCount: length);
+            }
+            case ListType lt:
+            {
+                // An all-null list: zeroed validity + all-zero offsets over an empty values child.
+                var offsets = new ArrowBuffer.Builder<int>(length + 1);
+                for (int i = 0; i <= length; i++) offsets.Append(0);
+                return new ListArray(lt, length, offsets.Build(), MakeNullArray(lt.ValueDataType, 0),
+                                     AllNullBitmap(length), nullCount: length);
+            }
             case StringType:
-            default:
             { var b = new StringArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
+            default:
+                throw new NotSupportedException(
+                    $"Schema-evolution backfill has no NULL-array builder for Arrow type '{type.Name}'.");
         }
+    }
+
+    private static ArrowBuffer AllNullBitmap(int length)
+    {
+        var bitmap = new ArrowBuffer.Builder<byte>((length + 7) / 8);
+        for (int i = 0; i < (length + 7) / 8; i++) bitmap.Append(0);
+        return bitmap.Build();
     }
 
     private static Apache.Arrow.Schema BuildProjectedSchema(

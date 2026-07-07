@@ -414,9 +414,14 @@ raw incremental-by-version-range read outside of CDF.
 **Schema evolution API — largely present.** `AddColumnAsync` (nullable
 columns; assigns a fresh column-mapping id when mapping is on),
 `RenameColumnAsync` / `DropColumnAsync` (metadata-only; require column
-mapping) and `SetSchemaAsync` (adopt a whole new schema — the REPLACE
-primitive) are public. Still missing: column reorder, nullability
-change, adding a column to a nested struct, and changing the column
+mapping), `SetSchemaAsync` (adopt a whole new schema — the REPLACE
+primitive), and the NESTED analogs `AddFieldAsync` /
+`RenameFieldAsync` / `DropFieldAsync` (a field inside a struct at any
+depth; metadata-only — the read path reconciles old files recursively,
+backfilling an ADDed member as a typed NULL child; rename/drop require
+column mapping; struct-typed additions are rejected under mapping since
+every descendant would need its own column id) are public. Still
+missing: column reorder, nullability change, and changing the column
 mapping mode after `CreateAsync`.
 
 **Checkpoint content gaps — fixed.** `CheckpointWriter` preserves
