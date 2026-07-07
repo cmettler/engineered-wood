@@ -142,6 +142,23 @@ like a top-level column; the Parquet `StatisticsAccessor`/bloom probe already re
 A literal dotted column name colliding with a struct path is POISONED (removed — never guessed).
 Tests: `NestedStatsPruningTests`.
 
+Transactional (multi-statement) commit seams: `ComputeDeletionVectorActionsAsync` (the deferred half of
+the DV delete — positions-per-ordinal in, remove/add pairs with unioned inline DVs out, no commit),
+`WriteDataFilesAsync` (the write-no-commit half of the batch path — partition split, recursive mapping
+rename + field ids, variant transport, the `IDataFileWriter` seam, per-file stats; row-tracking baseRowId
+left to the commit, like the streaming writer), and `CommitDataFilesAsync(extraActions:, expectedVersion:,
+operation:)` (caller-supplied actions join the one commit; `expectedVersion` turns the append OCC retry
+into a conflict-ABORT for snapshot-coupled actions — first-committer-wins snapshot isolation), plus
+`ReadRowsByRowIdsAsync` (exact-row read-back by transient rowid, for UPDATE post-image construction),
+the `Compute*` family (`ComputeAddColumn`/`ComputeRenameColumn`/`ComputeDropColumn`/`ComputeAddField`/
+`ComputeDropField` — the compute-only halves of the schema ALTERs: metaData + protocol-upgrade actions +
+the parsed new schema, chainable against a pending base), `WriteDataFilesAsync(schemaOverride:)`, and the
+public `ReconcileBatchToFields` export of the recursive schema-evolution reconcile (lets a host overlay a
+pending schema onto committed reads).
+Together these let a host buffer a whole multi-statement transaction (schema changes + appends + DV
+deletes + updates) and commit it as ONE atomic Delta version — the same OptimisticTransaction shape
+Spark/delta-rs use (fused metaData+protocol+DV+add commits validated against delta-kernel).
+
 ## Suggested order
 
 1 → 2 → 3 are independent pure bugfixes (start there; each has a one-line repro). 4 and 5 are small and

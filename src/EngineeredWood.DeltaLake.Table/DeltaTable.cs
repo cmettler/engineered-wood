@@ -481,6 +481,311 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return newVersion;
     }
 
+    /// <summary>The deferred (compute-only) form of a schema change, for a buffered multi-statement
+    /// transaction: <see cref="Actions"/> = the optional protocol upgrade + the new <c>metaData</c> action,
+    /// to be fused into ONE commit via <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>;
+    /// <see cref="NewSchema"/> is the parsed new Delta schema (drives the caller's read overlays and
+    /// schema-overridden writes).</summary>
+    public readonly record struct DeferredSchemaChange(
+        IReadOnlyList<DeltaAction> Actions,
+        MetadataAction Metadata,
+        ProtocolAction? ProtocolUpgrade,
+        EngineeredWood.DeltaLake.Schema.StructType NewSchema);
+
+    /// <summary>
+    /// The compute-only counterpart of <see cref="AddColumnAsync"/>: builds the metadata (+ protocol
+    /// upgrade) actions for appending a nullable column WITHOUT committing — for a buffered transaction
+    /// that fuses its schema change with its data changes into one atomic commit. For CHAINED adds in one
+    /// transaction pass the previous change's <paramref name="baseMetadata"/>/<paramref name="baseProtocol"/>
+    /// so the second column composes on the first's pending schema/protocol. Pure computation, no IO.
+    /// </summary>
+    public DeferredSchemaChange ComputeAddColumn(
+        Field newColumn, MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        if (!newColumn.IsNullable)
+            throw new InvalidOperationException(
+                $"ADD COLUMN '{newColumn.Name}' must be nullable — existing rows have no value for a new column.");
+
+        var snapshot = CurrentSnapshot;
+        var baseMeta = baseMetadata ?? snapshot.Metadata;
+        var baseSchema = baseMetadata is null
+            ? snapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        var config = baseMeta.Configuration;
+        var mappingMode = ColumnMapping.GetMode(config);
+
+        foreach (var f in baseSchema.Fields)
+        {
+            if (string.Equals(f.Name, newColumn.Name, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Column '{newColumn.Name}' already exists.");
+        }
+
+        var newDeltaField = SchemaConverter.FromArrowSchema(
+            new Apache.Arrow.Schema(new[] { newColumn }, null)).Fields[0];
+
+        EngineeredWood.DeltaLake.Schema.StructType newSchema;
+        var newConfig = config;
+        if (mappingMode == ColumnMappingMode.None)
+        {
+            newSchema = new EngineeredWood.DeltaLake.Schema.StructType
+            {
+                Fields = new List<StructField>(baseSchema.Fields) { newDeltaField },
+            };
+        }
+        else
+        {
+            // Fresh column id + physical name, recursively, continuing past the base's maxColumnId (the
+            // base may itself be a pending change that already bumped it).
+            var (mappedField, lastId) = AssignMappedFieldFor(baseSchema, config, newDeltaField);
+            newSchema = new EngineeredWood.DeltaLake.Schema.StructType
+            {
+                Fields = new List<StructField>(baseSchema.Fields) { mappedField },
+            };
+            var cfg = config is null
+                ? new Dictionary<string, string>()
+                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
+            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
+            newConfig = cfg;
+        }
+
+        var protocolUpgrade = UpgradeProtocolForFeatures(
+            baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
+
+        var metadata = baseMeta with
+        {
+            SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
+            Configuration = newConfig,
+        };
+        var actions = new List<DeltaAction>();
+        if (protocolUpgrade is not null)
+            actions.Add(protocolUpgrade);
+        actions.Add(metadata);
+        return new DeferredSchemaChange(actions, metadata, protocolUpgrade, newSchema);
+    }
+
+    /// <summary>
+    /// The compute-only counterpart of <see cref="RenameColumnAsync"/> — for a buffered transaction. Requires
+    /// column mapping (checked against the base config). The renamed field keeps its column id + physical
+    /// name; a renamed PARTITION column also updates <c>metaData.partitionColumns</c> (callers that cannot
+    /// handle a mid-transaction partition-column rename should compare
+    /// <see cref="DeferredSchemaChange.Metadata"/>.PartitionColumns against the base). No protocol change.
+    /// </summary>
+    public DeferredSchemaChange ComputeRenameColumn(
+        string oldName, string newName, MetadataAction? baseMetadata = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        var baseMeta = baseMetadata ?? snapshot.Metadata;
+        var baseSchema = baseMetadata is null
+            ? snapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        if (ColumnMapping.GetMode(baseMeta.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "RENAME COLUMN requires column mapping (enable it at table creation) — a plain table would need "
+                + "to rewrite every data file since the logical name is the physical parquet column name.");
+        }
+
+        StructField? target = null;
+        foreach (var f in baseSchema.Fields)
+        {
+            if (string.Equals(f.Name, newName, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Column '{newName}' already exists.");
+            if (string.Equals(f.Name, oldName, StringComparison.Ordinal))
+                target = f;
+        }
+        if (target is null)
+            throw new InvalidOperationException($"Column '{oldName}' does not exist.");
+
+        var newFields = new List<StructField>(baseSchema.Fields.Count);
+        foreach (var f in baseSchema.Fields)
+        {
+            newFields.Add(ReferenceEquals(f, target)
+                ? new StructField { Name = newName, Type = f.Type, Nullable = f.Nullable, Metadata = f.Metadata }
+                : f);
+        }
+        var newSchema = new EngineeredWood.DeltaLake.Schema.StructType { Fields = newFields };
+
+        var newPartitionColumns = baseMeta.PartitionColumns;
+        if (newPartitionColumns.Contains(oldName))
+        {
+            newPartitionColumns = newPartitionColumns
+                .Select(pc => string.Equals(pc, oldName, StringComparison.Ordinal) ? newName : pc)
+                .ToList();
+        }
+
+        var metadata = baseMeta with
+        {
+            SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
+            PartitionColumns = newPartitionColumns,
+        };
+        return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
+    }
+
+    /// <summary>The compute-only counterpart of <see cref="DropColumnAsync"/> — for a buffered transaction.
+    /// Requires column mapping; partition columns and the last column are rejected. No protocol change.</summary>
+    public DeferredSchemaChange ComputeDropColumn(string name, MetadataAction? baseMetadata = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        var baseMeta = baseMetadata ?? snapshot.Metadata;
+        var baseSchema = baseMetadata is null
+            ? snapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        if (ColumnMapping.GetMode(baseMeta.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "DROP COLUMN requires column mapping (enable it at table creation) — a plain table would need "
+                + "to rewrite every data file since the logical name is the physical parquet column name.");
+        }
+        foreach (var pc in baseMeta.PartitionColumns)
+        {
+            if (string.Equals(pc, name, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Cannot drop partition column '{name}'.");
+        }
+
+        var newFields = new List<StructField>(baseSchema.Fields.Count);
+        bool found = false;
+        foreach (var f in baseSchema.Fields)
+        {
+            if (string.Equals(f.Name, name, StringComparison.Ordinal)) { found = true; continue; }
+            newFields.Add(f);
+        }
+        if (!found)
+            throw new InvalidOperationException($"Column '{name}' does not exist.");
+        if (newFields.Count == 0)
+            throw new InvalidOperationException("Cannot drop the table's only column.");
+        var newSchema = new EngineeredWood.DeltaLake.Schema.StructType { Fields = newFields };
+
+        var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
+        return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
+    }
+
+    /// <summary>The compute-only counterpart of <see cref="AddFieldAsync"/> (nested ADD) — for a buffered
+    /// transaction. Under column mapping the new field gets fresh recursive ids continuing past the base's
+    /// maxColumnId; may carry a protocol upgrade for schema-driven features.</summary>
+    public DeferredSchemaChange ComputeAddField(
+        IReadOnlyList<string> containerPath, Field newField,
+        MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (containerPath.Count == 0)
+            throw new ArgumentException("containerPath must name the containing struct column.", nameof(containerPath));
+        if (!newField.IsNullable)
+            throw new InvalidOperationException(
+                $"ADD COLUMN '{PathText(containerPath)}.{newField.Name}' must be nullable — existing rows have no value for a new field.");
+
+        var snapshot = CurrentSnapshot;
+        var baseMeta = baseMetadata ?? snapshot.Metadata;
+        var baseSchema = baseMetadata is null
+            ? snapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        var config = baseMeta.Configuration;
+        var mappingMode = ColumnMapping.GetMode(config);
+
+        var newDeltaField = SchemaConverter.FromArrowSchema(
+            new Apache.Arrow.Schema(new[] { newField }, null)).Fields[0];
+
+        var newConfig = config;
+        if (mappingMode != ColumnMappingMode.None)
+        {
+            var (mappedField, lastId) = AssignMappedFieldFor(baseSchema, config, newDeltaField);
+            newDeltaField = mappedField;
+            var cfg = config is null
+                ? new Dictionary<string, string>()
+                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
+            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
+            newConfig = cfg;
+        }
+
+        var addedField = newDeltaField;
+        var newSchema = TransformStructAt(baseSchema, containerPath, 0, fields =>
+        {
+            foreach (var f in fields)
+            {
+                if (string.Equals(f.Name, addedField.Name, StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        $"Field '{PathText(containerPath)}.{addedField.Name}' already exists.");
+            }
+            return new List<StructField>(fields) { addedField };
+        });
+
+        var protocolUpgrade = UpgradeProtocolForFeatures(
+            baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
+
+        var metadata = baseMeta with
+        {
+            SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
+            Configuration = newConfig,
+        };
+        var actions = new List<DeltaAction>();
+        if (protocolUpgrade is not null)
+            actions.Add(protocolUpgrade);
+        actions.Add(metadata);
+        return new DeferredSchemaChange(actions, metadata, protocolUpgrade, newSchema);
+    }
+
+    /// <summary>The compute-only counterpart of <see cref="DropFieldAsync"/> (nested DROP) — for a buffered
+    /// transaction. Requires column mapping; the containing struct must not become empty.</summary>
+    public DeferredSchemaChange ComputeDropField(
+        IReadOnlyList<string> fieldPath, MetadataAction? baseMetadata = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (fieldPath.Count < 2)
+            throw new ArgumentException("fieldPath must name a NESTED field (use ComputeDropColumn for top-level columns).");
+
+        var snapshot = CurrentSnapshot;
+        var baseMeta = baseMetadata ?? snapshot.Metadata;
+        var baseSchema = baseMetadata is null
+            ? snapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        if (ColumnMapping.GetMode(baseMeta.Configuration) == ColumnMappingMode.None)
+        {
+            throw new InvalidOperationException(
+                "DROP of a nested field requires column mapping (enable it at table creation) — a plain table "
+                + "would need to rewrite every data file since the logical name is the physical parquet name.");
+        }
+
+        string name = fieldPath[fieldPath.Count - 1];
+        var containerPath = fieldPath.Take(fieldPath.Count - 1).ToList();
+        var newSchema = TransformStructAt(baseSchema, containerPath, 0, fields =>
+        {
+            var result = new List<StructField>(fields.Count);
+            bool found = false;
+            foreach (var f in fields)
+            {
+                if (string.Equals(f.Name, name, StringComparison.Ordinal)) { found = true; continue; }
+                result.Add(f);
+            }
+            if (!found)
+                throw new InvalidOperationException($"Field '{PathText(fieldPath)}' does not exist.");
+            if (result.Count == 0)
+                throw new InvalidOperationException(
+                    $"Cannot drop the only field of struct '{PathText(containerPath)}'.");
+            return result;
+        });
+
+        var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
+        return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
+    }
+
+    /// <summary>Reconciles a logically-named batch to <paramref name="expectedFields"/> — the public form of
+    /// the read path's RECURSIVE schema-evolution reconcile (<see cref="BackfillMissingColumns"/>): expected
+    /// columns/struct members the batch lacks backfill as typed NULLs, extra ones drop, struct children
+    /// recurse. A buffered transaction uses it to overlay its PENDING (uncommitted-ALTER) schema onto
+    /// committed reads.</summary>
+    public static RecordBatch ReconcileBatchToFields(RecordBatch batch, IReadOnlyList<Field> expectedFields)
+        => BackfillMissingColumns(batch, expectedFields);
+
     /// <summary>
     /// Replaces the table's schema wholesale with <paramref name="newSchema"/> as a metadata-only commit
     /// (a new <c>metaData</c> action; no data files are rewritten). Unlike <see cref="AddColumnAsync"/> this can
@@ -956,8 +1261,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // higher). Returns the mapped field + the last assigned id (the new maxColumnId).
     private static (StructField Field, int LastId) AssignMappedField(
         Snapshot.Snapshot snapshot, IReadOnlyDictionary<string, string>? config, StructField field)
+        => AssignMappedFieldFor(snapshot.Schema, config, field);
+
+    // Base-schema form: a buffered transaction chains adds against its PENDING schema/config (whose
+    // maxColumnId the previous pending add already bumped), not the committed snapshot's.
+    private static (StructField Field, int LastId) AssignMappedFieldFor(
+        EngineeredWood.DeltaLake.Schema.StructType baseSchema,
+        IReadOnlyDictionary<string, string>? config, StructField field)
     {
-        int maxId = ColumnMapping.GetMaxColumnId(snapshot.Schema);
+        int maxId = ColumnMapping.GetMaxColumnId(baseSchema);
         if (config is not null && config.TryGetValue(ColumnMapping.MaxColumnIdKey, out var maxStr)
             && int.TryParse(maxStr, out var cfgMax))
         {
@@ -2996,12 +3308,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<WrittenDataFile> files,
         DeltaWriteMode mode,
         bool dynamicPartitionOverwrite = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IReadOnlyList<DeltaAction>? extraActions = null,
+        long? expectedVersion = null,
+        string operation = "WRITE")
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
-        HonorWriterFeatures(mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite);
+        // extraActions (a buffered transaction's deletion-vector remove/add pairs) likewise make this a
+        // non-append.
+        HonorWriterFeatures(mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite &&
+                            extraActions is not { Count: > 0 });
 
         if (dynamicPartitionOverwrite)
         {
@@ -3014,9 +3332,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         // Reject configurations that require write-time per-row processing the external writer did not do
-        // (the caller should have checked SupportsExternalDataFileCommit first).
+        // (the caller should have checked SupportsExternalDataFileCommit first). Only relevant when data
+        // FILES are being committed — a deletion-vector-only or metadata-only fused flush (extraActions
+        // with no files) involves no write-time processing.
         var cfg = CurrentSnapshot.Metadata.Configuration;
-        if (!SupportsExternalDataFileCommit)
+        if (files.Count > 0 && !SupportsExternalDataFileCommit)
             throw new NotSupportedException(
                 "CommitDataFilesAsync: table has identity columns or IcebergCompat — "
                 + "these require engineered-wood's own writer.");
@@ -3026,6 +3346,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         for (int attempt = 1; ; attempt++)
         {
             var snapshot = CurrentSnapshot;
+            // Buffered-transaction commit: the caller's extraActions are snapshot-coupled (deletion-vector
+            // ordinals/positions computed against expectedVersion), so a concurrent commit invalidates them —
+            // conflict-ABORT instead of the append retry (first-committer-wins snapshot isolation).
+            if (expectedVersion is { } expected && snapshot.Version != expected)
+            {
+                throw new DeltaConflictException(
+                    snapshot.Version,
+                    $"Transaction conflict: the table moved from version {expected} to {snapshot.Version} "
+                    + "while the transaction was open — the buffered changes were rolled back; retry the "
+                    + "transaction.");
+            }
             var actions = new List<DeltaAction>();
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -3104,12 +3435,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
             }
 
-            var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(actions, cfg, "WRITE");
+            // A buffered transaction's deletion-vector remove/add pairs join the SAME commit (atomic
+            // DML + append flush).
+            if (extraActions is { Count: > 0 })
+                actions.AddRange(extraActions);
+
+            var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(actions, cfg, operation);
             try
             {
                 await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken).ConfigureAwait(false);
             }
-            catch (DeltaConflictException) when (attempt < 16)
+            catch (DeltaConflictException) when (attempt < 16 && expectedVersion is null)
             {
                 // A concurrent writer took our version — refresh the snapshot (recomputes the Overwrite removes +
                 // the row-tracking high-water mark) and retry. The already-written data files are reused as-is.
@@ -3121,6 +3457,211 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (_options.CheckpointInterval > 0 && newVersion % _options.CheckpointInterval == 0)
                 await _checkpointWriter.WriteCheckpointAsync(_currentSnapshot, cancellationToken).ConfigureAwait(false);
             return newVersion;
+        }
+    }
+
+    /// <summary>
+    /// Computes the deletion-vector actions for the given deleted positions WITHOUT committing — the
+    /// deferred half of <see cref="DeleteByRowIdsViaVectorsAsync"/>, for a buffered (multi-statement)
+    /// transaction that fuses its DML + appends into one commit via
+    /// <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>. Positions are keyed by the CURRENT
+    /// snapshot's path-sorted file ordinal (the transient-rowid ordinal) and are ABSOLUTE in-file row
+    /// positions; each touched file's existing DV is unioned with the new positions and the result is a
+    /// <c>remove</c>(old path+DV) + <c>add</c>(same path, new DV) pair. Inline DVs → pure metadata, no
+    /// storage write. Change Data Feed is NOT captured here (the caller must gate CDF tables to the
+    /// committing path). Returns the actions + the count of NEWLY deleted rows.
+    /// </summary>
+    public async ValueTask<(IReadOnlyList<DeltaAction> Actions, long RowsDeleted)> ComputeDeletionVectorActionsAsync(
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var snapshot = CurrentSnapshot;
+        var ordered = OrderedActiveFiles(snapshot);
+        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var actions = new List<DeltaAction>();
+        long totalDeleted = 0;
+
+        foreach (var kvp in positionsByOrdinal)
+        {
+            int ordinal = kvp.Key;
+            if (ordinal < 0 || ordinal >= ordered.Count)
+                continue;
+            var addFile = ordered[ordinal];
+
+            var allDeleted = addFile.DeletionVector is not null
+                ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
+                    .ConfigureAwait(false))
+                : new HashSet<long>();
+
+            long newlyDeleted = 0;
+            foreach (long p in kvp.Value)
+                if (allDeleted.Add(p))
+                    newlyDeleted++;
+            if (newlyDeleted == 0)
+                continue;
+            totalDeleted += newlyDeleted;
+
+            var newDv = await dvWriter.CreateAsync(allDeleted, allDeleted.Count, cancellationToken)
+                .ConfigureAwait(false);
+
+            actions.Add(new RemoveFile
+            {
+                Path = addFile.Path,
+                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = true,
+                DeletionVector = addFile.DeletionVector,
+            });
+            actions.Add(addFile with
+            {
+                DeletionVector = newDv,
+                DataChange = true,
+                Stats = StatsWithLooseBounds(addFile.Stats),
+            });
+        }
+
+        return (actions, totalDeleted);
+    }
+
+    /// <summary>
+    /// Writes <paramref name="batches"/> as data files WITHOUT committing — the write half of the batch
+    /// path, for a buffered transaction that commits everything at once via
+    /// <see cref="CommitDataFilesAsync"/>. Append-shaped: partition split, recursive column-mapping
+    /// physical rename + field-id stamping, variant transport, the <see cref="IDataFileWriter"/> seam and
+    /// per-file stats all apply; row-tracking <c>baseRowId</c> is NOT materialized into the files (the
+    /// commit assigns it, like the streaming writer). Identity columns and IcebergCompat need write-time
+    /// per-row processing tied to the commit — callers must check
+    /// <see cref="SupportsExternalDataFileCommit"/> first. The written files are invisible orphans until
+    /// committed (rollback = never reference them; vacuum cleans).
+    /// </summary>
+    public async ValueTask<IReadOnlyList<WrittenDataFile>> WriteDataFilesAsync(
+        IReadOnlyList<RecordBatch> batches,
+        CancellationToken cancellationToken = default,
+        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride = null)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (!SupportsExternalDataFileCommit)
+            throw new NotSupportedException(
+                "WriteDataFilesAsync: table has identity columns or IcebergCompat — "
+                + "these require the committing write path.");
+
+        var snapshot = CurrentSnapshot;
+        // schemaOverride: a buffered transaction's PENDING (ALTERed) schema — the batches carry columns the
+        // committed snapshot doesn't know yet; the pending schema (whose added columns already carry their
+        // column-mapping ids/physical names) drives the physical rename + stats keying. The paired commit
+        // includes the matching metaData action.
+        var writeSchema = schemaOverride ?? snapshot.Schema;
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(writeSchema, mappingMode);
+        var files = new List<WrittenDataFile>();
+
+        foreach (var batch in batches)
+        {
+            if (batch.Length == 0)
+                continue;
+
+            var partitions = Partitioning.PartitionUtils.SplitByPartition(batch, partitionColumns);
+            foreach (var (partValues, dataBatch) in partitions)
+            {
+                if (dataBatch.Length == 0)
+                    continue;
+
+                var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode);
+
+                // partitionValues keyed by the PHYSICAL column name under mapping (the spec convention).
+                var trackedPartValues = partValues;
+                if (mappingMode != ColumnMappingMode.None && partValues.Count > 0)
+                {
+                    trackedPartValues = new Dictionary<string, string>(partValues.Count);
+                    foreach (var kv in partValues)
+                    {
+                        trackedPartValues[logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
+                    }
+                }
+
+                string partDir = Partitioning.PartitionUtils.BuildPartitionPath(trackedPartValues);
+                string fileName = string.IsNullOrEmpty(partDir)
+                    ? $"{Guid.NewGuid():N}.parquet"
+                    : $"{partDir}/{Guid.NewGuid():N}.parquet";
+
+                long fileSize;
+                if (_options.DataFileWriter is { } dataFileWriter)
+                {
+                    fileSize = await dataFileWriter.WriteAsync(
+                        new[] { physicalBatch }, fileName, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    var codecBatch = VariantTransport.ToVariantArrays(physicalBatch);
+                    await using (var file = await _fs.CreateAsync(
+                        fileName, cancellationToken: cancellationToken).ConfigureAwait(false))
+                    {
+                        await using var writer = new ParquetFileWriter(
+                            file, ownsFile: false, _options.ParquetWriteOptions);
+                        await writer.WriteRowGroupAsync(codecBatch, cancellationToken).ConfigureAwait(false);
+                        await writer.DisposeAsync().ConfigureAwait(false);
+                        fileSize = file.Position;
+                    }
+                }
+
+                string? stats = _options.CollectStats
+                    ? CollectStats(ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode))
+                    : null;
+
+                files.Add(new WrittenDataFile(
+                    fileName, fileSize, dataBatch.Length,
+                    trackedPartValues.Count > 0 ? trackedPartValues : null, stats));
+            }
+        }
+
+        return files;
+    }
+
+    /// <summary>
+    /// Reads exactly the rows identified by the given transient rowids (<c>(fileOrdinal &lt;&lt; 40) |
+    /// absolutePosition</c> against the CURRENT snapshot), yielding logical-named batches WITH the trailing
+    /// virtual <c>_metadata.row_id</c> column so the caller can pair each row with its id — the read-back
+    /// step of a buffered UPDATE (post-image construction). Deletion-vector-excluded rows never match
+    /// (<see cref="ReadFileAsync"/> filters them), and files without a requested position are not read.
+    /// </summary>
+    public async IAsyncEnumerable<RecordBatch> ReadRowsByRowIdsAsync(
+        IReadOnlyCollection<long> rowIds,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var snapshot = CurrentSnapshot;
+        long posMask = (1L << RowIdPositionBits) - 1;
+        var positionsByFile = new Dictionary<int, HashSet<long>>();
+        foreach (var rid in rowIds)
+        {
+            int ordinal = (int)(rid >> RowIdPositionBits);
+            if (!positionsByFile.TryGetValue(ordinal, out var set))
+            {
+                set = new HashSet<long>();
+                positionsByFile[ordinal] = set;
+            }
+            set.Add(rid & posMask);
+        }
+
+        var ordered = OrderedActiveFiles(snapshot);
+        foreach (var kvp in positionsByFile.OrderBy(k => k.Key))
+        {
+            if (kvp.Key < 0 || kvp.Key >= ordered.Count)
+                continue;
+            await foreach (var batch in ReadFileAsync(ordered[kvp.Key], null, snapshot, cancellationToken,
+                                                      fileOrdinal: kvp.Key).ConfigureAwait(false))
+            {
+                if (batch.Column(batch.ColumnCount - 1) is not Apache.Arrow.Int64Array rids)
+                    continue;
+                var rows = new List<int>();
+                for (int i = 0; i < batch.Length; i++)
+                    if (!rids.IsNull(i) && kvp.Value.Contains(rids.GetValue(i)!.Value & posMask))
+                        rows.Add(i);
+                if (rows.Count > 0)
+                    yield return TakeRowsFromBatch(batch, rows);
+            }
         }
     }
 

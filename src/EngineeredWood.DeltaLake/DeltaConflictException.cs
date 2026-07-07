@@ -16,4 +16,10 @@ public class DeltaConflictException : Exception
     {
         AttemptedVersion = attemptedVersion;
     }
+
+    public DeltaConflictException(long attemptedVersion, string message)
+        : base(message)
+    {
+        AttemptedVersion = attemptedVersion;
+    }
 }
