@@ -419,8 +419,9 @@ primitive), and the NESTED analogs `AddFieldAsync` /
 `RenameFieldAsync` / `DropFieldAsync` (a field inside a struct at any
 depth; metadata-only — the read path reconciles old files recursively,
 backfilling an ADDed member as a typed NULL child; rename/drop require
-column mapping; struct-typed additions are rejected under mapping since
-every descendant would need its own column id) are public. Still
+column mapping; under mapping an added struct/array/map-typed field gets
+column ids + physical names on every descendant via the create-time
+assigner) are public. Still
 missing: column reorder, nullability change, and changing the column
 mapping mode after `CreateAsync`.
 

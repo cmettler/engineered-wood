@@ -442,33 +442,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
         else
         {
-            // Column-mapping table: assign the new field a fresh column id + physical name and bump maxColumnId so
-            // the new column has a stable identity (like AssignColumnMapping does at create). Existing fields keep
-            // their id/physicalName (worked from snapshot.Schema, which carries the metadata). Old files lack the
-            // column → the read path backfills NULL by name/field-id.
-            int maxId = ColumnMapping.GetMaxColumnId(snapshot.Schema);
-            if (config is not null && config.TryGetValue(ColumnMapping.MaxColumnIdKey, out var maxStr)
-                && int.TryParse(maxStr, out var cfgMax))
-            {
-                maxId = System.Math.Max(maxId, cfgMax);
-            }
-            int newId = maxId + 1;
-            var meta = (newDeltaField.Metadata ?? new Dictionary<string, string>())
-                .ToDictionary(kv => kv.Key, kv => kv.Value);
-            meta[ColumnMapping.FieldIdKey] = newId.ToString();
-            meta[ColumnMapping.PhysicalNameKey] = $"col-{Guid.NewGuid():N}";
-            var mappedField = new StructField
-            {
-                Name = newDeltaField.Name, Type = newDeltaField.Type,
-                Nullable = newDeltaField.Nullable, Metadata = meta,
-            };
+            // Column-mapping table: assign the new field a fresh column id + physical name — RECURSIVELY
+            // (AssignColumnMapping, the create-time assigner), so a struct/array/map-typed column arrives
+            // with ids on every descendant (a top-level-only assignment would commit spec-violating
+            // metadata that strict readers reject) — and bump maxColumnId past the last assigned id.
+            // Existing fields keep their id/physicalName. Old files lack the column → the read path
+            // backfills NULL by name/field-id.
+            var (mappedField, lastId) = AssignMappedField(snapshot, config, newDeltaField);
             var fields = new List<StructField>(snapshot.Schema.Fields) { mappedField };
             newSchemaString = DeltaSchemaSerializer.Serialize(
                 new EngineeredWood.DeltaLake.Schema.StructType { Fields = fields });
             var cfg = config is null
                 ? new Dictionary<string, string>()
                 : config.ToDictionary(kv => kv.Key, kv => kv.Value);
-            cfg[ColumnMapping.MaxColumnIdKey] = newId.ToString();
+            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
             newConfig = cfg;
         }
 
@@ -763,30 +750,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var newConfig = config;
         if (mappingMode != ColumnMappingMode.None)
         {
-            if (ContainsStructType(newDeltaField.Type))
-                throw new InvalidOperationException(
-                    "Adding a struct-typed field to a column-mapping table is not supported — every nested "
-                    + "descendant would need its own column id.");
-            int maxId = ColumnMapping.GetMaxColumnId(snapshot.Schema);
-            if (config is not null && config.TryGetValue(ColumnMapping.MaxColumnIdKey, out var maxStr)
-                && int.TryParse(maxStr, out var cfgMax))
-            {
-                maxId = System.Math.Max(maxId, cfgMax);
-            }
-            int newId = maxId + 1;
-            var meta = (newDeltaField.Metadata ?? new Dictionary<string, string>())
-                .ToDictionary(kv => kv.Key, kv => kv.Value);
-            meta[ColumnMapping.FieldIdKey] = newId.ToString();
-            meta[ColumnMapping.PhysicalNameKey] = $"col-{Guid.NewGuid():N}";
-            newDeltaField = new StructField
-            {
-                Name = newDeltaField.Name, Type = newDeltaField.Type,
-                Nullable = newDeltaField.Nullable, Metadata = meta,
-            };
+            // Recursive id + physical-name assignment (AssignColumnMapping) — a struct/array/map-typed
+            // field gets ids on every descendant, exactly like at create.
+            var (mappedField, lastId) = AssignMappedField(snapshot, config, newDeltaField);
+            newDeltaField = mappedField;
             var cfg = config is null
                 ? new Dictionary<string, string>()
                 : config.ToDictionary(kv => kv.Key, kv => kv.Value);
-            cfg[ColumnMapping.MaxColumnIdKey] = newId.ToString();
+            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
             newConfig = cfg;
         }
 
@@ -979,13 +950,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return new EngineeredWood.DeltaLake.Schema.StructType { Fields = newFields };
     }
 
-    private static bool ContainsStructType(EngineeredWood.DeltaLake.Schema.DeltaDataType type) => type switch
+    // Assigns column-mapping metadata (id + physical name) to a NEW field being added to a mapped table —
+    // RECURSIVELY, via the create-time assigner, so struct/array/map descendants all get their own ids.
+    // Ids continue past the table's current maxColumnId (schema-derived OR the config key, whichever is
+    // higher). Returns the mapped field + the last assigned id (the new maxColumnId).
+    private static (StructField Field, int LastId) AssignMappedField(
+        Snapshot.Snapshot snapshot, IReadOnlyDictionary<string, string>? config, StructField field)
     {
-        EngineeredWood.DeltaLake.Schema.StructType => true,
-        EngineeredWood.DeltaLake.Schema.ArrayType at => ContainsStructType(at.ElementType),
-        EngineeredWood.DeltaLake.Schema.MapType mt => ContainsStructType(mt.KeyType) || ContainsStructType(mt.ValueType),
-        _ => false,
-    };
+        int maxId = ColumnMapping.GetMaxColumnId(snapshot.Schema);
+        if (config is not null && config.TryGetValue(ColumnMapping.MaxColumnIdKey, out var maxStr)
+            && int.TryParse(maxStr, out var cfgMax))
+        {
+            maxId = System.Math.Max(maxId, cfgMax);
+        }
+        var (assigned, lastId) = ColumnMapping.AssignColumnMapping(
+            new EngineeredWood.DeltaLake.Schema.StructType { Fields = new[] { field } }, maxId);
+        return (assigned.Fields[0], lastId);
+    }
 
     private static string PathText(IReadOnlyList<string> path) => string.Join(".", path);
 
