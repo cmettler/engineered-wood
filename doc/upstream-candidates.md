@@ -125,6 +125,15 @@ table: unknown configuration keys (`delta.parquet.vorder.enabled`, Spark's mater
 column names) survive every metaData rewrite by construction (the schema-change paths copy the full
 config dict) — checked key-for-key after ADD COLUMN, and Spark reconfirms the property afterwards.
 
+Repartition-on-overwrite: `WriteAsync(repartitionTo:)` changes the table's partition columns as part of
+the SAME atomic Overwrite commit — the only protocol-legal repartitioning shape (a new
+`metaData.partitionColumns` is valid only when every active file is removed in the same commit, since
+readers interpret each `add.partitionValues` against the current partition schema; Spark exposes this as
+`overwriteSchema=true` + a new `partitionBy` and has no `ALTER TABLE … PARTITIONED BY`). Guarded to a
+FULL overwrite (partition-scoped/dynamic overwrites keep files that would no longer conform); the input
+is Hive-split by the NEW columns; coordinated with the identity-HWM metadata emission so a commit never
+carries two conflicting metaData actions. delta-kernel reads the repartitioned result.
+
 Thrift WIRE-TYPE guards in `MetadataDecoder` (`case N when type == ThriftType.X`): field dispatch was
 by id only, so a foreign writer reusing a field id with a DIFFERENT type desynchronized the whole
 stream — Impala's `dict-page-offset-zero.parquet` (parquet-testing) carries a LIST at ColumnMetaData

@@ -2740,12 +2740,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// Writes RecordBatch data as a new commit.
     /// Returns the committed version number.
+    /// <para><paramref name="repartitionTo"/> (Overwrite only): change the table's partition columns as part
+    /// of the SAME atomic commit — the Delta-protocol-legal way to repartition (a new <c>metaData</c> with
+    /// the new <c>partitionColumns</c> is only valid when every active file is removed in the same commit,
+    /// which a full Overwrite does; Spark exposes this as <c>overwriteSchema=true</c> + a new
+    /// <c>partitionBy</c>). The new data is Hive-split by the NEW columns. Ignored when equal to the current
+    /// partitioning; empty list = departition.</para>
     /// </summary>
     public ValueTask<long> WriteAsync(
         IReadOnlyList<RecordBatch> batches,
         DeltaWriteMode mode = DeltaWriteMode.Append,
-        CancellationToken cancellationToken = default)
-        => WriteCoreAsync(batches, mode, null, cancellationToken);
+        CancellationToken cancellationToken = default,
+        IReadOnlyList<string>? repartitionTo = null)
+        => WriteCoreAsync(batches, mode, null, cancellationToken, repartitionTo: repartitionTo);
 
     /// <summary>
     /// Atomically overwrites one or more whole partitions in a SINGLE commit: removes exactly the active files
@@ -2973,7 +2980,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         DeltaWriteMode mode,
         IReadOnlyDictionary<string, string>? overwritePartitions,
         CancellationToken cancellationToken,
-        bool dynamicPartitionOverwrite = false)
+        bool dynamicPartitionOverwrite = false,
+        IReadOnlyList<string>? repartitionTo = null)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -2981,6 +2989,29 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         HonorWriterFeatures(mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite);
 
         var snapshot = CurrentSnapshot;
+
+        // Repartition-on-overwrite: changing partitionColumns is protocol-legal ONLY when every active file
+        // is removed in the same commit — i.e. a FULL overwrite (a partition-scoped or dynamic overwrite
+        // keeps files that would no longer conform to the new partition schema).
+        bool repartitioned = false;
+        if (repartitionTo is not null)
+        {
+            if (mode != DeltaWriteMode.Overwrite || overwritePartitions is { Count: > 0 } || dynamicPartitionOverwrite)
+            {
+                throw new DeltaFormatException(
+                    "Repartitioning requires a FULL overwrite (the new partition schema is only valid when "
+                    + "every active file is replaced in the same commit).");
+            }
+            foreach (var col in repartitionTo)
+            {
+                if (!snapshot.Schema.Fields.Any(f => f.Name == col))
+                {
+                    throw new DeltaFormatException(
+                        $"Repartition: '{col}' is not a column of the table.");
+                }
+            }
+            repartitioned = !repartitionTo.SequenceEqual(snapshot.Metadata.PartitionColumns);
+        }
 
         if (dynamicPartitionOverwrite && snapshot.Metadata.PartitionColumns.Count == 0)
         {
@@ -3014,7 +3045,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         // Column mapping: prepare logical-to-physical name mapping (also used to match/emit partitionValues,
         // which are keyed by the PHYSICAL column name under mapping — the Delta-spec convention).
-        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        // A repartitioning overwrite splits by the NEW columns (the metaData swap is emitted below).
+        var partitionColumns = repartitioned ? repartitionTo! : snapshot.Metadata.PartitionColumns;
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
             snapshot.Schema, mappingMode);
@@ -3225,7 +3257,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        // If identity columns were updated, emit metadata action with new HWMs
+        // If identity columns were updated, emit metadata action with new HWMs. A commit must not carry two
+        // conflicting metaData actions, so the identity metadata also carries a repartition's new
+        // partitionColumns; a repartition WITHOUT identity updates emits its own metaData below.
         if (allIdentityUpdates.Count > 0)
         {
             var updatedSchema = snapshot.Schema;
@@ -3237,7 +3271,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
 
             string updatedSchemaString = DeltaSchemaSerializer.Serialize(updatedSchema);
-            actions.Add(snapshot.Metadata with { SchemaString = updatedSchemaString });
+            actions.Add(snapshot.Metadata with
+            {
+                SchemaString = updatedSchemaString,
+                PartitionColumns = partitionColumns,
+            });
+        }
+        else if (repartitioned)
+        {
+            // Repartition-on-overwrite: the new partitionColumns commit atomically with the full file swap —
+            // every add in this commit already conforms to the new partition schema, every old file is
+            // removed above, so no reader ever sees a nonconforming active file.
+            actions.Add(snapshot.Metadata with { PartitionColumns = partitionColumns });
         }
 
         // Row tracking: persist the advanced high-water mark as the delta.rowTracking domainMetadata (the
