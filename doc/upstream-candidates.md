@@ -168,7 +168,13 @@ overwrite branches already carried the DV). (2) `CheckpointReader.ExtractMetadat
 checkpoint a table silently lost `delta.enableDeletionVectors` / `enableChangeDataFeed` /
 `columnMapping.mode` / `maxColumnId` / retention settings — and the loss is VIRAL, because the next
 checkpoint persists the config-less metadata (tables checkpointed by the buggy reader stay poisoned
-even after the fix). Fixed with the existing `GetStringMapField`.
+even after the fix). Fixed with the existing `GetStringMapField`. And a parquet-layer sibling: the
+page writer's `CompressTo` returned a ZERO-BYTE payload for an empty input, but a valid snappy stream of
+nothing is the single `0x00` length varint — so an all-null DataPage-V2 values section (declared
+`is_compressed`) was "corrupt snappy" to strict decoders. Delta CHECKPOINT files are full of all-null
+column chunks, so SQL Server 2025 failed every table read that crossed a checkpoint ("19787: Corrupt
+snappy compressed data" on the `.checkpoint.parquet`; DuckDB and delta-kernel tolerate the 0-byte form).
+Fixed by letting the codec encode emptiness (Snappier emits the valid empty stream).
 
 ## Suggested order
 
