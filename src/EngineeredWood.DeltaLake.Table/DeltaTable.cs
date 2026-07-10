@@ -3044,6 +3044,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     ExtendedFileMetadata = true,
                     PartitionValues = existingFile.PartitionValues,
                     Size = existingFile.Size,
+                    // Must match the ACTIVE (path, DV) entry: without the DV a remove of a
+                    // deletion-vector-carrying file never reconciles and the file stays active forever
+                    // (duplicated rows after an Overwrite of a DV-deleted table). The
+                    // CommitDataFilesAsync + dynamic-overwrite branches already carry it.
+                    DeletionVector = existingFile.DeletionVector,
                 });
             }
         }

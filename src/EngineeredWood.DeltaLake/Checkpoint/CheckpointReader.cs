@@ -320,6 +320,11 @@ public sealed class CheckpointReader
             format = new Format { Provider = provider };
         }
 
+        // configuration is a map<string,string> — DROPPING it loses delta.enableDeletionVectors /
+        // enableChangeDataFeed / columnMapping.mode / maxColumnId / retention settings after the first
+        // checkpoint (DV-mode misdetection, mapped tables falling back to mode=none, ...).
+        var configuration = GetStringMapField(structArray, "configuration", row);
+
         return new MetadataAction
         {
             Id = id,
@@ -329,6 +334,7 @@ public sealed class CheckpointReader
             SchemaString = schemaString,
             PartitionColumns = partitionColumns,
             CreatedTime = createdTime,
+            Configuration = configuration,
         };
     }
 

@@ -159,6 +159,17 @@ Together these let a host buffer a whole multi-statement transaction (schema cha
 deletes + updates) and commit it as ONE atomic Delta version — the same OptimisticTransaction shape
 Spark/delta-rs use (fused metaData+protocol+DV+add commits validated against delta-kernel).
 
+Two more spec-correctness fixes found by an S3 (MinIO) test rig: (1) `WriteCoreAsync`'s
+Overwrite-removes omitted the file's `deletionVector`, so an Overwrite of a table whose active file
+carries a DV never reconciled the remove against the (path, DV)-keyed active set — the file stayed
+active forever and every subsequent read DUPLICATED its rows (the CommitDataFilesAsync + dynamic-
+overwrite branches already carried the DV). (2) `CheckpointReader.ExtractMetadata` dropped
+`metaData.configuration` entirely (the writer emits the map; the reader never read it): after the first
+checkpoint a table silently lost `delta.enableDeletionVectors` / `enableChangeDataFeed` /
+`columnMapping.mode` / `maxColumnId` / retention settings — and the loss is VIRAL, because the next
+checkpoint persists the config-less metadata (tables checkpointed by the buggy reader stay poisoned
+even after the fix). Fixed with the existing `GetStringMapField`.
+
 ## Suggested order
 
 1 → 2 → 3 are independent pure bugfixes (start there; each has a one-line repro). 4 and 5 are small and
