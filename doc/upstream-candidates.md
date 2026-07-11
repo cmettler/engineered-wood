@@ -125,6 +125,19 @@ table: unknown configuration keys (`delta.parquet.vorder.enabled`, Spark's mater
 column names) survive every metaData rewrite by construction (the schema-change paths copy the full
 config dict) — checked key-for-key after ADD COLUMN, and Spark reconfirms the property afterwards.
 
+Spark-style logical rebase for buffered transactions:
+`CheckLogicalRebaseAsync(baseSnapshot, plannedActions, readPredicates, readWholeTable, serializable)` —
+FULL ConflictChecker parity. Walks the concurrent commit range (base+1..latest) and throws
+`DeltaConflictException` on: a concurrent metadata change, protocol change, delete/delete (any planned
+RemoveFile whose (path, DV) is no longer active unchanged), a concurrent data-changing remove of a file
+the transaction READ (concurrentDeleteReadCheck), and a concurrent data-changing add matching the
+transaction's read predicates (concurrentAppendCheck — from non-blind-append commits always; from blind
+appends only under `serializable`; blind append = no remove/metaData/protocol action in the commit).
+Read-predicate-vs-file matching = `DeltaFilePruner.ShouldInclude` over the base schema (partition values
+exact, stats conservative); `dataChange=false` actions (compaction) are exempt from the read checks —
+rows unchanged. Paired with `ComputeDeletionVectorActionsAsync(resolveAgainst:)` so DV ordinals/old-DVs
+resolve against the pinned snapshot (the newer snapshot's path-sorted ordinals differ after appends).
+
 Repartition-on-overwrite: `WriteAsync(repartitionTo:)` changes the table's partition columns as part of
 the SAME atomic Overwrite commit — the only protocol-legal repartitioning shape (a new
 `metaData.partitionColumns` is valid only when every active file is removed in the same commit, since

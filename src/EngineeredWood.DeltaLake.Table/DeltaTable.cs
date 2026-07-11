@@ -10,6 +10,7 @@ using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.DeltaLake.Snapshot;
+using EngineeredWood.Expressions;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet;
 
@@ -3523,10 +3524,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     public async ValueTask<(IReadOnlyList<DeltaAction> Actions, long RowsDeleted)> ComputeDeletionVectorActionsAsync(
         IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Snapshot.Snapshot? resolveAgainst = null)
     {
         ThrowIfDisposed();
-        var snapshot = CurrentSnapshot;
+        // `resolveAgainst` (rebase support): the ordinals + old DVs were captured against the transaction's
+        // PINNED snapshot — resolve there, not against a possibly-advanced current snapshot (whose
+        // path-sorted ordering may differ after concurrent appends). The caller must run
+        // CheckLogicalRebase before committing the result on a newer snapshot.
+        var snapshot = resolveAgainst ?? CurrentSnapshot;
         var ordered = OrderedActiveFiles(snapshot);
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var actions = new List<DeltaAction>();
@@ -3571,6 +3577,197 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         return (actions, totalDeleted);
+    }
+
+    /// <summary>
+    /// Spark-style LOGICAL REBASE conflict check: decides whether a transaction whose changes were computed
+    /// against <paramref name="baseSnapshot"/> may commit on top of the CURRENT snapshot even though other
+    /// writers committed in between. Real conflicts throw <see cref="DeltaConflictException"/>:
+    /// <list type="bullet">
+    /// <item>a concurrent METADATA change (schema / partitioning / configuration) — the transaction's
+    /// reads, chained DDL computations and written files all assumed the base metadata;</item>
+    /// <item>a concurrent PROTOCOL change;</item>
+    /// <item>a concurrent remove / rewrite / DV-modification of a file this transaction deletes from or
+    /// updates (delete/delete — the transaction's DV union was computed against the base file's DV), as
+    /// detected by any planned <see cref="RemoveFile"/> whose (path, DV) is no longer active unchanged;</item>
+    /// <item>with a READ SET supplied (<paramref name="readPredicates"/> — the pushed predicate of every
+    /// scan the transaction ran, a superset of the rows consumed — or <paramref name="readWholeTable"/>):
+    /// a concurrent data-changing REMOVE of a file the transaction read (Spark's
+    /// concurrentDeleteReadCheck), and a concurrent data-changing ADD that could match the reads (Spark's
+    /// concurrentAppendCheck) — the append check runs for every non-blind-append commit, and under
+    /// <paramref name="serializable"/> for blind appends too (Spark's Serializable vs the default
+    /// WriteSerializable, where blind appends may be logically reordered before the transaction).</item>
+    /// </list>
+    /// Predicate-vs-file matching uses <see cref="DeltaFilePruner"/> over the base snapshot's schema
+    /// (partition values exactly, stats conservatively — can't rule it out ⇒ it matches). Commits are
+    /// classified by walking the concurrent range (<c>base+1..latest</c>): blind append = no
+    /// remove/metaData/protocol action. OPTIMIZE-style actions (<c>dataChange=false</c>) rearrange rows
+    /// without changing them, so they are exempt from the READ checks; a compaction touching a file the
+    /// transaction MODIFIES still conflicts via the delete/delete check. Row-id/identity high-water marks
+    /// are re-derived at commit time from the snapshot committed onto, so appends need no compensation.
+    /// </summary>
+    public async ValueTask CheckLogicalRebaseAsync(
+        Snapshot.Snapshot baseSnapshot,
+        IReadOnlyList<DeltaAction> plannedActions,
+        IReadOnlyList<Expressions.Predicate>? readPredicates = null,
+        bool readWholeTable = false,
+        bool serializable = false,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var latest = CurrentSnapshot;
+        if (latest.Version == baseSnapshot.Version)
+        {
+            return;
+        }
+        if (!MetadataEquals(baseSnapshot.Metadata, latest.Metadata))
+        {
+            throw new DeltaConflictException(latest.Version,
+                "concurrent metadata change (schema/partitioning/configuration) — cannot rebase the transaction");
+        }
+        if (!ProtocolEquals(baseSnapshot.Protocol, latest.Protocol))
+        {
+            throw new DeltaConflictException(latest.Version,
+                "concurrent protocol change — cannot rebase the transaction");
+        }
+        // delete/delete: every file the transaction removes (DV remove+add pairs, rewrites) must still be
+        // active UNCHANGED — same path with the same deletion vector (DeletionVector is a record: value
+        // equality; both null = plain file).
+        Dictionary<string, AddFile>? latestByPath = null;
+        foreach (var action in plannedActions)
+        {
+            if (action is not RemoveFile remove)
+            {
+                continue;
+            }
+            if (latestByPath is null)
+            {
+                latestByPath = new Dictionary<string, AddFile>(latest.ActiveFiles.Count, StringComparer.Ordinal);
+                foreach (var f in latest.ActiveFiles.Values)
+                {
+                    latestByPath[f.Path] = f;
+                }
+            }
+            if (!latestByPath.TryGetValue(remove.Path, out var current)
+                || !Equals(current.DeletionVector, remove.DeletionVector))
+            {
+                throw new DeltaConflictException(latest.Version,
+                    $"concurrent delete/rewrite of file '{remove.Path}' this transaction also modifies — "
+                    + "cannot rebase the transaction");
+            }
+        }
+
+        // Read-set checks (skipped when the caller recorded no reads — pure delete/delete mode).
+        bool hasReads = readWholeTable || readPredicates is { Count: > 0 };
+        if (!hasReads)
+        {
+            return;
+        }
+        var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns);
+        bool ReadsMatch(AddFile file)
+        {
+            if (readWholeTable)
+            {
+                return true;
+            }
+            foreach (var predicate in readPredicates!)
+            {
+                if (pruner.ShouldInclude(file, predicate))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        var baseByPath = new Dictionary<string, AddFile>(baseSnapshot.ActiveFiles.Count, StringComparer.Ordinal);
+        foreach (var f in baseSnapshot.ActiveFiles.Values)
+        {
+            baseByPath[f.Path] = f;
+        }
+        for (long v = baseSnapshot.Version + 1; v <= latest.Version; v++)
+        {
+            var actions = await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false);
+            bool blindAppend = true;
+            foreach (var a in actions)
+            {
+                if (a is RemoveFile or MetadataAction or ProtocolAction)
+                {
+                    blindAppend = false;
+                    break;
+                }
+            }
+            foreach (var a in actions)
+            {
+                switch (a)
+                {
+                    case RemoveFile removed when removed.DataChange:
+                        // concurrentDeleteReadCheck: the file existed in our base snapshot and our reads
+                        // could have consumed rows from it (its DV change / rewrite / delete invalidates
+                        // what the transaction read). dataChange=false (compaction) is exempt.
+                        if (baseByPath.TryGetValue(removed.Path, out var readFile) && ReadsMatch(readFile))
+                        {
+                            throw new DeltaConflictException(latest.Version,
+                                $"concurrent delete/rewrite of file '{removed.Path}' this transaction read "
+                                + $"(commit v{v}) — cannot rebase the transaction");
+                        }
+                        break;
+                    case AddFile added when added.DataChange && (!blindAppend || serializable):
+                        // concurrentAppendCheck: rows appeared that the transaction's reads would have
+                        // consumed. Blind appends are exempt under WriteSerializable (they may be logically
+                        // reordered before the transaction); under Serializable commit order is logical
+                        // order, so they conflict too.
+                        if (ReadsMatch(added))
+                        {
+                            throw new DeltaConflictException(latest.Version,
+                                $"concurrent append of file '{added.Path}' matching this transaction's reads "
+                                + $"(commit v{v}) — cannot rebase the transaction");
+                        }
+                        break;
+                }
+            }
+        }
+    }
+
+    private static bool MetadataEquals(MetadataAction a, MetadataAction b)
+    {
+        if (!string.Equals(a.Id, b.Id, StringComparison.Ordinal)
+            || !string.Equals(a.SchemaString, b.SchemaString, StringComparison.Ordinal)
+            || !a.PartitionColumns.SequenceEqual(b.PartitionColumns, StringComparer.Ordinal))
+        {
+            return false;
+        }
+        var ca = a.Configuration;
+        var cb = b.Configuration;
+        if ((ca?.Count ?? 0) != (cb?.Count ?? 0))
+        {
+            return false;
+        }
+        if (ca is not null && cb is not null)
+        {
+            foreach (var kv in ca)
+            {
+                if (!cb.TryGetValue(kv.Key, out var v) || !string.Equals(kv.Value, v, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static bool ProtocolEquals(ProtocolAction a, ProtocolAction b)
+    {
+        if (a.MinReaderVersion != b.MinReaderVersion || a.MinWriterVersion != b.MinWriterVersion)
+        {
+            return false;
+        }
+        static bool FeaturesEqual(IReadOnlyList<string>? x, IReadOnlyList<string>? y)
+        {
+            var sx = new HashSet<string>(x ?? System.Array.Empty<string>(), StringComparer.Ordinal);
+            var sy = new HashSet<string>(y ?? System.Array.Empty<string>(), StringComparer.Ordinal);
+            return sx.SetEquals(sy);
+        }
+        return FeaturesEqual(a.ReaderFeatures, b.ReaderFeatures) && FeaturesEqual(a.WriterFeatures, b.WriterFeatures);
     }
 
     /// <summary>
