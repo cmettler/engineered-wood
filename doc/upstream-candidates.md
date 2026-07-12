@@ -147,6 +147,13 @@ FULL overwrite (partition-scoped/dynamic overwrites keep files that would no lon
 is Hive-split by the NEW columns; coordinated with the identity-HWM metadata emission so a commit never
 carries two conflicting metaData actions. delta-kernel reads the repartitioned result.
 
+`TransactionLog.ListVersionsAsync` sorts ascending (cross-platform correctness): it previously yielded
+commit versions in RAW directory-listing order — Windows/S3/ADLS list sorted, but Linux readdir returns
+inode-hash order — and the callers assume ascending replay: `SnapshotBuilder`'s latest-wins
+metadata/protocol reconciliation, `GetSnapshotAtTimestampAsync`'s monotonic early-break (the symptom
+that surfaced it: a timestamp resolved to v0 with newer commits present), and the history view. The
+versions are materialized + sorted (the log directory is bounded by the checkpoint interval).
+
 Thrift WIRE-TYPE guards in `MetadataDecoder` (`case N when type == ThriftType.X`): field dispatch was
 by id only, so a foreign writer reusing a field id with a DIFFERENT type desynchronized the whole
 stream — Impala's `dict-page-offset-zero.parquet` (parquet-testing) carries a LIST at ColumnMetaData
