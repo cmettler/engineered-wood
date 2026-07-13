@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers;
+using System.Text;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.IO;
 
@@ -63,13 +64,31 @@ public sealed class DeletionVectorReader
     private async ValueTask<byte[]> ReadUuidFileAsync(
         DeletionVector dv, CancellationToken cancellationToken)
     {
-        // Decode UUID from the path
+        // Spec: pathOrInlineDv = "<random prefix (optional)><z85-encoded uuid>" (uuid = the LAST 20 chars);
+        // the file lives in the TABLE ROOT (next to the data files, NOT _delta_log/) at
+        // "<prefix>/deletion_vector_<uuid>.bin" — the prefix, when present, is a directory (like the
+        // random data-file prefixes Spark writes).
         string pathOrUuid = dv.PathOrInlineDv;
         string uuid = DecodeUuidFromPath(pathOrUuid);
-        string filePath = $"_delta_log/deletion_vector_{uuid}.bin";
+        string prefix = pathOrUuid.Length > 20 ? pathOrUuid.Substring(0, pathOrUuid.Length - 20) : "";
+        string filePath = prefix.Length > 0
+            ? $"{prefix}/deletion_vector_{uuid}.bin"
+            : $"deletion_vector_{uuid}.bin";
 
-        return await ReadDvFileAsync(filePath, dv.Offset ?? 0, dv.SizeInBytes, cancellationToken)
-            .ConfigureAwait(false);
+        try
+        {
+            return await ReadDvFileAsync(filePath, dv.Offset ?? 0, dv.SizeInBytes, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception) when (prefix.Length == 0)
+        {
+            // LEGACY fallback: files written by the pre-spec engineered-wood writer live in _delta_log/
+            // under the LITTLE-ENDIAN (.NET Guid) rendering of the same bytes, as a bare bitmap blob.
+            byte[] uuidBytes = Base85.Decode(pathOrUuid[^20..]);
+            string legacyUuid = new Guid(uuidBytes).ToString();
+            return await ReadDvFileAsync($"_delta_log/deletion_vector_{legacyUuid}.bin",
+                dv.Offset ?? 0, dv.SizeInBytes, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -91,6 +110,24 @@ public sealed class DeletionVectorReader
 
         if (offset == 0 && size == allBytes.Length)
             return allBytes;
+
+        // Spec on-disk layout (the shape Spark writes): the file starts with a 1-byte format version,
+        // and each stored DV is "<dataSize: 4-byte BIG-ENDIAN int><bitmap: dataSize bytes><CRC-32:
+        // 4 bytes>" with the descriptor's offset pointing at the SIZE field and sizeInBytes == dataSize.
+        // Detect that shape by the size field matching, and return the bitmap bytes (skip the length
+        // prefix; the trailing checksum is not verified). Anything else falls back to a raw slice
+        // (a bare bitmap written at the offset).
+        if (offset + 4 + size <= allBytes.Length)
+        {
+            int be = (allBytes[offset] << 24) | (allBytes[offset + 1] << 16)
+                     | (allBytes[offset + 2] << 8) | allBytes[offset + 3];
+            if (be == size)
+            {
+                var bitmap = new byte[size];
+                Array.Copy(allBytes, offset + 4, bitmap, 0, size);
+                return bitmap;
+            }
+        }
 
         // Extract the relevant slice
         if (offset + size > allBytes.Length)
@@ -123,6 +160,15 @@ public sealed class DeletionVectorReader
             throw new DeltaFormatException(
                 $"Expected 16-byte UUID, got {uuidBytes.Length} bytes.");
 
-        return new Guid(uuidBytes).ToString();
+        // The file-name UUID is the canonical (BIG-ENDIAN / Java) rendering of the 16 bytes.
+        // .NET's Guid(byte[]) shuffles the first three groups little-endian — format by hand instead.
+        var sb = new StringBuilder(36);
+        for (int i = 0; i < 16; i++)
+        {
+            if (i is 4 or 6 or 8 or 10)
+                sb.Append('-');
+            sb.Append(uuidBytes[i].ToString("x2"));
+        }
+        return sb.ToString();
     }
 }

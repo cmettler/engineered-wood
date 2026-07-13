@@ -19,6 +19,53 @@ namespace EngineeredWood.DeltaLake.Table.ChangeDataFeed;
 internal static class CdfWriter
 {
     /// <summary>
+    /// Writes CDC files for a set of changed rows, splitting by PARTITION exactly like a data write —
+    /// the rows arrive WITH the table's partition columns (the read paths re-add them), each partition's
+    /// rows land in their own <c>_change_data</c> file with the partition columns EXCLUDED from the file
+    /// bytes and carried on the <see cref="CdcFile"/> action's <c>partitionValues</c> (physical-keyed
+    /// under column mapping — the data-file convention). Handles rows that span partitions (an
+    /// update_postimage after a SET of the partition column). Unpartitioned tables degrade to one file.
+    /// </summary>
+    public static async ValueTask<List<CdcFile>> WriteSplitAsync(
+        ITableFileSystem fs,
+        Snapshot.Snapshot snapshot,
+        RecordBatch rows,
+        string changeType,
+        ParquetWriteOptions? parquetOptions,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<CdcFile>();
+        if (rows.Length == 0)
+            return result;
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        if (partitionColumns.Count == 0)
+        {
+            result.Add(await WriteAsync(fs, snapshot, rows, changeType,
+                new Dictionary<string, string>(), parquetOptions, cancellationToken).ConfigureAwait(false));
+            return result;
+        }
+
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+        foreach (var (partValues, dataBatch) in Partitioning.PartitionUtils.SplitByPartition(rows, partitionColumns))
+        {
+            if (dataBatch.Length == 0)
+                continue;
+            var tracked = partValues;
+            if (mappingMode != ColumnMappingMode.None && partValues.Count > 0)
+            {
+                var t = new Dictionary<string, string>(partValues.Count);
+                foreach (var kv in partValues)
+                    t[logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
+                tracked = t;
+            }
+            result.Add(await WriteAsync(fs, snapshot, dataBatch, changeType, tracked,
+                parquetOptions, cancellationToken).ConfigureAwait(false));
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Writes a CDC file for a set of changed rows and returns the <see cref="CdcFile"/> action.
     /// </summary>
     public static async ValueTask<CdcFile> WriteAsync(

@@ -321,15 +321,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// (<paramref name="partitionValues"/> empty). Column mapping + the <c>_change_type</c> column are
     /// handled exactly like the per-statement CDC writes (<see cref="ChangeDataFeed.CdfWriter"/>).
     /// </summary>
-    public async ValueTask<CdcFile> WriteChangeDataFileAsync(
+    public async ValueTask<IReadOnlyList<CdcFile>> WriteChangeDataFileAsync(
         RecordBatch rows, string changeType,
-        IReadOnlyDictionary<string, string>? partitionValues = null,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        return await ChangeDataFeed.CdfWriter.WriteAsync(
+        return await ChangeDataFeed.CdfWriter.WriteSplitAsync(
             _fs, CurrentSnapshot, rows, changeType,
-            partitionValues ?? new Dictionary<string, string>(),
             _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false);
     }
 
@@ -1531,11 +1529,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 foreach (var deletedBatch in deletedRowBatches)
                 {
-                    var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
+                    actions.AddRange(await ChangeDataFeed.CdfWriter.WriteSplitAsync(
                         _fs, snapshot, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                        addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken).ConfigureAwait(false);
-                    actions.Add(cdcAction);
+                        _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false));
                 }
             }
         }
@@ -1744,11 +1740,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 foreach (var deletedBatch in deletedBatches)
                 {
-                    var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
+                    actions.AddRange(await ChangeDataFeed.CdfWriter.WriteSplitAsync(
                         _fs, snapshot, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                        addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken).ConfigureAwait(false);
-                    actions.Add(cdcAction);
+                        _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false));
                 }
             }
         }
@@ -1874,10 +1868,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 }
                 foreach (var deletedBatch in deletedBatches)
                 {
-                    var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
+                    actions.AddRange(await ChangeDataFeed.CdfWriter.WriteSplitAsync(
                         _fs, snapshot, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                        addFile.PartitionValues, _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false);
-                    actions.Add(cdcAction);
+                        _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false));
                 }
             }
         }
@@ -1952,7 +1945,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             && dvCfg.TryGetValue("delta.enableDeletionVectors", out var dvFlag)
             && string.Equals(dvFlag, "true", StringComparison.OrdinalIgnoreCase);
         if (dvEnabled && !IsIcebergCompat
-            && !(cdfEnabled && snapshot.Metadata.PartitionColumns.Count > 0)
             && !(Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) || HasTypeChanges(snapshot.Schema)))
         {
             return await UpdateViaVectorsAsync(snapshot, rowIds, rewriteFile, cancellationToken)
@@ -2097,14 +2089,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     var preBatch = TakeRowsFromBatch(preFull, matched);
                     var postBatch = TakeRowsFromBatch(rew, matched);
 
-                    var preCdc = await ChangeDataFeed.CdfWriter.WriteAsync(
+                    actions.AddRange(await ChangeDataFeed.CdfWriter.WriteSplitAsync(
                         _fs, snapshot, preBatch, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
-                        addFile.PartitionValues, _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false);
-                    actions.Add(preCdc);
-                    var postCdc = await ChangeDataFeed.CdfWriter.WriteAsync(
+                        _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false));
+                    actions.AddRange(await ChangeDataFeed.CdfWriter.WriteSplitAsync(
                         _fs, snapshot, postBatch, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
-                        addFile.PartitionValues, _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false);
-                    actions.Add(postCdc);
+                        _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false));
                 }
             }
         }
@@ -2223,16 +2213,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         // path. The commit then carries cdc actions, so the feed reads cdc-ONLY for it (the
                         // DV re-add + the post-image add never double-count).
                         var preBatch = TakeRowsFromBatch(DropVirtualRowId(orig), matched);
-                        var preCdc = await ChangeDataFeed.CdfWriter.WriteAsync(
+                        actions.AddRange(await ChangeDataFeed.CdfWriter.WriteSplitAsync(
                             _fs, snapshot, preBatch, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
-                            addFile.PartitionValues, _options.ParquetWriteOptions, cancellationToken)
-                            .ConfigureAwait(false);
-                        actions.Add(preCdc);
-                        var postCdc = await ChangeDataFeed.CdfWriter.WriteAsync(
+                            _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false));
+                        actions.AddRange(await ChangeDataFeed.CdfWriter.WriteSplitAsync(
                             _fs, snapshot, postRows, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
-                            addFile.PartitionValues, _options.ParquetWriteOptions, cancellationToken)
-                            .ConfigureAwait(false);
-                        actions.Add(postCdc);
+                            _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false));
                     }
                 }
             }
@@ -2538,19 +2524,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 foreach (var pre in preimages)
                 {
-                    var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
+                    actions.AddRange(await ChangeDataFeed.CdfWriter.WriteSplitAsync(
                         _fs, snapshot, pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
-                        addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken).ConfigureAwait(false);
-                    actions.Add(cdcAction);
+                        _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false));
                 }
                 foreach (var post in postimages)
                 {
-                    var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
+                    actions.AddRange(await ChangeDataFeed.CdfWriter.WriteSplitAsync(
                         _fs, snapshot, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
-                        addFile.PartitionValues, _options.ParquetWriteOptions,
-                        cancellationToken).ConfigureAwait(false);
-                    actions.Add(cdcAction);
+                        _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false));
                 }
             }
         }

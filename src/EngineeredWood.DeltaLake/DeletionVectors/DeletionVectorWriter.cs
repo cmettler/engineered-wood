@@ -68,23 +68,47 @@ public sealed class DeletionVectorWriter
     private async ValueTask<DeletionVector> CreateFileAsync(
         byte[] dvBlob, long cardinality, CancellationToken cancellationToken)
     {
+        // Spec on-disk DV file (the shape Spark writes AND reads): stored in the TABLE ROOT (next to the
+        // data files — NOT _delta_log/) as "deletion_vector_<uuid>.bin", where <uuid> is the CANONICAL
+        // (big-endian) rendering of the same 16 bytes z85-encoded into pathOrInlineDv. File layout:
+        // <format version: 1 byte = 1><dataSize: 4-byte big-endian int><bitmap bytes><CRC-32 of the
+        // bitmap: 4-byte big-endian>, with the descriptor's offset pointing at the size field.
         string uuid = Guid.NewGuid().ToString();
         string fileName = $"deletion_vector_{uuid}.bin";
-        string filePath = $"_delta_log/{fileName}";
 
-        await _fs.WriteAllBytesAsync(filePath, dvBlob, cancellationToken)
-            .ConfigureAwait(false);
-
-        // Encode UUID for the path reference
-        byte[] uuidBytes = Guid.Parse(uuid).ToByteArray();
-        // Pad to 16 bytes (already is)
+        // Canonical big-endian UUID bytes = the string's hex digits in order (NOT Guid.ToByteArray(),
+        // which shuffles the first three groups little-endian).
+        string hex = uuid.Replace("-", "");
+        byte[] uuidBytes = new byte[16];
+        for (int i = 0; i < 16; i++)
+            uuidBytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
         string encodedUuid = Base85.Encode(uuidBytes);
+
+        var crc = new System.IO.Hashing.Crc32();
+        crc.Append(dvBlob);
+        byte[] crcLe = crc.GetCurrentHash(); // System.IO.Hashing returns little-endian bytes
+
+        byte[] fileBytes = new byte[1 + 4 + dvBlob.Length + 4];
+        fileBytes[0] = 1; // format version
+        fileBytes[1] = (byte)(dvBlob.Length >> 24);
+        fileBytes[2] = (byte)(dvBlob.Length >> 16);
+        fileBytes[3] = (byte)(dvBlob.Length >> 8);
+        fileBytes[4] = (byte)dvBlob.Length;
+        Array.Copy(dvBlob, 0, fileBytes, 5, dvBlob.Length);
+        int tail = 5 + dvBlob.Length;
+        fileBytes[tail] = crcLe[3];
+        fileBytes[tail + 1] = crcLe[2];
+        fileBytes[tail + 2] = crcLe[1];
+        fileBytes[tail + 3] = crcLe[0];
+
+        await _fs.WriteAllBytesAsync(fileName, fileBytes, cancellationToken)
+            .ConfigureAwait(false);
 
         return new DeletionVector
         {
             StorageType = "u",
             PathOrInlineDv = encodedUuid,
-            Offset = 0,
+            Offset = 1,
             SizeInBytes = dvBlob.Length,
             Cardinality = cardinality,
         };

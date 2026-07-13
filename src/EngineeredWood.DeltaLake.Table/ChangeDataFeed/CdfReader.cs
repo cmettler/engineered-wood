@@ -73,7 +73,8 @@ internal static class CdfReader
                 {
                     await foreach (var batch in ReadCdcFileAsync(
                         fs, cdcFile, version, commitTimestamp, readOptions,
-                        physicalToLogical, cancellationToken).ConfigureAwait(false))
+                        physicalToLogical, logicalToPhysical, partitionColumns, arrowSchema,
+                        cancellationToken).ConfigureAwait(false))
                     {
                         yield return nestedMapping
                             ? ColumnMappingRecursive.ToLogical(batch, snapshot.Schema, mappingMode)
@@ -143,6 +144,9 @@ internal static class CdfReader
         long? commitTimestamp,
         ParquetReadOptions? readOptions,
         Dictionary<string, string>? physicalToLogical,
+        Dictionary<string, string>? logicalToPhysical,
+        IReadOnlyList<string> partitionColumns,
+        Apache.Arrow.Schema arrowSchema,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         await using var file = await fs.OpenReadAsync(DeltaPath.Decode(cdcFile.Path), cancellationToken)
@@ -158,6 +162,69 @@ internal static class CdfReader
             var b = physicalToLogical is { Count: > 0 }
                 ? Schema.ColumnMapping.RenameColumns(batch, physicalToLogical)
                 : batch;
+            // Partition columns are EXCLUDED from cdc file bytes (the data-file convention) — re-add them
+            // from the cdc action's partitionValues. Presence-checked: a legacy file that baked them in
+            // (pre-partitioned-cdc EW) keeps its own values. AddPartitionColumns walks the TABLE schema, so
+            // the file's _change_type column (last; preserved as-is — Spark cdc files may mix change types
+            // per row) is detached around the call.
+            bool hasPartCol = false;
+            foreach (var f in b.Schema.FieldsList)
+            {
+                if (string.Equals(f.Name, partitionColumns.Count > 0 ? partitionColumns[0] : "", StringComparison.Ordinal))
+                {
+                    hasPartCol = true;
+                    break;
+                }
+            }
+            if (partitionColumns.Count > 0 && !hasPartCol)
+            {
+                int ctIdx = -1;
+                for (int i = 0; i < b.Schema.FieldsList.Count; i++)
+                {
+                    if (b.Schema.FieldsList[i].Name == CdfConfig.ChangeTypeColumn)
+                    {
+                        ctIdx = i;
+                        break;
+                    }
+                }
+                var ctField = ctIdx >= 0 ? b.Schema.FieldsList[ctIdx] : null;
+                var ctColumn = ctIdx >= 0 ? b.Column(ctIdx) : null;
+                if (ctIdx >= 0)
+                {
+                    var dataCols = new List<IArrowArray>(b.ColumnCount - 1);
+                    var dataFields = new List<Field>(b.ColumnCount - 1);
+                    for (int i = 0; i < b.ColumnCount; i++)
+                    {
+                        if (i == ctIdx)
+                            continue;
+                        dataCols.Add(b.Column(i));
+                        dataFields.Add(b.Schema.FieldsList[i]);
+                    }
+                    var sb = new Apache.Arrow.Schema.Builder();
+                    foreach (var f in dataFields)
+                        sb.Field(f);
+                    b = new RecordBatch(sb.Build(), dataCols, b.Length);
+                }
+                b = Partitioning.PartitionUtils.AddPartitionColumns(
+                    b, arrowSchema, cdcFile.PartitionValues ?? new Dictionary<string, string>(),
+                    partitionColumns, logicalToPhysical);
+                if (ctColumn is not null)
+                {
+                    var cols = new List<IArrowArray>(b.ColumnCount + 1);
+                    var flds = new List<Field>(b.ColumnCount + 1);
+                    for (int i = 0; i < b.ColumnCount; i++)
+                    {
+                        cols.Add(b.Column(i));
+                        flds.Add(b.Schema.FieldsList[i]);
+                    }
+                    cols.Add(ctColumn);
+                    flds.Add(ctField!);
+                    var sb2 = new Apache.Arrow.Schema.Builder();
+                    foreach (var f in flds)
+                        sb2.Field(f);
+                    b = new RecordBatch(sb2.Build(), cols, b.Length);
+                }
+            }
             yield return AddMetadataColumns(b, commitVersion, commitTimestamp);
         }
     }
