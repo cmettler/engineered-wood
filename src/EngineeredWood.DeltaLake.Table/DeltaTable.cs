@@ -101,6 +101,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? partitionColumns = null,
         ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
         IReadOnlyDictionary<string, string>? configuration = null,
+        Schema.StructType? preAssignedSchema = null,
         CancellationToken cancellationToken = default)
     {
         options ??= DeltaTableOptions.Default;
@@ -113,8 +114,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (latestVersion >= 0)
             throw new InvalidOperationException("Delta table already exists.");
 
-        // Convert Arrow schema to Delta schema
-        var deltaSchema = SchemaConverter.FromArrowSchema(schema);
+        // Convert Arrow schema to Delta schema. `preAssignedSchema` = a caller-supplied Delta schema whose
+        // column-mapping ids + physical names were assigned BEFORE this create (data files referencing them
+        // were already written — an eagerly-streamed buffered-transaction CTAS); physical names are random
+        // GUIDs, so a re-assignment here would orphan those files.
+        var deltaSchema = preAssignedSchema ?? SchemaConverter.FromArrowSchema(schema);
 
         // Set protocol versions based on column mapping mode
         int minReaderVersion = 1;
@@ -132,9 +136,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             minReaderVersion = 2;
             minWriterVersion = 5;
 
-            // Assign column mapping IDs and physical names
-            var (mappedSchema, maxId) = ColumnMapping.AssignColumnMapping(deltaSchema);
-            deltaSchema = mappedSchema;
+            // Assign column mapping IDs and physical names (a pre-assigned schema keeps its own).
+            int maxId;
+            if (preAssignedSchema is not null)
+            {
+                maxId = ColumnMapping.GetMaxColumnId(deltaSchema);
+            }
+            else
+            {
+                (deltaSchema, maxId) = ColumnMapping.AssignColumnMapping(deltaSchema);
+            }
 
             string modeStr = columnMappingMode switch
             {
@@ -282,6 +293,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? partitionColumns = null,
         IReadOnlyDictionary<string, string>? configuration = null,
         ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
+        Schema.StructType? preAssignedSchema = null,
         CancellationToken cancellationToken = default)
     {
         options ??= DeltaTableOptions.Default;
@@ -297,7 +309,28 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // New table: honor the requested column-mapping mode (name/id assigns physical names + bumps the protocol).
         return await CreateAsync(fileSystem, schema, options, partitionColumns,
             columnMappingMode: columnMappingMode, configuration: configuration,
+            preAssignedSchema: preAssignedSchema,
             cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Writes a Change-Data-Feed <c>_change_data</c> parquet file for <paramref name="rows"/> (no commit —
+    /// the returned <see cref="CdcFile"/> action is the caller's to include in a later commit). Serves a
+    /// buffered (multi-statement) transaction's eager CDC capture: the rows are in hand at statement time,
+    /// the action fuses into the transaction's single commit at flush. Unpartitioned rows by default
+    /// (<paramref name="partitionValues"/> empty). Column mapping + the <c>_change_type</c> column are
+    /// handled exactly like the per-statement CDC writes (<see cref="ChangeDataFeed.CdfWriter"/>).
+    /// </summary>
+    public async ValueTask<CdcFile> WriteChangeDataFileAsync(
+        RecordBatch rows, string changeType,
+        IReadOnlyDictionary<string, string>? partitionValues = null,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return await ChangeDataFeed.CdfWriter.WriteAsync(
+            _fs, CurrentSnapshot, rows, changeType,
+            partitionValues ?? new Dictionary<string, string>(),
+            _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -2623,6 +2656,30 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>The deterministic active-file ordering used to encode/decode the transient rowid (sorted by
     /// path). The same ordering at scan + delete guarantees a rowid's high bits map back to the same file.</summary>
+    /// <summary>
+    /// The active files' <c>baseRowId</c>s in TRANSIENT-ROWID ORDINAL order (the path-sorted active set
+    /// — the same ordering the rowid encoding uses), for the CURRENT snapshot. A buffered transaction's
+    /// eager UPDATE resolves each matched row's ORIGINAL stable id as
+    /// <c>baseRowId[ordinal] + position</c> (the same rule the merge-on-read update applies).
+    /// </summary>
+    public async ValueTask<IReadOnlyList<long?>> OrderedActiveBaseRowIdsAsync(
+        long? atVersion = null, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        // atVersion: pin the ordinal ordering to the snapshot the rowids came from (see
+        // ReadRowsByRowIdsAsync) — a concurrent append must not shift the base-id resolution.
+        var snapshot = atVersion is { } v && v != CurrentSnapshot.Version
+            ? await GetSnapshotAtVersionAsync(v, cancellationToken).ConfigureAwait(false)
+            : CurrentSnapshot;
+        var ordered = OrderedActiveFiles(snapshot);
+        var ids = new List<long?>(ordered.Count);
+        foreach (var f in ordered)
+        {
+            ids.Add(f.BaseRowId);
+        }
+        return ids;
+    }
+
     private static List<Actions.AddFile> OrderedActiveFiles(Snapshot.Snapshot snapshot)
     {
         var files = new List<Actions.AddFile>(snapshot.ActiveFiles.Values);
@@ -3339,6 +3396,96 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// it can fall back to the batch path without leaving an orphan. (Partitioning is a separate check — the caller
     /// inspects <c>CurrentSnapshot.Metadata.PartitionColumns</c>.)
     /// </summary>
+    /// <summary>True when the table declares IcebergCompat (requires the committing write path).</summary>
+    public bool IsIcebergCompat =>
+        Schema.IcebergCompat.GetVersion(CurrentSnapshot.Metadata.Configuration)
+        != Schema.IcebergCompatVersion.None;
+
+    /// <summary>True when any column carries identity metadata.</summary>
+    public bool HasIdentityColumns
+    {
+        get
+        {
+            foreach (var f in CurrentSnapshot.Schema.Fields)
+            {
+                if (IdentityColumn.GetConfig(f) is not null)
+                    return true;
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Generates identity-column values for a buffered (multi-statement) transaction's eagerly-written
+    /// appends: the configs seed from the CURRENT snapshot's schema, overridden by
+    /// <paramref name="chainedHighWaterMarks"/> (the transaction's pending marks from earlier
+    /// statements, so values chain across statements without a commit between them). Returns the
+    /// processed batches + the new per-column high-water marks; the caller fuses them into its commit
+    /// via <see cref="BuildIdentityMetadataAction"/>. Concurrency: a concurrent identity-consuming
+    /// commit necessarily carries a metaData action (the HWM lives in schema metadata), so the caller's
+    /// rebase metadata check aborts the transaction — Spark's own concurrent-identity policy; values
+    /// baked here are never committed on top of a moved HWM.
+    /// </summary>
+    public (IReadOnlyList<RecordBatch> Batches, IReadOnlyDictionary<string, long> HighWaterMarks)
+        GenerateIdentityValues(IReadOnlyList<RecordBatch> batches,
+                               IReadOnlyDictionary<string, long>? chainedHighWaterMarks = null)
+    {
+        ThrowIfDisposed();
+        var schema = CurrentSnapshot.Schema;
+        var configs = new Dictionary<string, IdentityColumnConfig>();
+        foreach (var f in schema.Fields)
+        {
+            if (IdentityColumn.GetConfig(f) is { } cfg)
+            {
+                configs[f.Name] = chainedHighWaterMarks is not null
+                                  && chainedHighWaterMarks.TryGetValue(f.Name, out var h)
+                    ? cfg with { HighWaterMark = h }
+                    : cfg;
+            }
+        }
+        if (configs.Count == 0)
+        {
+            return (batches, new Dictionary<string, long>());
+        }
+        var outBatches = new List<RecordBatch>(batches.Count);
+        foreach (var b in batches)
+        {
+            var (processed, _) = IdentityColumns.IdentityColumnWriter.ProcessBatch(b, schema, ref configs);
+            outBatches.Add(processed);
+        }
+        var marks = new Dictionary<string, long>();
+        foreach (var kv in configs)
+        {
+            if (kv.Value.HighWaterMark is { } hwm)
+                marks[kv.Key] = hwm;
+        }
+        return (outBatches, marks);
+    }
+
+    /// <summary>
+    /// Builds the metaData action carrying updated identity high-water marks, based on
+    /// <paramref name="baseMetadata"/> (default: the current snapshot's — a buffered ALTER's pending
+    /// metadata composes so one commit never carries two metaData actions).
+    /// </summary>
+    public MetadataAction BuildIdentityMetadataAction(
+        IReadOnlyDictionary<string, long> highWaterMarks, MetadataAction? baseMetadata = null)
+    {
+        ThrowIfDisposed();
+        var meta = baseMetadata ?? CurrentSnapshot.Metadata;
+        var schema = baseMetadata is null
+            ? CurrentSnapshot.Schema
+            : DeltaSchemaSerializer.Parse(baseMetadata.SchemaString);
+        var fields = new List<StructField>(schema.Fields.Count);
+        foreach (var f in schema.Fields)
+        {
+            fields.Add(highWaterMarks.TryGetValue(f.Name, out var hwm)
+                ? IdentityColumn.UpdateHighWaterMark(f, hwm)
+                : f);
+        }
+        var updated = new Schema.StructType { Fields = fields };
+        return meta with { SchemaString = DeltaSchemaSerializer.Serialize(updated) };
+    }
+
     public bool SupportsExternalDataFileCommit
     {
         get
@@ -3362,7 +3509,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default,
         IReadOnlyList<DeltaAction>? extraActions = null,
         long? expectedVersion = null,
-        string operation = "WRITE")
+        string operation = "WRITE",
+        bool identityValuesPreGenerated = false)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -3387,7 +3535,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // FILES are being committed — a deletion-vector-only or metadata-only fused flush (extraActions
         // with no files) involves no write-time processing.
         var cfg = CurrentSnapshot.Metadata.Configuration;
-        if (files.Count > 0 && !SupportsExternalDataFileCommit)
+        if (files.Count > 0 && !SupportsExternalDataFileCommit
+            && !(identityValuesPreGenerated && !IsIcebergCompat))
             throw new NotSupportedException(
                 "CommitDataFilesAsync: table has identity columns or IcebergCompat — "
                 + "these require engineered-wood's own writer.");
@@ -3784,14 +3933,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     public async ValueTask<IReadOnlyList<WrittenDataFile>> WriteDataFilesAsync(
         IReadOnlyList<RecordBatch> batches,
         CancellationToken cancellationToken = default,
-        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride = null)
+        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride = null,
+        bool identityValuesPreGenerated = false,
+        IReadOnlyList<long>? materializedRowIds = null)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        if (!SupportsExternalDataFileCommit)
+        if (IsIcebergCompat)
             throw new NotSupportedException(
-                "WriteDataFilesAsync: table has identity columns or IcebergCompat — "
-                + "these require the committing write path.");
+                "WriteDataFilesAsync: IcebergCompat tables require the committing write path.");
+        if (HasIdentityColumns && !identityValuesPreGenerated)
+            throw new NotSupportedException(
+                "WriteDataFilesAsync: table has identity columns — generate their values first "
+                + "(GenerateIdentityValues) and pass identityValuesPreGenerated, or use the "
+                + "committing write path.");
 
         var snapshot = CurrentSnapshot;
         // schemaOverride: a buffered transaction's PENDING (ALTERed) schema — the batches carry columns the
@@ -3803,6 +3958,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(writeSchema, mappingMode);
         var files = new List<WrittenDataFile>();
+
+        // materializedRowIds: the rows' ORIGINAL stable row ids, flat + aligned with the batches' rows
+        // (a buffered transaction's UPDATE post-images on a materialized-row-tracking table — the
+        // declared __delta_row_id column overrides baseRowId + position for a spec reader, preserving
+        // identity across the update). Unpartitioned only: the partition split reorders rows and the
+        // flat alignment would break (the merge-on-read update has the same shape restriction).
+        if (materializedRowIds is not null && partitionColumns.Count > 0)
+            throw new NotSupportedException(
+                "WriteDataFilesAsync: materializedRowIds require an unpartitioned table.");
+        int matOffset = 0;
 
         foreach (var batch in batches)
         {
@@ -3816,6 +3981,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     continue;
 
                 var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode);
+                if (materializedRowIds is not null)
+                {
+                    var idb = new Int64Array.Builder();
+                    for (int r = 0; r < dataBatch.Length; r++)
+                        idb.Append(materializedRowIds[matOffset + r]);
+                    matOffset += dataBatch.Length;
+                    physicalBatch = RowTracking.RowTrackingWriter.AddRowIdColumn(physicalBatch, idb.Build());
+                }
 
                 // partitionValues keyed by the PHYSICAL column name under mapping (the spec convention).
                 var trackedPartValues = partValues;
@@ -3875,10 +4048,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     public async IAsyncEnumerable<RecordBatch> ReadRowsByRowIdsAsync(
         IReadOnlyCollection<long> rowIds,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default,
+        long? atVersion = null)
     {
         ThrowIfDisposed();
-        var snapshot = CurrentSnapshot;
+        // atVersion: the snapshot the rowids were SCANNED against (a buffered transaction's pinned
+        // version). Ordinals are path-sort positions in THAT snapshot's active set — resolving them
+        // against a moved CurrentSnapshot would read the wrong files after a concurrent commuting
+        // append shifts the ordering.
+        var snapshot = atVersion is { } v && v != CurrentSnapshot.Version
+            ? await GetSnapshotAtVersionAsync(v, cancellationToken).ConfigureAwait(false)
+            : CurrentSnapshot;
         long posMask = (1L << RowIdPositionBits) - 1;
         var positionsByFile = new Dictionary<int, HashSet<long>>();
         foreach (var rid in rowIds)
