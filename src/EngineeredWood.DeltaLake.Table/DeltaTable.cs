@@ -3510,7 +3510,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<DeltaAction>? extraActions = null,
         long? expectedVersion = null,
         string operation = "WRITE",
-        bool identityValuesPreGenerated = false)
+        bool identityValuesPreGenerated = false,
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>>? deletedPositionsByFileIndex = null)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -3610,8 +3611,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
             long newVersion = snapshot.Version + 1;
-            foreach (var f in files)
+            for (int fi = 0; fi < files.Count; fi++)
             {
+                var f = files[fi];
+                // deletedPositionsByFileIndex: rows of THIS not-yet-committed file that a buffered
+                // transaction deleted after inserting them (same-transaction DML) — the add is born with
+                // an inline deletion vector, so the rows never appear in any committed version. Stats
+                // stay physical-row stats, marked tightBounds=false per the spec (loose supersets).
+                DeletionVector? dv = null;
+                string? stats = f.StatsJson ?? $"{{\"numRecords\":{f.NumRecords}}}";
+                if (deletedPositionsByFileIndex is not null
+                    && deletedPositionsByFileIndex.TryGetValue(fi, out var deletedPositions)
+                    && deletedPositions.Count > 0)
+                {
+                    var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+                    dv = await dvWriter.CreateAsync(deletedPositions, deletedPositions.Count,
+                        cancellationToken).ConfigureAwait(false);
+                    stats = StatsWithLooseBounds(stats);
+                }
                 long fileBaseRowId = nextRowId;
                 actions.Add(new AddFile
                 {
@@ -3622,9 +3639,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     DataChange = true,
                     // numRecords is REQUIRED (row-tracking high-water mark is derived from baseRowId + numRecords);
                     // a caller that has full stats passes StatsJson, else we emit the minimal numRecords-only stats.
-                    Stats = f.StatsJson ?? $"{{\"numRecords\":{f.NumRecords}}}",
+                    Stats = stats,
                     BaseRowId = rowTrackingEnabled ? fileBaseRowId : null,
                     DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
+                    DeletionVector = dv,
                 });
                 if (rowTrackingEnabled)
                     nextRowId += f.NumRecords;
