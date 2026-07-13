@@ -3431,7 +3431,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                                IReadOnlyDictionary<string, long>? chainedHighWaterMarks = null)
     {
         ThrowIfDisposed();
-        var schema = CurrentSnapshot.Schema;
+        return GenerateIdentityValuesForSchema(CurrentSnapshot.Schema, batches, chainedHighWaterMarks);
+    }
+
+    /// <summary>
+    /// The schema-seeded form of <see cref="GenerateIdentityValues"/> — for a table that does NOT exist
+    /// yet (a buffered transaction's pending CREATE: the identity configs come from the parked schema's
+    /// <c>delta.identity.*</c> field metadata, values chain across the transaction's statements, and
+    /// the flush bakes the final marks into commit-0's schema). No concurrency concern: nobody can
+    /// consume ids from a table that has never been committed.
+    /// </summary>
+    public static (IReadOnlyList<RecordBatch> Batches, IReadOnlyDictionary<string, long> HighWaterMarks)
+        GenerateIdentityValuesForSchema(Schema.StructType schema, IReadOnlyList<RecordBatch> batches,
+                                        IReadOnlyDictionary<string, long>? chainedHighWaterMarks = null)
+    {
         var configs = new Dictionary<string, IdentityColumnConfig>();
         foreach (var f in schema.Fields)
         {
