@@ -83,8 +83,11 @@ internal static class RowTrackingWriter
     /// Both arrays' length must equal <paramref name="batch"/>.Length.
     /// </summary>
     public static RecordBatch AddRowIdAndCommitVersionColumns(
-        RecordBatch batch, Int64Array rowIds, Int64Array commitVersions)
+        RecordBatch batch, Int64Array rowIds, Int64Array commitVersions, bool nullable = false)
     {
+        // nullable: a copy-on-write REWRITE may carry per-row NULLs (a source file predating row tracking
+        // has no derivable original id — readers then fall back to the new file's baseRowId + position,
+        // a fresh id for exactly that row). Compaction keeps the non-nullable form.
         var columns = new IArrowArray[batch.ColumnCount + 2];
         var fields = new List<Field>(batch.ColumnCount + 2);
         for (int i = 0; i < batch.ColumnCount; i++)
@@ -93,9 +96,9 @@ internal static class RowTrackingWriter
             fields.Add(batch.Schema.FieldsList[i]);
         }
         columns[batch.ColumnCount] = rowIds;
-        fields.Add(new Field(RowIdColumn, Int64Type.Default, false));
+        fields.Add(new Field(RowIdColumn, Int64Type.Default, nullable));
         columns[batch.ColumnCount + 1] = commitVersions;
-        fields.Add(new Field(RowCommitVersionColumn, Int64Type.Default, false));
+        fields.Add(new Field(RowCommitVersionColumn, Int64Type.Default, nullable));
 
         var schema = new Apache.Arrow.Schema.Builder();
         foreach (var f in fields)

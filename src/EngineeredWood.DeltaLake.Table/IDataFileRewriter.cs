@@ -36,8 +36,23 @@ public interface IDataFileRewriter
     /// The returned batches carry the table's logical user schema (no trailing rowid, no partition columns —
     /// exactly what the Delta write path expects for a fresh data file). The Delta layer does NOT open the
     /// source file when this is used.
+    ///
+    /// <para>When <paramref name="rowTracking"/> is non-null (a row-tracking table with materialized columns
+    /// declared), the returned batches ADDITIONALLY carry two trailing nullable BIGINT columns
+    /// <c>__delta_row_id</c> and <c>__delta_row_commit_version</c>: each row's ORIGINAL stable id (the source
+    /// file's materialized value where present, else <see cref="RowTrackingRewrite.SourceBaseRowId"/> +
+    /// position) and commit version (an UPDATE-substituted row gets
+    /// <see cref="RowTrackingRewrite.NewCommitVersion"/>; others keep the source's materialized value else
+    /// <see cref="RowTrackingRewrite.SourceDefaultCommitVersion"/>). A value may be NULL when underivable
+    /// (a source file predating row tracking) — readers then fall back to the NEW file's baseRowId +
+    /// position, i.e. a fresh id for that row.</para>
     /// </summary>
     IAsyncEnumerable<RecordBatch> ReadRewriteAsync(
         int fileOrdinal, string sourceRelativePath, IReadOnlyCollection<long> excludePositions,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken, RowTrackingRewrite? rowTracking = null);
 }
+
+/// <summary>Per-source-file inputs for materializing row tracking through a copy-on-write rewrite —
+/// see <see cref="IDataFileRewriter.ReadRewriteAsync"/>.</summary>
+public sealed record RowTrackingRewrite(
+    long? SourceBaseRowId, long? SourceDefaultCommitVersion, long NewCommitVersion);
