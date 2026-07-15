@@ -77,7 +77,9 @@ tables with partition values containing `:`/`%`/space were unreadable by Spark a
   `IdentityColumnWriter` machinery finally advertises itself).
 - `appendOnly`/`invariants`/`checkConstraints` allowlisted + enforced only when ACTIVE
   (`HonorWriterFeatures`) — a v7-upgraded table merely LISTING them (the common case) writes normally;
-  a write violating an active one is rejected instead of silently proceeding.
+  a write violating an active one is rejected instead of silently proceeding. Tests:
+  `WriterFeatureEnforcementTests` (inactive-listed writes normally; active invariant / CHECK
+  constraint / generation expression each reject) + the appendOnly arm in `SchemaWriteModesTests`.
 - `delta.rowTracking` domainMetadata high-water mark emitted on every id-assigning commit and max()'d on
   snapshot rebuild (removes could regress the derived mark → row-id reuse); `tightBounds:false` on
   DV-carrying adds; Spark-style 32-char string stat truncation (max side last-char-incremented); nested
@@ -205,7 +207,11 @@ Tests: `BufferedTransactionTests` (Table.Tests) — the fused ALTER+INSERT+DELET
 chained Compute* composition, the ReconcileBatchToFields pending-schema overlay, ReadRowsByRowIdsAsync
 `atVersion` read-back, the expectedVersion conflict-abort, and the `txn`-action round-trip; plus
 `SchemaWriteModesTests` for SetSchemaAsync (adopt/no-op), repartition-on-overwrite, static + dynamic
-partition overwrite, and `delta.appendOnly` enforcement.
+partition overwrite, and `delta.appendOnly` enforcement; plus `IdentityTransactionSeamsTests` for the
+identity split (GenerateIdentityValues chaining across statements, the fused
+BuildIdentityMetadataAction commit with a persisting high-water mark, the schema-seeded pending-CREATE
+form, and the un-valued-batches guard on WriteDataFilesAsync); `TimestampResolutionTests` pins
+plain-table timestamp travel via the always-on commitInfo.timestamp.
 
 Row-tracking preservation through EVERY rewrite (the row-tracking promise made real — `delta.
 enableRowTracking` guarantees ids stable across rewrites, which only holds if every rewrite path
