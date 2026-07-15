@@ -24,7 +24,7 @@ public static class SchemaConverter
     /// Deliberately NOT the canonical arrow.parquet.variant (whose storage is struct&lt;metadata,value&gt;) —
     /// the single-blob transport is the host boundary's contract.
     /// </summary>
-    public const string VariantExtensionName = "arrownet.variant";
+    public const string VariantExtensionName = "fabricator.variant";
 
     private const string ArrowExtensionNameKey = "ARROW:extension:name";
 
