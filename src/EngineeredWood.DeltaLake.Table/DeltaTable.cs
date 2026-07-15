@@ -1843,7 +1843,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     public async ValueTask<(long RowsDeleted, long Version)> DeleteByRowIdsViaVectorsAsync(
         IReadOnlyCollection<long> rowIds,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool rowLevelRetry = false)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -1870,6 +1871,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         var actions = new List<DeltaAction>();
+        // Newly-deleted positions per ordinal — the row-level rebase input (RebaseDvDmlActionsAsync)
+        // when a concurrent writer takes our version.
+        var rebasePositions = new Dictionary<int, IReadOnlyCollection<long>>();
         long totalDeleted = 0;
 
         foreach (var kvp in positionsByFile)
@@ -1885,16 +1889,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 : new HashSet<long>();
 
             long newlyDeleted = 0;
-            var newPositions = cdfEnabled ? new HashSet<long>() : null; // CDC: the rows deleted in THIS commit
+            var newPositions = new HashSet<long>(); // the rows deleted in THIS commit (CDC match + rebase)
             foreach (long p in kvp.Value)
                 if (allDeleted.Add(p))
                 {
                     newlyDeleted++;
-                    newPositions?.Add(p);
+                    newPositions.Add(p);
                 }
             if (newlyDeleted == 0)
                 continue;
             totalDeleted += newlyDeleted;
+            rebasePositions[ordinal] = newPositions;
 
             var newDv = await dvWriter.CreateAsync(allDeleted, allDeleted.Count, cancellationToken)
                 .ConfigureAwait(false);
@@ -1928,7 +1933,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         continue;
                     var delRows = new List<int>();
                     for (int i = 0; i < batch.Length; i++)
-                        if (!rids.IsNull(i) && newPositions!.Contains(rids.GetValue(i)!.Value & posMask))
+                        if (!rids.IsNull(i) && newPositions.Contains(rids.GetValue(i)!.Value & posMask))
                             delRows.Add(i);
                     if (delRows.Count > 0)
                     {
@@ -1948,12 +1953,52 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (actions.Count == 0)
             return (0, snapshot.Version);
 
-        var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-            actions, snapshot.Metadata.Configuration, "DELETE");
-        long newVersion = snapshot.Version + 1;
-        await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken).ConfigureAwait(false);
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken).ConfigureAwait(false);
+        long newVersion = await CommitDvDmlWithRebaseAsync(actions, rebasePositions, snapshot, "DELETE",
+            rowLevelRetry, cancellationToken).ConfigureAwait(false);
         return (totalDeleted, newVersion);
+    }
+
+    /// <summary>
+    /// Commits a DV-DML action set with optional ROW-LEVEL concurrency retry: on a version conflict the
+    /// actions are rebased onto the new latest snapshot (<see cref="RebaseDvDmlActionsAsync"/> — concurrent
+    /// DV swaps of the same files re-union when the touched rows are disjoint; same-row / rewrite conflicts
+    /// throw) and the commit retries (bounded). With <paramref name="rowLevelRetry"/> off the first conflict
+    /// surfaces as before.
+    /// </summary>
+    private async ValueTask<long> CommitDvDmlWithRebaseAsync(
+        IReadOnlyList<DeltaAction> actions,
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> rebasePositions,
+        Snapshot.Snapshot snapshot,
+        string operation,
+        bool rowLevelRetry,
+        CancellationToken cancellationToken)
+    {
+        const int maxAttempts = 16;
+        var commitSnapshot = snapshot;
+        var commitActions = actions;
+        for (int attempt = 1; ; attempt++)
+        {
+            var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
+                commitActions, commitSnapshot.Metadata.Configuration, operation);
+            long newVersion = commitSnapshot.Version + 1;
+            try
+            {
+                await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken).ConfigureAwait(false);
+                _currentSnapshot = await SnapshotBuilder.UpdateAsync(commitSnapshot, _log, cancellationToken)
+                    .ConfigureAwait(false);
+                return newVersion;
+            }
+            catch (DeltaConflictException) when (rowLevelRetry && attempt < maxAttempts)
+            {
+                // Another writer took the version: reload the latest snapshot and rebase the ORIGINAL
+                // actions onto it (always from the original base — the rebase is not cumulative).
+                _currentSnapshot = await SnapshotBuilder.UpdateAsync(CurrentSnapshot, _log, cancellationToken)
+                    .ConfigureAwait(false);
+                commitSnapshot = CurrentSnapshot;
+                commitActions = await RebaseDvDmlActionsAsync(actions, rebasePositions, snapshot, commitSnapshot,
+                    cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 
     /// <summary>
@@ -1969,7 +2014,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     public async ValueTask<long> UpdateByRowIdsAsync(
         IReadOnlyCollection<long> rowIds,
         Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool rowLevelRetry = false)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -2017,7 +2063,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (dvEnabled && !IsIcebergCompat
             && !(Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) || HasTypeChanges(snapshot.Schema)))
         {
-            return await UpdateViaVectorsAsync(snapshot, rowIds, rewriteFile, cancellationToken)
+            return await UpdateViaVectorsAsync(snapshot, rowIds, rewriteFile, rowLevelRetry, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -2274,6 +2320,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Snapshot.Snapshot snapshot,
         IReadOnlyCollection<long> rowIds,
         Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile,
+        bool rowLevelRetry,
         CancellationToken cancellationToken)
     {
         long posMask = (1L << RowIdPositionBits) - 1;
@@ -2288,6 +2335,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var actions = new List<DeltaAction>();
+        // Matched (pre-image) positions per ordinal — the row-level rebase input when a concurrent
+        // writer takes our version (post-image adds re-derive their row-id range in the rebase).
+        var rebasePositions = new Dictionary<int, IReadOnlyCollection<long>>();
         var appendBatches = new List<RecordBatch>(); // matched post-image rows, appended as one new file
         // When the table declares materialized row tracking, each appended row must carry its ORIGINAL stable id
         // (source baseRowId + position) so an UPDATE preserves the row id (Spark reads the materialized column).
@@ -2385,6 +2435,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             foreach (long p in matchedPositions)
                 if (allDeleted.Add(p))
                     totalUpdated++;
+            rebasePositions[ordinal] = matchedPositions;
             var newDv = await dvWriter.CreateAsync(allDeleted, allDeleted.Count, cancellationToken)
                 .ConfigureAwait(false);
             actions.Add(new RemoveFile
@@ -2522,12 +2573,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-            actions, snapshot.Metadata.Configuration, "UPDATE");
-        long newVersion = snapshot.Version + 1;
-        await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken).ConfigureAwait(false);
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken).ConfigureAwait(false);
-        return newVersion;
+        return await CommitDvDmlWithRebaseAsync(actions, rebasePositions, snapshot, "UPDATE",
+            rowLevelRetry, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -3970,6 +4017,160 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// ROW-LEVEL CONCURRENCY rebase (the Databricks-style capability, file-conflict → row-conflict): re-targets
+    /// a DML action set that was computed against <paramref name="from"/> onto <paramref name="to"/> when a
+    /// concurrent writer swapped a touched file's deletion vector. Per <c>remove</c>+<c>add</c> DV pair
+    /// (matched by path):
+    /// <list type="bullet">
+    /// <item>the path must still be ACTIVE in <paramref name="to"/> — a concurrent rewrite/compaction of the
+    /// file remains a conflict (v1; a row-id-based remap across rewrites is the possible v2);</item>
+    /// <item>THIS transaction's newly-deleted positions (<paramref name="newPositionsByOrdinal"/>, keyed by
+    /// <paramref name="from"/>'s path-sorted ordinals — absolute in-file positions, stable because DV swaps
+    /// never rewrite the parquet) must be DISJOINT from the concurrent deletions — an intersection means the
+    /// same row was deleted/updated by both writers ⇒ row-level conflict;</item>
+    /// <item>disjoint ⇒ the pair is re-issued against the CURRENT state: <c>remove</c>(path, current DV) +
+    /// <c>add</c>(path, current DV ∪ ours) — both writers' row deletions compose.</item>
+    /// </list>
+    /// Post-image adds (paths NOT active in <paramref name="from"/> — merge-on-read UPDATE appends) get their
+    /// row-tracking <c>baseRowId</c>/<c>defaultRowCommitVersion</c> re-derived from <paramref name="to"/>
+    /// (a concurrent commit may have consumed row-id space), and the trailing high-water-mark domain action is
+    /// rebuilt accordingly. CDC actions pass through unchanged — their content is exactly THIS transaction's
+    /// rows, which the disjointness check guarantees the concurrent writers did not touch. Metadata/protocol
+    /// changes between the snapshots throw (same rule as <see cref="CheckLogicalRebaseAsync"/>). The caller
+    /// re-runs commitInfo assembly after the rebase.
+    /// </summary>
+    public async ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsAsync(
+        IReadOnlyList<DeltaAction> actions,
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> newPositionsByOrdinal,
+        Snapshot.Snapshot from,
+        Snapshot.Snapshot to,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (to.Version == from.Version)
+        {
+            return actions;
+        }
+        if (!MetadataEquals(from.Metadata, to.Metadata))
+        {
+            throw new DeltaConflictException(to.Version,
+                "concurrent metadata change (schema/partitioning/configuration) — cannot rebase the transaction");
+        }
+        if (!ProtocolEquals(from.Protocol, to.Protocol))
+        {
+            throw new DeltaConflictException(to.Version,
+                "concurrent protocol change — cannot rebase the transaction");
+        }
+
+        // Our newly-deleted positions per path (ordinals resolve against `from` — that's what they were
+        // captured on).
+        var fromOrdered = OrderedActiveFiles(from);
+        var oursByPath = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
+        foreach (var kvp in newPositionsByOrdinal)
+        {
+            if (kvp.Key >= 0 && kvp.Key < fromOrdered.Count)
+                oursByPath[fromOrdered[kvp.Key].Path] = kvp.Value;
+        }
+        var fromByPath = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var f in from.ActiveFiles.Values)
+            fromByPath.Add(f.Path);
+        var toByPath = new Dictionary<string, AddFile>(to.ActiveFiles.Count, StringComparer.Ordinal);
+        foreach (var f in to.ActiveFiles.Values)
+            toByPath[f.Path] = f;
+
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(to.Metadata.Configuration);
+        long nextRowId = rowTrackingEnabled ? to.RowIdHighWaterMark : 0;
+        bool anyPostImage = false;
+        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var rebased = new List<DeltaAction>(actions.Count);
+
+        foreach (var action in actions)
+        {
+            switch (action)
+            {
+                case RemoveFile remove when oursByPath.ContainsKey(remove.Path):
+                {
+                    if (!toByPath.TryGetValue(remove.Path, out var current))
+                    {
+                        throw new DeltaConflictException(to.Version,
+                            $"concurrent rewrite/compaction of file '{remove.Path}' this transaction modifies — "
+                            + "cannot rebase at row level (the file was replaced); retry the transaction");
+                    }
+                    rebased.Add(remove with { DeletionVector = current.DeletionVector });
+                    break;
+                }
+                case AddFile add when oursByPath.TryGetValue(add.Path, out var ours):
+                {
+                    // The DV-pair re-add: union OUR positions with the CURRENT deletion vector, after the
+                    // row-level disjointness check against the concurrent deletions.
+                    var current = toByPath[add.Path]; // present — the paired remove above would have thrown
+                    var currentDeleted = current.DeletionVector is not null
+                        ? new HashSet<long>(await _dvReader.ReadAsync(current.DeletionVector, cancellationToken)
+                            .ConfigureAwait(false))
+                        : new HashSet<long>();
+                    int overlap = 0;
+                    foreach (long p in ours)
+                        if (currentDeleted.Contains(p))
+                            overlap++;
+                    if (overlap > 0)
+                    {
+                        throw new DeltaConflictException(to.Version,
+                            $"row-level conflict on file '{add.Path}': {overlap} row(s) this transaction "
+                            + "deletes/updates were concurrently deleted or updated — retry the transaction");
+                    }
+                    foreach (long p in ours)
+                        currentDeleted.Add(p);
+                    var newDv = await dvWriter.CreateAsync(currentDeleted, currentDeleted.Count, cancellationToken)
+                        .ConfigureAwait(false);
+                    rebased.Add(current with
+                    {
+                        DeletionVector = newDv,
+                        DataChange = true,
+                        Stats = StatsWithLooseBounds(current.Stats),
+                    });
+                    break;
+                }
+                case AddFile add when !fromByPath.Contains(add.Path) && add.DataChange:
+                {
+                    // Post-image add (a brand-new file): re-derive its row-id range from the snapshot we are
+                    // committing onto — concurrent commits may have consumed row-id space.
+                    if (rowTrackingEnabled && add.BaseRowId is not null)
+                    {
+                        long rows = Actions.ColumnStats.Parse(add.Stats)?.NumRecords ?? 0;
+                        rebased.Add(add with
+                        {
+                            BaseRowId = nextRowId,
+                            DefaultRowCommitVersion = to.Version + 1,
+                        });
+                        nextRowId += rows;
+                        anyPostImage = true;
+                    }
+                    else
+                    {
+                        rebased.Add(add);
+                    }
+                    break;
+                }
+                case Actions.DomainMetadata dm
+                    when string.Equals(dm.Domain, DeltaLake.RowTracking.RowTrackingConfig.DomainName,
+                                       StringComparison.Ordinal):
+                    // Re-emitted after the loop with the re-derived mark (position in the list is not
+                    // significant for domain metadata).
+                    anyPostImage = true;
+                    break;
+                default:
+                    rebased.Add(action);
+                    break;
+            }
+        }
+        if (rowTrackingEnabled && anyPostImage)
+        {
+            rebased.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
+        }
+        return rebased;
+    }
+
+    /// <summary>
     /// Spark-style LOGICAL REBASE conflict check: decides whether a transaction whose changes were computed
     /// against <paramref name="baseSnapshot"/> may commit on top of the CURRENT snapshot even though other
     /// writers committed in between. Real conflicts throw <see cref="DeltaConflictException"/>:
@@ -4002,6 +4203,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<Expressions.Predicate>? readPredicates = null,
         bool readWholeTable = false,
         bool serializable = false,
+        bool rowLevelDml = false,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
@@ -4074,6 +4276,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             baseByPath[f.Path] = f;
         }
+        if (rowLevelDml && latestByPath is null)
+        {
+            latestByPath = new Dictionary<string, AddFile>(latest.ActiveFiles.Count, StringComparer.Ordinal);
+            foreach (var f in latest.ActiveFiles.Values)
+            {
+                latestByPath[f.Path] = f;
+            }
+        }
         for (long v = baseSnapshot.Version + 1; v <= latest.Version; v++)
         {
             var actions = await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false);
@@ -4094,6 +4304,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         // concurrentDeleteReadCheck: the file existed in our base snapshot and our reads
                         // could have consumed rows from it (its DV change / rewrite / delete invalidates
                         // what the transaction read). dataChange=false (compaction) is exempt.
+                        // ROW-LEVEL relaxation (rowLevelDml, Databricks-style): a remove whose path is
+                        // STILL ACTIVE at latest is a deletion-vector SWAP — the file's surviving rows are
+                        // untouched, and the rows THIS transaction modifies are validated by the row-level
+                        // rebase (RebaseDvDmlActionsAsync disjointness check) — so it is not a read conflict.
+                        if (rowLevelDml && latestByPath is not null && latestByPath.ContainsKey(removed.Path))
+                        {
+                            break;
+                        }
                         if (baseByPath.TryGetValue(removed.Path, out var readFile) && ReadsMatch(readFile))
                         {
                             throw new DeltaConflictException(latest.Version,
@@ -4106,6 +4324,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         // consumed. Blind appends are exempt under WriteSerializable (they may be logically
                         // reordered before the transaction); under Serializable commit order is logical
                         // order, so they conflict too.
+                        // ROW-LEVEL relaxation: a re-add of a path already active in our BASE snapshot is
+                        // the DV-swap half of a concurrent DML commit — no new rows appeared (only fewer).
+                        if (rowLevelDml && baseByPath.ContainsKey(added.Path))
+                        {
+                            break;
+                        }
                         if (ReadsMatch(added))
                         {
                             throw new DeltaConflictException(latest.Version,
