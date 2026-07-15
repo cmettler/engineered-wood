@@ -149,6 +149,8 @@ Read-predicate-vs-file matching = `DeltaFilePruner.ShouldInclude` over the base 
 exact, stats conservative); `dataChange=false` actions (compaction) are exempt from the read checks —
 rows unchanged. Paired with `ComputeDeletionVectorActionsAsync(resolveAgainst:)` so DV ordinals/old-DVs
 resolve against the pinned snapshot (the newer snapshot's path-sorted ordinals differ after appends).
+Tests: `LogicalRebaseTests` (Table.Tests) — WriteSerializable vs Serializable blind-append semantics,
+stats-based read matching, deleteRead, delete/delete, metadata conflict, the compaction exemption.
 
 Repartition-on-overwrite: `WriteAsync(repartitionTo:)` changes the table's partition columns as part of
 the SAME atomic Overwrite commit — the only protocol-legal repartitioning shape (a new
@@ -199,6 +201,11 @@ pending schema onto committed reads).
 Together these let a host buffer a whole multi-statement transaction (schema changes + appends + DV
 deletes + updates) and commit it as ONE atomic Delta version — the same OptimisticTransaction shape
 Spark/delta-rs use (fused metaData+protocol+DV+add commits validated against delta-kernel).
+Tests: `BufferedTransactionTests` (Table.Tests) — the fused ALTER+INSERT+DELETE one-version commit,
+chained Compute* composition, the ReconcileBatchToFields pending-schema overlay, ReadRowsByRowIdsAsync
+`atVersion` read-back, the expectedVersion conflict-abort, and the `txn`-action round-trip; plus
+`SchemaWriteModesTests` for SetSchemaAsync (adopt/no-op), repartition-on-overwrite, static + dynamic
+partition overwrite, and `delta.appendOnly` enforcement.
 
 Row-tracking preservation through EVERY rewrite (the row-tracking promise made real — `delta.
 enableRowTracking` guarantees ids stable across rewrites, which only holds if every rewrite path
