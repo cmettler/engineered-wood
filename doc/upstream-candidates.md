@@ -39,6 +39,18 @@ external reader (Spark, delta-kernel, Fabric) could decode an engineered-wood DV
 a legacy fallback); delta-kernel now reads DV tables, and Fabric's SQL endpoint queries them live. This
 also fixes engineered-wood's own `DeleteAsync` output for external consumers.
 
+Second pass — the ON-DISK (`storageType "u"`) form was broken in BOTH directions (never exercised:
+the writer only produced inline DVs until a large delete crossed the 1 KB inline threshold, and reading
+Spark's `.bin` DVs was first attempted against a live Fabric table). Three spec divergences, mirrored in
+reader and writer: (1) resolved/written under `_delta_log/` instead of the TABLE ROOT (+ the optional
+random-prefix directory from `pathOrInlineDv`'s leading characters); (2) the file name's UUID rendered
+with .NET's little-endian `Guid(byte[])` instead of the canonical big-endian/Java form; (3) the on-disk
+framing ignored — the spec shape is `<version:1><dataSize:4-byte BE><bitmap><CRC-32 BE>` with the offset
+pointing at the size field. Both sides now write/read the spec shape (reader keeps a legacy fallback for
+pre-fix tables; CRC written via System.IO.Hashing). Validated: Spark reads our large-DV deletes, we read
+Spark's `u`-DV UPDATE output byte-for-byte, delta-kernel exact, and Fabric's SQL endpoint decodes the
+on-disk `.bin` live.
+
 ## 3. Checkpoint correctness (deleted rows resurrected — critical)
 
 `CheckpointWriter` dropped `add.deletionVector` (plus `baseRowId`/`defaultRowCommitVersion`) and the
@@ -188,6 +200,33 @@ Together these let a host buffer a whole multi-statement transaction (schema cha
 deletes + updates) and commit it as ONE atomic Delta version — the same OptimisticTransaction shape
 Spark/delta-rs use (fused metaData+protocol+DV+add commits validated against delta-kernel).
 
+Row-tracking preservation through EVERY rewrite (the row-tracking promise made real — `delta.
+enableRowTracking` guarantees ids stable across rewrites, which only holds if every rewrite path
+materializes them): merge-on-read UPDATE post-images bake each row's ORIGINAL `__delta_row_id` (+ the
+new commit version); compaction materializes BOTH id and per-row ORIGINAL commit version (a single
+baseRowId/defaultRowCommitVersion cannot represent rows merged from several sources); and copy-on-write
+DELETE/UPDATE rewrites materialize survivor ids + versions on both byte paths (codec via
+`strippedRowIdsOut`/`strippedVersionsOut` collectors on `ReadFileAsync`; the `IDataFileRewriter` seam
+via an optional `RowTrackingRewrite` record — the host projects the two trailing columns itself) while
+assigning the fresh `baseRowId`/`defaultRowCommitVersion` + HWM domain action the CoW add previously
+lacked (a spec gap). Sources with their OWN materialized ids are honored everywhere (chained rewrites
+carry through; `baseRowId + position` arithmetic on an already-rewritten file would silently change row
+identity). The merge-on-read eligibility gates were also lifted to the full matrix — column mapping
+(name+id; the old `mappingMode == None` requirement was stale), partitions (post-images route through
+`WriteDataFilesAsync` for the Hive split; a SET of the partition column moves the row), and CDF
+(per-file `update_preimage`/`update_postimage` cdc emission; partitioned via the new
+`CdfWriter.WriteSplitAsync`, which all cdc emission sites now share — per-partition cdc files with
+physical-keyed partitionValues, and `CdfReader` re-adds partition columns from the cdc action). Spark
+reads `_metadata.row_id` preserved through all of it, and Spark's own writes back into these tables
+honor the materialized declaration.
+
+S3 conditional-writes correctness (`S3TableFileSystem.RenameAsync`): the commit rename used a
+conditional CopyObject — which is SILENTLY UNGUARDED (AWS documents conditional writes for
+PutObject/CompleteMultipartUpload only; MinIO happily copies over an existing target), so the
+put-if-absent commit guard did not actually guard. Rewritten as GetObject(temp) → PutObject(target,
+`If-None-Match: *`) → Delete(temp); a 412 maps to the rename-failed → `DeltaConflictException` path.
+Validated with 4 racing processes × 10 commits on MinIO: 40/40 commits, zero lost.
+
 Two more spec-correctness fixes found by an S3 (MinIO) test rig: (1) `WriteCoreAsync`'s
 Overwrite-removes omitted the file's `deletionVector`, so an Overwrite of a table whose active file
 carries a DV never reconciled the remove against the (path, DV)-keyed active set — the file stayed
@@ -205,9 +244,41 @@ column chunks, so SQL Server 2025 failed every table read that crossed a checkpo
 snappy compressed data" on the `.checkpoint.parquet`; DuckDB and delta-kernel tolerate the 0-byte form).
 Fixed by letting the codec encode emptiness (Snappier emits the valid empty stream).
 
+## 9. Row-level concurrency (v1 + v2 — the capability piece)
+
+Concurrent DML touching the SAME data file composes instead of failing the file-level delete/delete
+check — the Databricks-proprietary capability (OSS Spark, delta-rs and delta-kernel all conflict at file
+granularity), and v2 goes past Databricks. Opt-in per call; default behavior byte-identical.
+**Tests: `RowLevelConcurrencyTests` (Table.Tests) — self-contained xunit racers for every case below.**
+
+- **v1 — deletion-vector re-union** (`RebaseDvDmlActionsAsync`): a DML action set computed against a
+  base snapshot re-targets onto the latest one. Per remove+add DV pair: the path must still be active;
+  THIS transaction's newly-deleted positions must be DISJOINT from the concurrent deletions (absolute
+  in-file positions are stable across DV swaps — the parquet is never rewritten); disjoint ⇒
+  remove(path, currentDV) + add(path, currentDV ∪ ours); same-row overlap ⇒ a row-level
+  `DeltaConflictException` (first committer wins, no lost update). Post-image adds re-derive
+  `baseRowId`/`defaultRowCommitVersion` + the HWM action from the target snapshot.
+- **v2 — remap across rewrites** (`RemapRowsAcrossRewriteAsync`, automatic within the rebase): when a
+  touched file was REPLACED (compaction / copy-on-write), the rows relocate by STABLE ROW ID — the
+  tombstoned source (on storage until VACUUM) resolves the target ids + ORIGINAL commit versions; the
+  post-rewrite files are scanned for them (dataChange=false candidates first, early exit; fresh appends
+  are structurally excluded — their derived ids sit above the base HWM); the row's COMMIT VERSION is
+  the concurrent-modification discriminator (relocated-untouched keeps its original version — which the
+  slice-8 materialization work guarantees; concurrently updated carries the rewrite's version ⇒
+  conflict; found nowhere ⇒ concurrently deleted ⇒ conflict). Databricks' row-level concurrency still
+  throws on compaction — this is what the materialized ids buy.
+- **Consumption**: autocommit-style callers pass `rowLevelRetry: true` to
+  `DeleteByRowIdsViaVectorsAsync`/`UpdateByRowIdsAsync` (a bounded reload+rebase+retry loop,
+  `CommitDvDmlWithRebaseAsync`); buffered/multi-statement hosts call `RebaseDvDmlActionsAsync`
+  explicitly before `CommitDataFilesAsync(extraActions:, expectedVersion:)` and pass
+  `rowLevelDml: true` to `CheckLogicalRebaseAsync` (which then skips the read-set checks — the
+  row-level write validation subsumes them under WriteSerializable's reads-don't-serialize
+  semantics; `serializable` callers leave both flags off and keep the strict file-level checks).
+
 ## Suggested order
 
 1 → 2 → 3 are independent pure bugfixes (start there; each has a one-line repro). 4 and 5 are small and
 self-contained. 6 is larger but purely spec-alignment. 7 is the strategic discussion — worth an issue
 first ("would you take a pluggable codec seam?") since it shapes the project's positioning. 8 can trickle
-in alongside.
+in alongside. 9 depends on 7's commit seams + 8's row-tracking materialization and is the showcase piece —
+`RowLevelConcurrencyTests` demonstrates the whole surface without any external harness.
