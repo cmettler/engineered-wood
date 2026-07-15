@@ -4074,6 +4074,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var fromByPath = new HashSet<string>(StringComparer.Ordinal);
         foreach (var f in from.ActiveFiles.Values)
             fromByPath.Add(f.Path);
+        // ordinal + AddFile per path in `from` — the remap phase reads the tombstoned source files.
+        var fromFileByPath = new Dictionary<string, (AddFile File, int Ordinal)>(StringComparer.Ordinal);
+        for (int o = 0; o < fromOrdered.Count; o++)
+            fromFileByPath[fromOrdered[o].Path] = (fromOrdered[o], o);
+        var remapPaths = new HashSet<string>(StringComparer.Ordinal);
         var toByPath = new Dictionary<string, AddFile>(to.ActiveFiles.Count, StringComparer.Ordinal);
         foreach (var f in to.ActiveFiles.Values)
             toByPath[f.Path] = f;
@@ -4092,13 +4097,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     if (!toByPath.TryGetValue(remove.Path, out var current))
                     {
-                        throw new DeltaConflictException(to.Version,
-                            $"concurrent rewrite/compaction of file '{remove.Path}' this transaction modifies — "
-                            + "cannot rebase at row level (the file was replaced); retry the transaction");
+                        // v2: the file was REWRITTEN (compaction / copy-on-write). With row tracking the
+                        // rows are relocatable by STABLE ID — collect for the remap phase below (the
+                        // original remove+add pair is dropped; remapped pairs on the NEW files replace it).
+                        if (!DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(to.Metadata.Configuration))
+                        {
+                            throw new DeltaConflictException(to.Version,
+                                $"concurrent rewrite/compaction of file '{remove.Path}' this transaction modifies — "
+                                + "cannot rebase (no row tracking to remap by); retry the transaction");
+                        }
+                        remapPaths.Add(remove.Path);
+                        break;
                     }
                     rebased.Add(remove with { DeletionVector = current.DeletionVector });
                     break;
                 }
+                case AddFile add when remapPaths.Contains(add.Path):
+                    break; // the pair's re-add — replaced by the remapped pairs below
                 case AddFile add when oursByPath.TryGetValue(add.Path, out var ours):
                 {
                     // The DV-pair re-add: union OUR positions with the CURRENT deletion vector, after the
@@ -4163,11 +4178,187 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     break;
             }
         }
+        if (remapPaths.Count > 0)
+        {
+            var sources = new List<(AddFile File, int Ordinal, IReadOnlyCollection<long> Positions)>();
+            foreach (var path in remapPaths)
+            {
+                var (file, ordinal) = fromFileByPath[path];
+                sources.Add((file, ordinal, oursByPath[path]));
+            }
+            rebased.AddRange(await RemapRowsAcrossRewriteAsync(sources, fromByPath, from, to, cancellationToken)
+                .ConfigureAwait(false));
+        }
         if (rowTrackingEnabled && anyPostImage)
         {
             rebased.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
         }
         return rebased;
+    }
+
+    /// <summary>
+    /// v2 of row-level concurrency: relocates DML row intents ACROSS a concurrent rewrite (compaction /
+    /// copy-on-write) by STABLE ROW ID — beyond Databricks, whose row-level concurrency still conflicts
+    /// with compaction. Mechanics: (1) each tombstoned source file (parquet still on storage until VACUUM)
+    /// is read at the transaction's base snapshot to resolve the target rows' stable ids + ORIGINAL commit
+    /// versions (materialized <c>__delta_row_id</c>/<c>__delta_row_commit_version</c>, else
+    /// baseRowId+position / defaultRowCommitVersion); (2) the NEW files (active in <paramref name="to"/>
+    /// but not in the base) are scanned for those ids — compaction-shaped files (dataChange=false) first,
+    /// early-exit once every id is found. Fresh appends can never hold them (their derived ids sit above
+    /// the base snapshot's high-water mark), so only files with materialized ids match. The row's commit
+    /// version is the concurrent-modification discriminator: a relocated-but-untouched row keeps its
+    /// ORIGINAL version (compaction and CoW pass-through both materialize it), while a concurrently
+    /// UPDATED row carries the rewrite's version ⇒ row-level conflict; an id found NOWHERE was concurrently
+    /// DELETED ⇒ row-level conflict (a concurrently DV-deleted relocated row also resolves here — the DV
+    /// filter hides it from the scan). (3) The found positions become remove+add DV pairs on the NEW
+    /// files (union with their current DVs).
+    /// </summary>
+    private async ValueTask<List<DeltaAction>> RemapRowsAcrossRewriteAsync(
+        IReadOnlyList<(AddFile File, int Ordinal, IReadOnlyCollection<long> Positions)> sources,
+        HashSet<string> fromByPath,
+        Snapshot.Snapshot from,
+        Snapshot.Snapshot to,
+        CancellationToken cancellationToken)
+    {
+        long posMask = (1L << RowIdPositionBits) - 1;
+
+        // 1. resolve the target rows' stable ids + original commit versions from the tombstoned sources.
+        var targetVersions = new Dictionary<long, long>();
+        foreach (var (file, ordinal, positions) in sources)
+        {
+            var posSet = positions as HashSet<long> ?? new HashSet<long>(positions);
+            var ids = new List<Int64Array?>();
+            var vers = new List<Int64Array?>();
+            var batches = new List<RecordBatch>();
+            await foreach (var b in ReadFileAsync(file, null, from, cancellationToken, fileOrdinal: ordinal,
+                               strippedRowIdsOut: ids, strippedVersionsOut: vers).ConfigureAwait(false))
+                batches.Add(b);
+            int resolved = 0;
+            for (int bi = 0; bi < batches.Count; bi++)
+            {
+                var b = batches[bi];
+                if (b.ColumnCount == 0)
+                    continue;
+                var rids = b.Column(b.ColumnCount - 1) as Int64Array;
+                if (rids is null)
+                    continue;
+                for (int i = 0; i < b.Length; i++)
+                {
+                    if (rids.IsNull(i))
+                        continue;
+                    long pos = rids.GetValue(i)!.Value & posMask;
+                    if (!posSet.Contains(pos))
+                        continue;
+                    long? matId = bi < ids.Count && ids[bi] is { } ia && !ia.IsNull(i) ? ia.GetValue(i) : null;
+                    long? matVer = bi < vers.Count && vers[bi] is { } va && !va.IsNull(i) ? va.GetValue(i) : null;
+                    long? stable = matId ?? (file.BaseRowId is { } baseId ? baseId + pos : null);
+                    long? version = matVer ?? file.DefaultRowCommitVersion;
+                    if (stable is null || version is null)
+                    {
+                        throw new DeltaConflictException(to.Version,
+                            $"concurrent rewrite of file '{file.Path}': a target row has no stable row "
+                            + "id/version to remap by — retry the transaction");
+                    }
+                    targetVersions[stable.Value] = version.Value;
+                    resolved++;
+                }
+            }
+            if (resolved != posSet.Count)
+            {
+                throw new DeltaConflictException(to.Version,
+                    $"concurrent rewrite of file '{file.Path}': {posSet.Count - resolved} target row(s) "
+                    + "could not be resolved for the remap — retry the transaction");
+            }
+        }
+
+        // 2. locate the ids in the NEW files (compaction-shaped dataChange=false first; early exit).
+        var remaining = new HashSet<long>(targetVersions.Keys);
+        var assignments = new Dictionary<string, (AddFile File, HashSet<long> Positions)>(StringComparer.Ordinal);
+        var candidates = to.ActiveFiles.Values
+            .Where(f => !fromByPath.Contains(f.Path))
+            .OrderBy(f => f.DataChange) // false (compaction) first
+            .ToList();
+        foreach (var cand in candidates)
+        {
+            if (remaining.Count == 0)
+                break;
+            var ids = new List<Int64Array?>();
+            var vers = new List<Int64Array?>();
+            var batches = new List<RecordBatch>();
+            await foreach (var b in ReadFileAsync(cand, null, to, cancellationToken, fileOrdinal: 0,
+                               strippedRowIdsOut: ids, strippedVersionsOut: vers).ConfigureAwait(false))
+                batches.Add(b);
+            for (int bi = 0; bi < batches.Count; bi++)
+            {
+                var b = batches[bi];
+                if (b.ColumnCount == 0 || bi >= ids.Count || ids[bi] is not { } ia)
+                    continue; // no materialized ids in this batch — a fresh append can't hold our rows
+                var rids = b.Column(b.ColumnCount - 1) as Int64Array;
+                if (rids is null)
+                    continue;
+                var va = bi < vers.Count ? vers[bi] : null;
+                for (int i = 0; i < b.Length; i++)
+                {
+                    if (ia.IsNull(i) || rids.IsNull(i))
+                        continue;
+                    long stable = ia.GetValue(i)!.Value;
+                    if (!remaining.Contains(stable))
+                        continue;
+                    long newVer = va is not null && !va.IsNull(i)
+                        ? va.GetValue(i)!.Value
+                        : cand.DefaultRowCommitVersion ?? long.MaxValue;
+                    if (newVer != targetVersions[stable])
+                    {
+                        throw new DeltaConflictException(to.Version,
+                            $"row-level conflict: row (stable id {stable}) this transaction deletes/updates "
+                            + "was concurrently updated (commit version advanced across the rewrite) — "
+                            + "retry the transaction");
+                    }
+                    if (!assignments.TryGetValue(cand.Path, out var slot))
+                    {
+                        assignments[cand.Path] = slot = (cand, new HashSet<long>());
+                    }
+                    slot.Positions.Add(rids.GetValue(i)!.Value & posMask);
+                    remaining.Remove(stable);
+                }
+            }
+        }
+        if (remaining.Count > 0)
+        {
+            throw new DeltaConflictException(to.Version,
+                $"row-level conflict: {remaining.Count} row(s) this transaction deletes/updates were "
+                + "concurrently deleted (not found after the rewrite) — retry the transaction");
+        }
+
+        // 3. remove+add DV pairs on the new files.
+        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var result = new List<DeltaAction>(assignments.Count * 2);
+        foreach (var kv in assignments)
+        {
+            var (cand, positions) = kv.Value;
+            var deleted = cand.DeletionVector is not null
+                ? new HashSet<long>(await _dvReader.ReadAsync(cand.DeletionVector, cancellationToken)
+                    .ConfigureAwait(false))
+                : new HashSet<long>();
+            foreach (long p in positions)
+                deleted.Add(p);
+            var newDv = await dvWriter.CreateAsync(deleted, deleted.Count, cancellationToken)
+                .ConfigureAwait(false);
+            result.Add(new RemoveFile
+            {
+                Path = cand.Path,
+                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = true,
+                DeletionVector = cand.DeletionVector,
+            });
+            result.Add(cand with
+            {
+                DeletionVector = newDv,
+                DataChange = true,
+                Stats = StatsWithLooseBounds(cand.Stats),
+            });
+        }
+        return result;
     }
 
     /// <summary>
@@ -4250,8 +4441,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         // Read-set checks (skipped when the caller recorded no reads — pure delete/delete mode).
+        // ROW-LEVEL mode (rowLevelDml, write_serializable only): the read checks are REPLACED by the
+        // row-level write validation (RebaseDvDmlActionsAsync / RemapRowsAcrossRewriteAsync — same-row
+        // overlap and concurrent update/delete of OUR rows conflict there, at row granularity). Under
+        // WriteSerializable reads are not serialized (the isolation level's definition), and this matches
+        // Databricks row-level semantics: concurrent DML/appends touching OTHER rows never abort a
+        // transaction that merely read them.
         bool hasReads = readWholeTable || readPredicates is { Count: > 0 };
-        if (!hasReads)
+        if (!hasReads || rowLevelDml)
         {
             return;
         }
@@ -4276,14 +4473,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             baseByPath[f.Path] = f;
         }
-        if (rowLevelDml && latestByPath is null)
-        {
-            latestByPath = new Dictionary<string, AddFile>(latest.ActiveFiles.Count, StringComparer.Ordinal);
-            foreach (var f in latest.ActiveFiles.Values)
-            {
-                latestByPath[f.Path] = f;
-            }
-        }
         for (long v = baseSnapshot.Version + 1; v <= latest.Version; v++)
         {
             var actions = await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false);
@@ -4304,14 +4493,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         // concurrentDeleteReadCheck: the file existed in our base snapshot and our reads
                         // could have consumed rows from it (its DV change / rewrite / delete invalidates
                         // what the transaction read). dataChange=false (compaction) is exempt.
-                        // ROW-LEVEL relaxation (rowLevelDml, Databricks-style): a remove whose path is
-                        // STILL ACTIVE at latest is a deletion-vector SWAP — the file's surviving rows are
-                        // untouched, and the rows THIS transaction modifies are validated by the row-level
-                        // rebase (RebaseDvDmlActionsAsync disjointness check) — so it is not a read conflict.
-                        if (rowLevelDml && latestByPath is not null && latestByPath.ContainsKey(removed.Path))
-                        {
-                            break;
-                        }
                         if (baseByPath.TryGetValue(removed.Path, out var readFile) && ReadsMatch(readFile))
                         {
                             throw new DeltaConflictException(latest.Version,
@@ -4324,12 +4505,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         // consumed. Blind appends are exempt under WriteSerializable (they may be logically
                         // reordered before the transaction); under Serializable commit order is logical
                         // order, so they conflict too.
-                        // ROW-LEVEL relaxation: a re-add of a path already active in our BASE snapshot is
-                        // the DV-swap half of a concurrent DML commit — no new rows appeared (only fewer).
-                        if (rowLevelDml && baseByPath.ContainsKey(added.Path))
-                        {
-                            break;
-                        }
                         if (ReadsMatch(added))
                         {
                             throw new DeltaConflictException(latest.Version,
