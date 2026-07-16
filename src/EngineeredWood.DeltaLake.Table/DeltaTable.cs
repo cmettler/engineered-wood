@@ -4735,8 +4735,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var addFile = ordered[kvp.Key];
             // sourceRowTrackingOut: one entry per YIELDED batch, row-aligned — each matched row's ORIGINAL
             // stable id (the source file's materialized value where present — a compacted / rewritten file —
-            // else baseRowId + absolute position) and commit version. Plain value arrays, so they stay valid
-            // after the table is disposed (unlike the batches' Arrow buffers).
+            // else baseRowId + absolute position) and commit version. Plain value arrays — the caller can
+            // consume them without any Arrow buffer lifetime to manage. (The yielded batches themselves are
+            // also self-owned and remain valid after the table is disposed.)
             int bi = -1;
             var srcMatIds = sourceRowTrackingOut is not null ? new List<Apache.Arrow.Int64Array?>() : null;
             var srcMatVers = sourceRowTrackingOut is not null ? new List<Apache.Arrow.Int64Array?>() : null;
