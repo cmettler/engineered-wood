@@ -4702,9 +4702,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     public async IAsyncEnumerable<RecordBatch> ReadRowsByRowIdsAsync(
         IReadOnlyCollection<long> rowIds,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default,
         long? atVersion = null,
-        List<(long?[] Ids, long?[] Versions)>? sourceRowTrackingOut = null)
+        List<(long?[] Ids, long?[] Versions)>? sourceRowTrackingOut = null,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default
+        )
     {
         ThrowIfDisposed();
         // atVersion: the snapshot the rowids were SCANNED against (a buffered transaction's pinned
