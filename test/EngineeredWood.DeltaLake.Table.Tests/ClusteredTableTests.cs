@@ -142,6 +142,79 @@ public class ClusteredTableTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_WithClusteringColumns_DeclaresTheFeatureAndDomain()
+    {
+        // The create-side counterpart: CreateAsync(clusteringColumns:) declares the table LIQUID-CLUSTERED
+        // — writer-v7 `clustering` (+ its domainMetadata dependency) and the delta.clustering domain in
+        // commit-0, byte-shaped like Spark's own (paths + the redundant domainName field) — so a clustering
+        // engine's OPTIMIZE (Spark) reclusters tables created here.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("v", StringType.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema, clusteringColumns: ["id"]);
+
+        var protocol = table.CurrentSnapshot.Protocol;
+        Assert.Equal(7, protocol.MinWriterVersion);
+        Assert.Contains("clustering", protocol.WriterFeatures!);
+        Assert.Contains("domainMetadata", protocol.WriterFeatures!);
+
+        Assert.True(table.CurrentSnapshot.DomainMetadata.TryGetValue(ClusteringDomain, out var dm));
+        Assert.Equal(/*lang=json,strict*/ "{\"clusteringColumns\":[[\"id\"]],\"domainName\":\"delta.clustering\"}",
+                     dm!.Configuration);
+
+        // and writes work as usual (unclustered appends — the spec-legal ingest shape)
+        long v = await table.WriteAsync([Batch(1, 5)]);
+        Assert.Equal(1, v);
+    }
+
+    [Fact]
+    public async Task CreateAsync_WithClusteringColumns_UnderColumnMapping_StoresPhysicalNames()
+    {
+        // The spec stores PHYSICAL column names in the delta.clustering domain: OSS Spark's
+        // ClusteringColumnInfo resolves the domain's paths against the schema's physical names and
+        // None.get-crashes on a logical name under column mapping (observed live on Fabric Spark 4.1 —
+        // DESCRIBE DETAIL and OPTIMIZE both failed on a domain carrying logical names). The caller
+        // supplies LOGICAL names; CreateAsync must resolve them through the mapping-assigned schema.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("grp", Int64Type.Default, true))
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("v", StringType.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema,
+            columnMappingMode: Schema.ColumnMappingMode.Name,
+            clusteringColumns: ["grp", "id"]);
+
+        Assert.True(table.CurrentSnapshot.DomainMetadata.TryGetValue(ClusteringDomain, out var dm));
+        var config = dm!.Configuration;
+
+        // The domain must carry the mapped col-<guid> physical names, never the logical ones.
+        var grpPhysical = Schema.ColumnMapping.GetPhysicalName(
+            table.CurrentSnapshot.Schema.Fields.Single(f => f.Name == "grp"), Schema.ColumnMappingMode.Name);
+        var idPhysical = Schema.ColumnMapping.GetPhysicalName(
+            table.CurrentSnapshot.Schema.Fields.Single(f => f.Name == "id"), Schema.ColumnMappingMode.Name);
+        Assert.StartsWith("col-", grpPhysical);
+        Assert.StartsWith("col-", idPhysical);
+        Assert.Equal(
+            $"{{\"clusteringColumns\":[[\"{grpPhysical}\"],[\"{idPhysical}\"]],\"domainName\":\"delta.clustering\"}}",
+            config);
+        Assert.DoesNotContain("[\"grp\"]", config);
+    }
+
+    [Fact]
+    public async Task CreateAsync_WithUnknownClusteringColumn_Throws()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Build();
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema, clusteringColumns: ["nope"]));
+        Assert.Contains("nope", ex.Message);
+    }
+
+    [Fact]
     public async Task ClusteringProvider_RoundTripsThroughLogReplay()
     {
         // add.clusteringProvider (a Databricks/Spark clustering writer tags its clustered files) must

@@ -307,6 +307,17 @@ granularity), and v2 goes past Databricks. Opt-in per call; default behavior byt
   still shows the clusteringColumns, and a further OPTIMIZE reclusters (incl. the foreign unclustered
   files). Writing CLUSTERED files (Hilbert layout + provider tagging) remains unimplemented — this slice
   is interop, not a clustering writer.
+- **Create side**: `CreateAsync`/`OpenOrCreateAsync` gained `clusteringColumns` — declares the table
+  liquid-clustered at creation (writer-v7 `clustering` + its `domainMetadata` dependency + the
+  `delta.clustering` domain in commit-0, byte-shaped like Spark's own). **Spec finding (cost a live
+  crash): the domain stores PHYSICAL column names.** OSS Spark's `ClusteringColumnInfo.apply`
+  (`ClusteringColumn.scala`) resolves the domain's paths against the schema's physical names and
+  `None.get`-crashes `DESCRIBE DETAIL`/`OPTIMIZE` on a logical name under column mapping (observed on
+  Fabric Spark 4.1). Callers supply LOGICAL names; CreateAsync resolves them through the
+  mapping-assigned schema (`ColumnMapping.GetPhysicalName`); unknown column → clear error.
+  `ClusteredTableTests` now 6 (adds mapped-create physical-name pin + unknown-column throw); validated
+  live — Spark `DESCRIBE DETAIL` shows the logical clusteringColumns and `OPTIMIZE` runs its clustering
+  strategy on a table created here with name-mode mapping.
 
 ## Suggested order
 

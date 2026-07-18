@@ -102,7 +102,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
         IReadOnlyDictionary<string, string>? configuration = null,
         Schema.StructType? preAssignedSchema = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IReadOnlyList<string>? clusteringColumns = null)
     {
         options ??= DeltaTableOptions.Default;
         var log = new TransactionLog(fileSystem);
@@ -224,6 +225,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             minWriterVersion = 7;
             writerFeatureSet.Add("identityColumns");
         }
+        // Clustered (liquid-clustering) table: a WRITER-only feature ('clustering', readers read normally)
+        // whose clustering-columns spec rides the delta.clustering system domain (=> domainMetadata is a
+        // dependency, like rowTracking's high-water mark). The domain action joins commit-0 below. This
+        // library does not itself WRITE clustered layouts — a clustering engine's OPTIMIZE (Spark) uses the
+        // declaration to (re)cluster.
+        if (clusteringColumns is { Count: > 0 })
+        {
+            minWriterVersion = 7;
+            writerFeatureSet.Add("clustering");
+            if (!writerFeatureSet.Contains("domainMetadata"))
+                writerFeatureSet.Add("domainMetadata");
+        }
         // Column mapping is BOTH a reader and writer feature. In table-features mode (reader v3 / writer v7 —
         // forced by deletionVectors/rowTracking/… above) it MUST be listed in BOTH feature lists, else a strict
         // reader (Spark) rejects the table ("feature enabled in metadata but not listed in protocol"). Absent any
@@ -269,6 +282,38 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 CreatedTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             },
         };
+        if (clusteringColumns is { Count: > 0 })
+        {
+            // The clustering-columns spec, byte-shaped like Spark's own (each column a PATH array — these
+            // are top-level names — plus the redundant domainName field Spark includes):
+            // {"clusteringColumns":[["a"],["b"]],"domainName":"delta.clustering"}
+            // CRITICAL: the domain stores PHYSICAL names (OSS delta's ClusteringColumnInfo resolves them
+            // against the schema's physical names and None.get-crashes on a logical name under column
+            // mapping — observed live on Fabric Spark 4.1). Resolve each caller-supplied LOGICAL name
+            // through the (already mapping-assigned) schema; without mapping physical == logical.
+            var sb = new System.Text.StringBuilder("{\"clusteringColumns\":[");
+            for (int i = 0; i < clusteringColumns.Count; i++)
+            {
+                var field = deltaSchema.Fields.FirstOrDefault(
+                    f => string.Equals(f.Name, clusteringColumns[i], StringComparison.OrdinalIgnoreCase));
+                if (field is null)
+                {
+                    throw new DeltaFormatException(
+                        $"Clustering column '{clusteringColumns[i]}' is not a column of the table.");
+                }
+                string physical = ColumnMapping.GetPhysicalName(field, columnMappingMode);
+                if (i > 0)
+                    sb.Append(',');
+                sb.Append("[\"").Append(physical.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append("\"]");
+            }
+            sb.Append("],\"domainName\":\"delta.clustering\"}");
+            actions.Add(new DomainMetadata
+            {
+                Domain = "delta.clustering",
+                Configuration = sb.ToString(),
+                Removed = false,
+            });
+        }
 
         // Record a commitInfo on the create commit too (operation "CREATE TABLE" + timestamp), so version 0
         // appears in the history with metadata like every other commit.
@@ -294,7 +339,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyDictionary<string, string>? configuration = null,
         ColumnMappingMode columnMappingMode = ColumnMappingMode.None,
         Schema.StructType? preAssignedSchema = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IReadOnlyList<string>? clusteringColumns = null)
     {
         options ??= DeltaTableOptions.Default;
         var log = new TransactionLog(fileSystem);
@@ -310,7 +356,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return await CreateAsync(fileSystem, schema, options, partitionColumns,
             columnMappingMode: columnMappingMode, configuration: configuration,
             preAssignedSchema: preAssignedSchema,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+            cancellationToken: cancellationToken,
+            clusteringColumns: clusteringColumns).ConfigureAwait(false);
     }
 
     /// <summary>
