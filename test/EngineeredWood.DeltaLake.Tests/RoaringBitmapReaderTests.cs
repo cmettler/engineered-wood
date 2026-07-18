@@ -14,32 +14,35 @@ public class RoaringBitmapReaderTests
     /// </summary>
     private static byte[] BuildSimpleDv(params ushort[] values)
     {
-        // RoaringBitmapArray format:
-        // 4 bytes: magic (0x6431544D)
-        // Then portable Roaring Bitmap:
-        //   4 bytes: cookie = (containerCount-1) << 16 | 12346 (no-run cookie)
-        //   For each container: 2 bytes key + 2 bytes (cardinality-1)
-        //   If containerCount >= 4: containerCount * 4 bytes offset header
+        // Spec RoaringBitmapArray (the only accepted form):
+        // 4 bytes:  magic (0x6431544D)
+        // 8 bytes:  int64 sub-bitmap count
+        // Per sub-bitmap: 4 bytes int32 high-32-bit key, then a portable CRoaring bitmap:
+        //   4 bytes: cookie = 12346 (NO_RUNCONTAINER)
+        //   4 bytes: size = container count
+        //   Per container: 2 bytes key + 2 bytes (cardinality-1)   (descriptive header)
+        //   Per container: 4 bytes offset                          (offset header, always present)
         //   Then container data
 
         using var ms = new MemoryStream();
         using var bw = new BinaryWriter(ms);
 
-        // Magic
-        bw.Write((uint)1681511377);
+        bw.Write((uint)1681511377);   // magic
+        bw.Write((long)1);            // one sub-bitmap
+        bw.Write((uint)0);            // high-32-bit key = 0
 
         int containerCount = 1;
         int cardinality = values.Length;
 
-        // Cookie: no-run, 1 container
-        uint cookie = (uint)((containerCount - 1) << 16) | 12346;
-        bw.Write(cookie);
+        bw.Write((uint)12346);        // cookie: NO_RUNCONTAINER
+        bw.Write((uint)containerCount);
 
         // Descriptive header: key=0, cardinality-1
-        bw.Write((ushort)0); // key
-        bw.Write((ushort)(cardinality - 1)); // cardinality - 1
+        bw.Write((ushort)0);
+        bw.Write((ushort)(cardinality - 1));
 
-        // No offset header (containerCount < 4)
+        // Offset header (always present for the no-run cookie); the reader skips it, so the value is filler.
+        bw.Write((uint)0);
 
         // Array container: sorted uint16 values
         foreach (ushort v in values.OrderBy(v => v))

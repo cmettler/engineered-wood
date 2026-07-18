@@ -35,26 +35,8 @@ public class DeletionVectorTests : IDisposable
     /// </summary>
     private static byte[] BuildDvBlob(params ushort[] deletedRows)
     {
-        using var ms = new MemoryStream();
-        using var bw = new BinaryWriter(ms);
-
-        // Magic
-        bw.Write((uint)1681511377);
-
-        // Cookie: no-run, 1 container
-        uint cookie = (uint)((1 - 1) << 16) | 12346;
-        bw.Write(cookie);
-
-        // Key=0, cardinality-1
-        bw.Write((ushort)0);
-        bw.Write((ushort)(deletedRows.Length - 1));
-
-        // Array container
-        foreach (ushort v in deletedRows.OrderBy(v => v))
-            bw.Write(v);
-
-        bw.Flush();
-        return ms.ToArray();
+        // Serialize through the production writer so the blob is the spec RoaringBitmapArray form.
+        return RoaringBitmapWriter.Serialize(deletedRows.Select(v => (long)v));
     }
 
     [Fact]

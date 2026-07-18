@@ -34,8 +34,34 @@ internal static class RoaringBitmapReader
             throw new DeltaFormatException(
                 $"Invalid deletion vector magic: 0x{magic:X8}, expected 0x{RoaringBitmapArrayMagic:X8}.");
 
+        // Portable RoaringBitmapArray: int64 sub-bitmap count, then per sub-bitmap an int32 high-32-bit key +
+        // a standard portable 32-bit CRoaring bitmap. This is the only accepted form — the writer emits it and
+        // Spark / delta-kernel / Fabric all read and write it.
+        int pos = 4;
+        if (data.Length < pos + 8)
+            throw new DeltaFormatException("Deletion vector truncated: missing RoaringBitmapArray sub-bitmap count.");
+
+        long subBitmaps = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(pos, 8));
+        pos += 8;
+        if (subBitmaps < 0 || subBitmaps > int.MaxValue)
+            throw new DeltaFormatException($"Deletion vector has an invalid sub-bitmap count: {subBitmaps}.");
+
         var result = new HashSet<long>();
-        EngineeredWood.Encodings.RoaringBitmap.DeserializePortable(data.Slice(4), v => result.Add(v));
+        for (long s = 0; s < subBitmaps; s++)
+        {
+            if (data.Length < pos + 4)
+                throw new DeltaFormatException("Deletion vector truncated: missing sub-bitmap key.");
+            uint key = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(pos, 4));
+            pos += 4;
+            long highBits = (long)key << 32;
+            int consumed = EngineeredWood.Encodings.RoaringBitmap.DeserializePortable(
+                data.Slice(pos), v => result.Add(highBits | v),
+                EngineeredWood.Encodings.RoaringBitmap.RoaringFormat.CRoaring);
+            if (consumed <= 0)
+                throw new DeltaFormatException("Deletion vector sub-bitmap could not be decoded.");
+            pos += consumed;
+        }
+
         return result;
     }
 }
