@@ -28,6 +28,17 @@ public static class ProtocolVersions
     /// <summary>Named writer features supported by this implementation.</summary>
     private static readonly HashSet<string> SupportedWriterFeatures = new(StringComparer.Ordinal)
     {
+        // ENFORCEMENT features a writer must honor when ACTIVE; they are almost always LISTED (not active),
+        // because enabling a real feature (columnMapping/deletionVectors/…) upgrades the table to writer-v7
+        // "table features", which enumerates the legacy writer-v2/v3 features explicitly. The writer honors
+        // them per-table (DeltaTable.HonorWriterFeatures): appendOnly is enforced only when
+        // delta.appendOnly=true; invariants / checkConstraints / generatedColumns carry arbitrary SQL this
+        // writer cannot evaluate, so an ACTIVE one REJECTS the write rather than committing possibly-violating
+        // data. Merely LISTING them (the common v7 case) writes normally.
+        "appendOnly",
+        "invariants",
+        "checkConstraints",
+        "generatedColumns",
         "changeDataFeed",
         "columnMapping",
         "deletionVectors",

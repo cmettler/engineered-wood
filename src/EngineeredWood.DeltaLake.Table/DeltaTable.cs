@@ -382,6 +382,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        HonorWriterFeatures(isAppend: false); // DELETE is a data change
 
         var snapshot = CurrentSnapshot;
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
@@ -506,6 +507,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        HonorWriterFeatures(isAppend: false); // UPDATE is a data change
 
         var snapshot = CurrentSnapshot;
         var actions = new List<DeltaAction>();
@@ -807,6 +809,48 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Writes RecordBatch data as a new commit.
     /// Returns the committed version number.
     /// </summary>
+    /// <summary>
+    /// Enforces the writer features a table ACTIVELY declares (Delta constraints are write-time only, so a
+    /// violating commit would poison the table for every reader). <c>delta.appendOnly=true</c> blocks non-append
+    /// data changes; <c>delta.constraints.*</c> / <c>delta.invariants</c> / <c>delta.generationExpression</c>
+    /// carry arbitrary SQL this writer cannot evaluate, so an ACTIVE one rejects the write. A table that merely
+    /// LISTS these features in its writer-v7 protocol (the common case) is unaffected.
+    /// </summary>
+    private void HonorWriterFeatures(bool isAppend)
+    {
+        var cfg = CurrentSnapshot.Metadata.Configuration;
+        if (cfg is not null)
+        {
+            if (!isAppend && cfg.TryGetValue("delta.appendOnly", out var ao)
+                && string.Equals(ao, "true", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new DeltaFormatException(
+                    "Table is append-only (delta.appendOnly=true): overwrite/delete/update are not permitted.");
+            }
+            foreach (var key in cfg.Keys)
+            {
+                if (key.StartsWith("delta.constraints.", StringComparison.Ordinal))
+                {
+                    throw new DeltaFormatException(
+                        $"Table declares CHECK constraint '{key}' which this writer cannot evaluate; write rejected.");
+                }
+            }
+        }
+        foreach (var field in CurrentSnapshot.ArrowSchema.FieldsList)
+        {
+            if (field.Metadata is not null && field.Metadata.ContainsKey("delta.invariants"))
+            {
+                throw new DeltaFormatException(
+                    $"Column '{field.Name}' declares an invariant expression this writer cannot evaluate; write rejected.");
+            }
+            if (field.Metadata is not null && field.Metadata.ContainsKey("delta.generationExpression"))
+            {
+                throw new DeltaFormatException(
+                    $"Column '{field.Name}' declares a generation expression this writer cannot evaluate; write rejected.");
+            }
+        }
+    }
+
     public async ValueTask<long> WriteAsync(
         IReadOnlyList<RecordBatch> batches,
         DeltaWriteMode mode = DeltaWriteMode.Append,
@@ -814,6 +858,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        HonorWriterFeatures(isAppend: mode == DeltaWriteMode.Append);
 
         var snapshot = CurrentSnapshot;
 

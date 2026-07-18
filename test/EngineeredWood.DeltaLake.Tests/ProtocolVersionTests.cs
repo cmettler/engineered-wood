@@ -112,11 +112,13 @@ public class ProtocolVersionTests
         {
             MinReaderVersion = 1,
             MinWriterVersion = 7,
-            WriterFeatures = ["generatedColumns"],
+            // A feature this writer does not understand — generatedColumns is now supported (listed +
+            // enforced via HonorWriterFeatures), so use a genuinely unknown feature here.
+            WriterFeatures = ["someUnsupportedFeature"],
         };
 
         var ex = Assert.Throws<DeltaFormatException>(
             () => ProtocolVersions.ValidateWriteSupport(protocol));
-        Assert.Contains("generatedColumns", ex.Message);
+        Assert.Contains("someUnsupportedFeature", ex.Message);
     }
 }
