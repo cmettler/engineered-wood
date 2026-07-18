@@ -83,8 +83,12 @@ internal static class PartitionUtils
         if (partitionValues.Count == 0)
             return "";
 
+        // Partition directory names use Spark's Hive-style escapePathName (escapes :/%… as %XX, space stays
+        // literal) — NOT URL-encoding — so the physical layout matches Spark. add.path is then the URL-encoded
+        // form of this on-disk path (see DeltaPath.Encode at the write sites).
         return string.Join("/",
-            partitionValues.Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
+            partitionValues.Select(kv =>
+                $"{EngineeredWood.DeltaLake.DeltaPath.EscapePathName(kv.Key)}={EngineeredWood.DeltaLake.DeltaPath.EscapePathName(kv.Value)}"));
     }
 
     /// <summary>

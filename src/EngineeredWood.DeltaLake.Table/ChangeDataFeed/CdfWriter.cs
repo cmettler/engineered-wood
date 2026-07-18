@@ -47,7 +47,7 @@ internal static class CdfWriter
 
         return new CdcFile
         {
-            Path = fileName,
+            Path = EngineeredWood.DeltaLake.DeltaPath.Encode(fileName),
             PartitionValues = CopyDict(partitionValues),
             Size = fileSize,
             DataChange = false,

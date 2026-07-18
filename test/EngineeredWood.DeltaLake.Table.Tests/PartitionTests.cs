@@ -60,6 +60,45 @@ public class PartitionTests : IDisposable
     }
 
     [Fact]
+    public async Task WritePartitioned_SpecialCharValue_EscapesPathAndRoundTrips()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("region", StringType.Default, false))
+            .Build();
+
+        await using var table = await DeltaTable.CreateAsync(
+            fs, schema, partitionColumns: ["region"]);
+
+        // ':' is escaped by Spark's escapePathName to %3A in the on-disk directory; add.path then
+        // URL-encodes that ('%' -> '%25'). Both layers must round-trip.
+        var ids = new Int64Array.Builder().Append(1).Append(2).Build();
+        var regions = new StringArray.Builder().Append("a:b").Append("a:b").Build();
+        await table.WriteAsync([new RecordBatch(schema, [ids, regions], 2)]);
+
+        var addFile = Assert.Single(table.CurrentSnapshot.ActiveFiles.Values);
+        // The partition VALUE in the log stays the raw logical value.
+        Assert.Equal("a:b", addFile.PartitionValues["region"]);
+        // add.path is URL-encoded: the Hive-escaped '%3A' appears as '%253A'.
+        Assert.Contains("region=a%253Ab/", addFile.Path);
+        // The physical directory uses Hive escaping ('%3A'), not URL-encoding.
+        Assert.True(Directory.Exists(Path.Combine(_tempDir, "region=a%3Ab")),
+            "expected a Hive-escaped partition directory on disk");
+
+        // Read back through the (Decode-wrapped) read path — the ':' value reconstructs.
+        var readRegions = new List<string>();
+        await foreach (var b in table.ReadAllAsync())
+        {
+            var col = (StringArray)b.Column(1);
+            for (int i = 0; i < b.Length; i++)
+                readRegions.Add(col.GetString(i));
+        }
+        Assert.Equal(2, readRegions.Count);
+        Assert.All(readRegions, r => Assert.Equal("a:b", r));
+    }
+
+    [Fact]
     public async Task ReadPartitioned_RestoresPartitionColumns()
     {
         var fs = new LocalTableFileSystem(_tempDir);

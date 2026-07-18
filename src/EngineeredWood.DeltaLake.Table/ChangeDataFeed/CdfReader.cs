@@ -106,7 +106,8 @@ internal static class CdfReader
         ParquetReadOptions? readOptions,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await using var file = await fs.OpenReadAsync(cdcFile.Path, cancellationToken)
+        await using var file = await fs.OpenReadAsync(
+            EngineeredWood.DeltaLake.DeltaPath.Decode(cdcFile.Path), cancellationToken)
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
 
@@ -127,11 +128,14 @@ internal static class CdfReader
         ParquetReadOptions? readOptions,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        // path is an add.path (URL-encoded on-disk relative path) — decode to the on-disk name.
+        string diskPath = EngineeredWood.DeltaLake.DeltaPath.Decode(path);
+
         // Try to read the file — it may have been deleted already
-        if (!await fs.ExistsAsync(path, cancellationToken).ConfigureAwait(false))
+        if (!await fs.ExistsAsync(diskPath, cancellationToken).ConfigureAwait(false))
             yield break;
 
-        await using var file = await fs.OpenReadAsync(path, cancellationToken)
+        await using var file = await fs.OpenReadAsync(diskPath, cancellationToken)
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
 

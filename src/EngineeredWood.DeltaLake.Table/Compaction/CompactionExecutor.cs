@@ -48,7 +48,8 @@ internal static class CompactionExecutor
         var allBatches = new List<RecordBatch>();
         foreach (var addFile in candidates)
         {
-            await using var file = await fs.OpenReadAsync(addFile.Path, cancellationToken)
+            await using var file = await fs.OpenReadAsync(
+                EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
 
@@ -140,7 +141,7 @@ internal static class CompactionExecutor
 
                 actions.Add(new AddFile
                 {
-                    Path = fileName,
+                    Path = EngineeredWood.DeltaLake.DeltaPath.Encode(fileName),
                     PartitionValues = candidates[0].PartitionValues,
                     Size = fileSize,
                     ModificationTime = now,

@@ -401,7 +401,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var deletedRowBatches = new List<RecordBatch>(); // For CDC
             long rowOffset = 0;
 
-            await using var file = await _fs.OpenReadAsync(addFile.Path, cancellationToken)
+            await using var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new Parquet.ParquetFileReader(
                 file, ownsFile: false, _options.ParquetReadOptions);
@@ -626,7 +626,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             actions.Add(new AddFile
             {
-                Path = newFileName,
+                Path = EngineeredWood.DeltaLake.DeltaPath.Encode(newFileName),
                 PartitionValues = addFile.PartitionValues,
                 Size = fileSize,
                 ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
@@ -944,7 +944,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 actions.Add(new AddFile
                 {
-                    Path = fileName,
+                    // add.path is the URL-encoded form of the on-disk relative path (spec); readers decode it.
+                    Path = EngineeredWood.DeltaLake.DeltaPath.Encode(fileName),
                     PartitionValues = partValues,
                     Size = fileSize,
                     ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
@@ -1081,7 +1082,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             : null;
 
         // Open the file and read its Parquet schema for field_id resolution
-        await using var file = await _fs.OpenReadAsync(addFile.Path, cancellationToken)
+        await using var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(
             file, ownsFile: false, _options.ParquetReadOptions);

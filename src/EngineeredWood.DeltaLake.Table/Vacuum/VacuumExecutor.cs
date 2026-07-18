@@ -22,10 +22,11 @@ internal static class VacuumExecutor
         bool dryRun,
         CancellationToken cancellationToken)
     {
-        // Collect all referenced file paths from the current snapshot
+        // Collect all referenced file paths from the current snapshot. add.path is URL-encoded, so decode to
+        // the on-disk name before comparing against the physical directory listing (below).
         var referencedPaths = new HashSet<string>(StringComparer.Ordinal);
         foreach (var addFile in snapshot.ActiveFiles.Values)
-            referencedPaths.Add(addFile.Path);
+            referencedPaths.Add(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path));
 
         // List all data files in the table directory
         // Data files are Parquet files not in _delta_log/
