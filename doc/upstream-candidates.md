@@ -326,6 +326,26 @@ granularity), and v2 goes past Databricks. Opt-in per call; default behavior byt
   provider's clustered OPTIMIZE (one host-engine query: per-file reads → global hilbert/lexicographic
   re-order → parquet write → this one commit).
 
+## 11. Compaction on PARTITIONED tables — silent partition-column corruption (bugfix)
+
+- **What**: `CompactionExecutor` compacted ALL candidate files into one output regardless of partition:
+  every partition's rows mixed into a single file written at the TABLE ROOT and stamped with the FIRST
+  candidate's `partitionValues` — after one `CompactAsync` on a partitioned table, every row read that one
+  partition's value (observed live: 400/400/400 across three partitions → 1200 rows all reading "US").
+  Additionally the target schema NULL-backfilled the partition columns INTO the compacted file (data files
+  must not carry them), which also misaligned a pluggable `IDataFileReader`'s raw batches
+  (index-out-of-bounds).
+- **Fix**: candidates group BY PARTITION (`CanonicalPartitionKey` — tolerant of mixed logical/physical
+  partitionValues vintages under column mapping) and each group ≥2 files compacts independently
+  (`CompactGroupAsync`): its adds carry the group's `partitionValues` and land in the group's Hive
+  directory (inherited from its sources' encoded path prefix); the widening/backfill target schema
+  EXCLUDES partition columns. Unpartitioned tables form a single group — behavior unchanged. A partition
+  with one small file stays untouched; a group whose rows are all DV-deleted is left alone (conservative,
+  matches the old no-op).
+- **Tests**: `CompactionTests.Compact_PartitionedTable_CompactsPerPartition` (the corruption pin: exact
+  per-partition values + per-partition files in their Hive dirs) and
+  `Compact_PartitionedTable_SingleFilePartitionLeftAlone`.
+
 ## Suggested order
 
 1 → 2 → 3 are independent pure bugfixes (start there; each has a one-line repro). 4 and 5 are small and
