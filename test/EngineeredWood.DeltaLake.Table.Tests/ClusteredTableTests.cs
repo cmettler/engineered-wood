@@ -215,6 +215,37 @@ public class ClusteredTableTests : IDisposable
     }
 
     [Fact]
+    public async Task CommitDataFiles_RewriteShape_DataChangeFalseAndClusteringProvider()
+    {
+        // A clustering OPTIMIZE commits Overwrite-shaped with dataChange=false on BOTH sides (CDF/append-only
+        // legality) and clusteringProvider on the adds — pin the action shape.
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await CreateClusteredTableAsync();
+        await table.WriteAsync([Batch(1, 3)]);
+        await table.WriteAsync([Batch(4, 3)]);
+
+        long v = await table.CommitDataFilesAsync(
+            [new WrittenDataFile("clustered-rewrite.parquet", 1234, 6, null, null)],
+            DeltaWriteMode.Overwrite,
+            expectedVersion: table.CurrentSnapshot.Version,
+            operation: "OPTIMIZE",
+            dataChange: false,
+            clusteringProvider: "liquid");
+        Assert.Equal(3, v);
+
+        var log = new TransactionLog(fs);
+        var commit = await log.ReadCommitAsync(3);
+        var removes = commit.OfType<RemoveFile>().ToList();
+        Assert.Equal(2, removes.Count);
+        Assert.All(removes, r => Assert.False(r.DataChange));
+        var add = commit.OfType<AddFile>().Single();
+        Assert.False(add.DataChange);
+        Assert.Equal("liquid", add.ClusteringProvider);
+        // The clustering domain still survives the rewrite commit.
+        Assert.True(table.CurrentSnapshot.DomainMetadata.ContainsKey(ClusteringDomain));
+    }
+
+    [Fact]
     public async Task ClusteringProvider_RoundTripsThroughLogReplay()
     {
         // add.clusteringProvider (a Databricks/Spark clustering writer tags its clustered files) must

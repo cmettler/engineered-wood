@@ -318,6 +318,13 @@ granularity), and v2 goes past Databricks. Opt-in per call; default behavior byt
   `ClusteredTableTests` now 6 (adds mapped-create physical-name pin + unknown-column throw); validated
   live — Spark `DESCRIBE DETAIL` shows the logical clusteringColumns and `OPTIMIZE` runs its clustering
   strategy on a table created here with name-mode mapping.
+- **Rewrite-commit seam**: `CommitDataFilesAsync` gained `dataChange` (default true) + `clusteringProvider`
+  — a clustering OPTIMIZE commits Overwrite-shaped with `dataChange=false` on removes AND adds (CDF
+  readers exclude it; spec-legal on appendOnly — `HonorWriterFeatures` treats a `dataChange=false` commit
+  as append-legal since it removes FILES, not rows) and stamps `add.clusteringProvider` (Spark's
+  `"liquid"`). `ClusteredTableTests` now 7 (the rewrite action-shape pin). Used by the consuming
+  provider's clustered OPTIMIZE (one host-engine query: per-file reads → global hilbert/lexicographic
+  re-order → parquet write → this one commit).
 
 ## Suggested order
 

@@ -3819,6 +3819,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    /// <param name="dataChange">False for a REWRITE commit (compaction / clustering OPTIMIZE): the removes and
+    /// adds carry <c>dataChange=false</c> — CDF readers exclude the commit from feeds, concurrent readers'
+    /// dataChange checks ignore it, and (per the spec) it is legal on an <c>appendOnly</c> table.</param>
+    /// <param name="clusteringProvider">Stamped as <c>add.clusteringProvider</c> on every add — a clustering
+    /// OPTIMIZE tags its clustered output files (Spark writes <c>"liquid"</c>).</param>
     public async ValueTask<long> CommitDataFilesAsync(
         IReadOnlyList<WrittenDataFile> files,
         DeltaWriteMode mode,
@@ -3828,15 +3833,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long? expectedVersion = null,
         string operation = "WRITE",
         bool identityValuesPreGenerated = false,
-        IReadOnlyDictionary<int, IReadOnlyCollection<long>>? deletedPositionsByFileIndex = null)
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>>? deletedPositionsByFileIndex = null,
+        bool dataChange = true,
+        string? clusteringProvider = null)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
         // extraActions (a buffered transaction's deletion-vector remove/add pairs) likewise make this a
-        // non-append.
-        HonorWriterFeatures(mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite &&
-                            extraActions is not { Count: > 0 });
+        // non-append. A dataChange=false rewrite (compaction) is append-LEGAL: appendOnly forbids removing
+        // ROWS, not reorganizing files.
+        HonorWriterFeatures((mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite &&
+                            extraActions is not { Count: > 0 }) || !dataChange);
 
         if (dynamicPartitionOverwrite)
         {
@@ -3891,7 +3899,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     {
                         Path = existingFile.Path,
                         DeletionTimestamp = now,
-                        DataChange = true,
+                        DataChange = dataChange,
                         ExtendedFileMetadata = true,
                         PartitionValues = existingFile.PartitionValues,
                         Size = existingFile.Size,
@@ -3953,13 +3961,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     PartitionValues = f.PartitionValues ?? new Dictionary<string, string>(),
                     Size = f.SizeBytes,
                     ModificationTime = now,
-                    DataChange = true,
+                    DataChange = dataChange,
                     // numRecords is REQUIRED (row-tracking high-water mark is derived from baseRowId + numRecords);
                     // a caller that has full stats passes StatsJson, else we emit the minimal numRecords-only stats.
                     Stats = stats,
                     BaseRowId = rowTrackingEnabled ? fileBaseRowId : null,
                     DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
                     DeletionVector = dv,
+                    ClusteringProvider = clusteringProvider,
                 });
                 if (rowTrackingEnabled)
                     nextRowId += f.NumRecords;
