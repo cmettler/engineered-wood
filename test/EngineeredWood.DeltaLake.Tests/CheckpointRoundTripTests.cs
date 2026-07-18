@@ -119,6 +119,86 @@ public class CheckpointRoundTripTests : IDisposable
     }
 
     [Fact]
+    public async Task WriteAndReadCheckpoint_PreservesRemoveTombstoneDeletionVector()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+
+        await log.WriteCommitAsync(0, new List<DeltaAction>
+        {
+            new ProtocolAction { MinReaderVersion = 3, MinWriterVersion = 7 },
+            new MetadataAction
+            {
+                Id = "dv-tombstone-table",
+                Name = "dv_tombstone",
+                Format = Format.Parquet,
+                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
+                PartitionColumns = [],
+                CreatedTime = 1700000000000,
+            },
+        });
+
+        var dv = new DeletionVector
+        {
+            StorageType = "u",
+            PathOrInlineDv = "ab^cdefghijklmnopqrs",
+            Offset = 1,
+            SizeInBytes = 40,
+            Cardinality = 5,
+        };
+
+        // Add a file carrying a DV, then fully remove it — the remove tombstone carries the same DV.
+        await log.WriteCommitAsync(1, new List<DeltaAction>
+        {
+            new AddFile
+            {
+                Path = "part-00000.parquet",
+                PartitionValues = new Dictionary<string, string>(),
+                Size = 1000,
+                ModificationTime = 1700000001000,
+                DataChange = true,
+                DeletionVector = dv,
+            },
+        });
+        await log.WriteCommitAsync(2, new List<DeltaAction>
+        {
+            new RemoveFile
+            {
+                Path = "part-00000.parquet",
+                DataChange = true,
+                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), // unexpired tombstone
+                DeletionVector = dv,
+            },
+        });
+
+        var snapshot = await SnapshotBuilder.BuildAsync(log);
+        Assert.Single(snapshot.Tombstones);
+
+        var writer = new CheckpointWriter(fs);
+        await writer.WriteCheckpointAsync(snapshot);
+
+        var reader = new CheckpointReader(fs);
+        var lastCkpt = await reader.ReadLastCheckpointAsync();
+        Assert.NotNull(lastCkpt);
+        var checkpointActions = await reader.ReadCheckpointAsync(lastCkpt!);
+
+        var restored = new SnapshotBuilder();
+        restored.ApplyCommit(lastCkpt!.Version, checkpointActions);
+        var restoredSnapshot = restored.Build();
+
+        // The tombstone survived the checkpoint AND kept its deletion-vector reference (VACUUM retention
+        // safety: a spec VACUUM protects the DV file while the tombstone is unexpired).
+        var tombstone = Assert.Single(restoredSnapshot.Tombstones).Value;
+        Assert.Equal("part-00000.parquet", tombstone.Path);
+        Assert.NotNull(tombstone.DeletionVector);
+        Assert.Equal(dv.StorageType, tombstone.DeletionVector!.StorageType);
+        Assert.Equal(dv.PathOrInlineDv, tombstone.DeletionVector.PathOrInlineDv);
+        Assert.Equal(dv.Offset, tombstone.DeletionVector.Offset);
+        Assert.Equal(dv.SizeInBytes, tombstone.DeletionVector.SizeInBytes);
+        Assert.Equal(dv.Cardinality, tombstone.DeletionVector.Cardinality);
+    }
+
+    [Fact]
     public async Task WriteAndReadCheckpoint_WithTransactions()
     {
         var fs = new LocalTableFileSystem(_tempDir);

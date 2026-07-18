@@ -216,6 +216,38 @@ public sealed class CheckpointReader
         // partitionValues is a map<string, string>
         var partitionValues = GetStringMapField(structArray, "partitionValues", row);
 
+        int tagsIdx = FindFieldIndex(structArray, "tags");
+        Dictionary<string, string>? tags = null;
+        if (tagsIdx >= 0 && !structArray.Fields[tagsIdx].IsNull(row))
+        {
+            var t = GetStringMapField(structArray, "tags", row);
+            if (t.Count > 0)
+                tags = t;
+        }
+
+        // deletionVector (nested struct; null storageType = none) + row-tracking fields. A checkpoint written
+        // before these were preserved simply lacks the columns — the lookups return null and the add behaves as
+        // before (but its DV/base-row-id information is already lost in that checkpoint).
+        DeletionVector? dv = null;
+        int dvIdx = ((Apache.Arrow.Types.StructType)structArray.Data.DataType).GetFieldIndex("deletionVector");
+        if (dvIdx >= 0)
+        {
+            var dvArray = (Apache.Arrow.StructArray)ArrowArrayFactory.BuildArray(structArray.Data.Children[dvIdx]);
+            int dvRow = row + structArray.Data.Offset;
+            string? storageType = GetStringField(dvArray, "storageType", dvRow);
+            if (!string.IsNullOrEmpty(storageType))
+            {
+                dv = new DeletionVector
+                {
+                    StorageType = storageType!, // guarded by IsNullOrEmpty above (no flow attribute on netstandard2.0)
+                    PathOrInlineDv = GetStringField(dvArray, "pathOrInlineDv", dvRow) ?? "",
+                    Offset = (int?)GetInt32Field(dvArray, "offset", dvRow),
+                    SizeInBytes = (int)(GetInt32Field(dvArray, "sizeInBytes", dvRow) ?? 0),
+                    Cardinality = GetInt64Field(dvArray, "cardinality", dvRow) ?? 0,
+                };
+            }
+        }
+
         return new AddFile
         {
             Path = path,
@@ -224,6 +256,10 @@ public sealed class CheckpointReader
             ModificationTime = modTime,
             DataChange = dataChange,
             Stats = stats,
+            Tags = tags,
+            DeletionVector = dv,
+            BaseRowId = GetInt64Field(structArray, "baseRowId", row),
+            DefaultRowCommitVersion = GetInt64Field(structArray, "defaultRowCommitVersion", row),
         };
     }
 
@@ -237,12 +273,35 @@ public sealed class CheckpointReader
 
         var partitionValues = GetStringMapField(structArray, "partitionValues", row);
 
+        // deletionVector (nested struct; null storageType = none). Preserved so a tombstone read back from a
+        // checkpoint keeps its DV reference for the next checkpoint and for VACUUM retention safety.
+        DeletionVector? dv = null;
+        int dvIdx = ((Apache.Arrow.Types.StructType)structArray.Data.DataType).GetFieldIndex("deletionVector");
+        if (dvIdx >= 0)
+        {
+            var dvArray = (Apache.Arrow.StructArray)ArrowArrayFactory.BuildArray(structArray.Data.Children[dvIdx]);
+            int dvRow = row + structArray.Data.Offset;
+            string? storageType = GetStringField(dvArray, "storageType", dvRow);
+            if (!string.IsNullOrEmpty(storageType))
+            {
+                dv = new DeletionVector
+                {
+                    StorageType = storageType!, // guarded by IsNullOrEmpty above (no flow attribute on netstandard2.0)
+                    PathOrInlineDv = GetStringField(dvArray, "pathOrInlineDv", dvRow) ?? "",
+                    Offset = (int?)GetInt32Field(dvArray, "offset", dvRow),
+                    SizeInBytes = (int)(GetInt32Field(dvArray, "sizeInBytes", dvRow) ?? 0),
+                    Cardinality = GetInt64Field(dvArray, "cardinality", dvRow) ?? 0,
+                };
+            }
+        }
+
         return new RemoveFile
         {
             Path = path,
             DeletionTimestamp = deletionTimestamp,
             DataChange = dataChange,
             PartitionValues = partitionValues.Count > 0 ? partitionValues : null,
+            DeletionVector = dv,
         };
     }
 
@@ -254,6 +313,10 @@ public sealed class CheckpointReader
         {
             MinReaderVersion = (int)(GetInt32Field(structArray, "minReaderVersion", row) ?? 1),
             MinWriterVersion = (int)(GetInt32Field(structArray, "minWriterVersion", row) ?? 2),
+            // The feature lists must round-trip: a snapshot rebuilt from a checkpoint that drops
+            // them would lose the table's feature declarations (nullable — absent below v3/v7).
+            ReaderFeatures = GetStringListFieldOrNull(structArray, "readerFeatures", row),
+            WriterFeatures = GetStringListFieldOrNull(structArray, "writerFeatures", row),
         };
     }
 
@@ -280,6 +343,11 @@ public sealed class CheckpointReader
             format = new Format { Provider = provider };
         }
 
+        // configuration is a map<string,string> — DROPPING it loses delta.enableDeletionVectors /
+        // enableChangeDataFeed / columnMapping.mode / maxColumnId / retention settings after the first
+        // checkpoint (DV-mode misdetection, mapped tables falling back to mode=none, ...).
+        var configuration = GetStringMapField(structArray, "configuration", row);
+
         return new MetadataAction
         {
             Id = id,
@@ -289,6 +357,7 @@ public sealed class CheckpointReader
             SchemaString = schemaString,
             PartitionColumns = partitionColumns,
             CreatedTime = createdTime,
+            Configuration = configuration,
         };
     }
 
@@ -431,12 +500,22 @@ public sealed class CheckpointReader
                     Apache.Arrow.LargeStringArray lsa => lsa.GetString(i),
                     _ => null,
                 };
-                if (key is not null && value is not null)
-                    result[key] = value;
+                if (key is not null)
+                    result[key] = value!;   // a null VALUE is meaningful (null partition value)
             }
         }
 
         return result;
+    }
+
+    // Like GetStringListField but distinguishes a NULL/absent list (null) from an empty one.
+    private static List<string>? GetStringListFieldOrNull(
+        Apache.Arrow.StructArray structArray, string name, int row)
+    {
+        int idx = FindFieldIndex(structArray, name);
+        if (idx < 0 || structArray.Fields[idx].IsNull(row))
+            return null;
+        return GetStringListField(structArray, name, row);
     }
 
     private static List<string> GetStringListField(
