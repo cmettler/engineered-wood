@@ -288,6 +288,26 @@ granularity), and v2 goes past Databricks. Opt-in per call; default behavior byt
   row-level write validation subsumes them under WriteSerializable's reads-don't-serialize
   semantics; `serializable` callers leave both flags off and keep the strict file-level checks).
 
+## 10. Clustered (liquid-clustering) tables — writer-feature support
+
+- **What**: `"clustering"` added to `SupportedWriterFeatures` (`ProtocolVersions.cs`). The feature is
+  advisory LAYOUT: the Delta spec permits plain (unclustered) appends and DML by writers that don't
+  implement clustering — a later clustering OPTIMIZE reclusters them. The obligations a non-clustering
+  writer has were ALREADY met: the `delta.clustering` system domain (the clustering-columns spec) is
+  preserved through commits and CHECKPOINTS (SnapshotBuilder/CheckpointWriter carry all domains), and
+  `add.clusteringProvider` round-trips (AddFile/ActionSerializer). Without the allowlist entry, EVERY
+  write to a Databricks/Fabric-Spark `CREATE TABLE … CLUSTER BY` table failed ValidateWriteSupport with
+  "unsupported writer features: [clustering]".
+- **Tests**: `ClusteredTableTests` (3) — append to a synthetic clustered table (protocol v7 +
+  clustering/domainMetadata + the domain action, the exact OSS delta-spark shape), the domain surviving a
+  CHECKPOINT (the sharp edge — a checkpoint that dropped domainMetadata would silently destroy the
+  clustering spec), and `clusteringProvider` round-tripping through log replay.
+- **Validated live** (Fabric Spark 4.1): Spark `CREATE TABLE … CLUSTER BY (grp, id)` + OPTIMIZE →
+  external append + DV DELETE through this library → Spark reads the exact result, `DESCRIBE DETAIL`
+  still shows the clusteringColumns, and a further OPTIMIZE reclusters (incl. the foreign unclustered
+  files). Writing CLUSTERED files (Hilbert layout + provider tagging) remains unimplemented — this slice
+  is interop, not a clustering writer.
+
 ## Suggested order
 
 1 → 2 → 3 are independent pure bugfixes (start there; each has a one-line repro). 4 and 5 are small and
