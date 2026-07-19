@@ -141,6 +141,42 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             };
         }
 
+        // Schema-driven table features must be DECLARED at creation, else a strict reader (Spark,
+        // delta-kernel) rejects the table with "feature enabled in metadata but not listed in protocol".
+        var readerFeatures = new List<string>();
+        var writerFeatures = new List<string>();
+
+        // timestamp_ntz (a naive TIMESTAMP column) is itself a table feature: the spec requires the
+        // 'timestampNtz' READER+WRITER feature whenever the schema contains the type, at any nesting depth.
+        if (SchemaUsesTimestampNtz(deltaSchema))
+        {
+            minReaderVersion = 3;
+            minWriterVersion = 7;
+            readerFeatures.Add("timestampNtz");
+            writerFeatures.Add("timestampNtz");
+        }
+
+        // Identity columns (delta.identity.* field metadata) are a WRITER-only feature ('identityColumns',
+        // legacy writer v6) — readers see an ordinary long column — so the reader version is untouched.
+        if (deltaSchema.Fields.Any(IdentityColumn.IsIdentityColumn))
+        {
+            minWriterVersion = 7;
+            writerFeatures.Add("identityColumns");
+        }
+
+        // Column mapping is BOTH a reader and writer feature. Once any other feature has forced
+        // table-features mode (reader v3 / writer v7) it MUST be listed in BOTH lists too — a v7 protocol
+        // with no columnMapping entry reads as "column mapping not supported". Absent any other feature,
+        // the legacy versioning set above (reader v2 / writer v5, no lists) is what Spark itself writes.
+        if (columnMappingMode != ColumnMappingMode.None &&
+            (minReaderVersion >= 3 || minWriterVersion >= 7))
+        {
+            minReaderVersion = 3;
+            minWriterVersion = 7;
+            readerFeatures.Add("columnMapping");
+            writerFeatures.Add("columnMapping");
+        }
+
         string schemaString = DeltaSchemaSerializer.Serialize(deltaSchema);
 
         var actions = new List<DeltaAction>
@@ -149,6 +185,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 MinReaderVersion = minReaderVersion,
                 MinWriterVersion = minWriterVersion,
+                ReaderFeatures = readerFeatures.Count > 0 ? readerFeatures : null,
+                WriterFeatures = writerFeatures.Count > 0 ? writerFeatures : null,
             },
             new MetadataAction
             {
@@ -263,11 +301,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             newConfig = cfg;
         }
 
+        // Adding a column whose type requires a schema-driven table feature (timestampNtz) to a table whose
+        // protocol lacks it needs a protocol upgrade in the SAME commit — otherwise the committed schema
+        // declares a type the protocol doesn't advertise, and strict readers reject the table.
+        var protocolUpgrade =
+            UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
+
         return await CommitMetadataOnlyAsync(
             snapshot,
             snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig },
             "ADD COLUMNS",
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken,
+            protocolUpgrade).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -386,15 +431,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             cancellationToken).ConfigureAwait(false);
     }
 
-    // Commits a single metaData action (the shape every metadata-only schema change takes) and refreshes.
+    // Commits a metaData action (the shape every metadata-only schema change takes), optionally preceded by a
+    // protocol upgrade in the SAME commit, and refreshes.
     private async ValueTask<long> CommitMetadataOnlyAsync(
         Snapshot.Snapshot snapshot,
         MetadataAction newMetadata,
         string operation,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ProtocolAction? protocolUpgrade = null)
     {
+        var actionList = new List<DeltaAction>();
+        if (protocolUpgrade is not null)
+            actionList.Add(protocolUpgrade);
+        actionList.Add(newMetadata);
+
         var actions = Log.InCommitTimestamp.EnsureCommitInfo(
-            [newMetadata], snapshot.Metadata.Configuration, operation);
+            actionList, snapshot.Metadata.Configuration, operation);
 
         long newVersion = snapshot.Version + 1;
         await _log.WriteCommitAsync(newVersion, actions, cancellationToken).ConfigureAwait(false);
@@ -403,6 +455,85 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, _log, cancellationToken).ConfigureAwait(false);
 
         return newVersion;
+    }
+
+    /// <summary>True when the type contains a <c>timestamp_ntz</c> column at any nesting depth.</summary>
+    private static bool SchemaUsesTimestampNtz(DeltaDataType type) => type switch
+    {
+        PrimitiveType p => string.Equals(p.TypeName, "timestamp_ntz", StringComparison.Ordinal),
+        StructType st => st.Fields.Any(f => SchemaUsesTimestampNtz(f.Type)),
+        ArrayType at => SchemaUsesTimestampNtz(at.ElementType),
+        MapType mt => SchemaUsesTimestampNtz(mt.KeyType) || SchemaUsesTimestampNtz(mt.ValueType),
+        _ => false,
+    };
+
+    /// <summary>
+    /// The schema-driven reader+writer table features <paramref name="type"/> requires per the Delta spec
+    /// (currently <c>timestampNtz</c> for a naive timestamp; <c>variantType</c> joins this list when variant
+    /// columns are supported).
+    /// </summary>
+    private static List<string> RequiredSchemaFeatures(DeltaDataType type)
+    {
+        var features = new List<string>();
+        if (SchemaUsesTimestampNtz(type))
+            features.Add("timestampNtz");
+        return features;
+    }
+
+    /// <summary>
+    /// Builds the protocol action that adds the given reader+writer features, or null when the current
+    /// protocol already declares them all (or none are required). Upgrading a LEGACY-versioned protocol to
+    /// table-features mode (reader 3 / writer 7) must enumerate every feature the legacy version implied,
+    /// else those capabilities are silently lost on the upgraded table.
+    /// </summary>
+    private static ProtocolAction? UpgradeProtocolForFeatures(
+        ProtocolAction current, IReadOnlyList<string> features)
+    {
+        var missing = features.Where(f =>
+            current.ReaderFeatures?.Contains(f) != true
+            || current.WriterFeatures?.Contains(f) != true).ToList();
+        if (missing.Count == 0)
+            return null;
+
+        var writerFeatures = new List<string>(
+            current.WriterFeatures ?? LegacyWriterFeatures(current.MinWriterVersion));
+        var readerFeatures = new List<string>(
+            current.ReaderFeatures ?? LegacyReaderFeatures(current.MinReaderVersion));
+        foreach (var feature in missing)
+        {
+            if (!writerFeatures.Contains(feature))
+                writerFeatures.Add(feature);
+            if (!readerFeatures.Contains(feature))
+                readerFeatures.Add(feature);
+        }
+
+        return new ProtocolAction
+        {
+            MinReaderVersion = 3,
+            MinWriterVersion = 7,
+            ReaderFeatures = readerFeatures,
+            WriterFeatures = writerFeatures,
+        };
+    }
+
+    /// <summary>Writer features implied by a legacy writer version (Delta spec upgrade table).</summary>
+    private static List<string> LegacyWriterFeatures(int minWriterVersion)
+    {
+        var features = new List<string>();
+        if (minWriterVersion >= 2) { features.Add("appendOnly"); features.Add("invariants"); }
+        if (minWriterVersion >= 3) { features.Add("checkConstraints"); }
+        if (minWriterVersion >= 4) { features.Add("changeDataFeed"); features.Add("generatedColumns"); }
+        if (minWriterVersion >= 5) { features.Add("columnMapping"); }
+        if (minWriterVersion >= 6) { features.Add("identityColumns"); }
+        return features;
+    }
+
+    /// <summary>Reader features implied by a legacy reader version (Delta spec upgrade table).</summary>
+    private static List<string> LegacyReaderFeatures(int minReaderVersion)
+    {
+        var features = new List<string>();
+        if (minReaderVersion >= 2) { features.Add("columnMapping"); }
+        return features;
     }
 
     // Assigns column-mapping metadata (id + physical name) to a NEW field being added to a mapped table —
