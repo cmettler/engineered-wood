@@ -199,7 +199,7 @@ internal static class ArrowSchemaConverter
         if (element.ConvertedType.HasValue)
         {
             var desc = BuildTempDescriptor(node);
-            var result = FromConvertedType(element.ConvertedType.Value, desc);
+            var result = FromConvertedType(element.ConvertedType.Value, desc, options);
             if (result != null)
                 return ApplyOutputKind(result, kind);
         }
@@ -238,7 +238,7 @@ internal static class ArrowSchemaConverter
         // Second: check ConvertedType
         if (element.ConvertedType.HasValue)
         {
-            var arrowType = FromConvertedType(element.ConvertedType.Value, column);
+            var arrowType = FromConvertedType(element.ConvertedType.Value, column, options);
             if (arrowType != null)
                 return arrowType;
         }
@@ -284,13 +284,14 @@ internal static class ArrowSchemaConverter
             LogicalType.JsonType => Apache.Arrow.Types.StringType.Default,
             LogicalType.UuidType => MakeUuidArrowType(options),
             LogicalType.Float16Type => HalfFloatType.Default,
-            LogicalType.DecimalType dt => MakeDecimalType(dt.Precision, dt.Scale, column.PhysicalType),
+            LogicalType.DecimalType dt => MakeDecimalType(dt.Precision, dt.Scale, column.PhysicalType, options),
             LogicalType.UnknownLogicalType { ThriftFieldId: 11 } => NullType.Default,
             _ => null, // fall through to ConvertedType or PhysicalType
         };
     }
 
-    private static IArrowType? FromConvertedType(ConvertedType convertedType, ColumnDescriptor column)
+    private static IArrowType? FromConvertedType(
+        ConvertedType convertedType, ColumnDescriptor column, ParquetReadOptions? options)
     {
         return convertedType switch
         {
@@ -313,13 +314,28 @@ internal static class ArrowSchemaConverter
             ConvertedType.Decimal => MakeDecimalType(
                 column.SchemaElement.Precision ?? 0,
                 column.SchemaElement.Scale ?? 0,
-                column.PhysicalType),
+                column.PhysicalType,
+                options),
             _ => null, // fall through to PhysicalType
         };
     }
 
-    private static IArrowType MakeDecimalType(int precision, int scale, PhysicalType physicalType)
+    /// <summary>
+    /// Decodes a Parquet DECIMAL to an Arrow type. By default the narrowest decimal that fits the physical
+    /// width is used; <see cref="DecimalOutputKind.Decimal128"/> widens everything to the classic
+    /// Decimal128/256 for consumers that mishandle the narrow types (see the enum for why).
+    /// </summary>
+    private static IArrowType MakeDecimalType(
+        int precision, int scale, PhysicalType physicalType, ParquetReadOptions? options)
     {
+        // Widening is lossless — the value decoders sign-extend the unscaled integer to any target width.
+        if (options?.DecimalOutput == DecimalOutputKind.Decimal128)
+        {
+            return precision <= 38
+                ? new Decimal128Type(precision, scale)
+                : new Decimal256Type(precision, scale);
+        }
+
         return physicalType switch
         {
             PhysicalType.Int32 => new Decimal32Type(precision, scale),

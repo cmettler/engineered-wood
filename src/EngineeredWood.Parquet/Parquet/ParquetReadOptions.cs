@@ -32,6 +32,29 @@ public enum ByteArrayOutputKind
 }
 
 /// <summary>
+/// Controls the Arrow output type for DECIMAL columns.
+/// </summary>
+public enum DecimalOutputKind
+{
+    /// <summary>
+    /// Default: the narrowest Arrow decimal that fits — <c>Decimal32Type</c> for an INT32-backed column,
+    /// <c>Decimal64Type</c> for INT64, and by precision for FIXED_LEN_BYTE_ARRAY. Preserves the physical
+    /// width, at the cost of producing types some consumers do not handle (see <see cref="Decimal128"/>).
+    /// </summary>
+    Default,
+
+    /// <summary>
+    /// Always produce the classic <c>Decimal128Type</c> (<c>Decimal256Type</c> when precision &gt; 38),
+    /// whatever the parquet physical width. The narrow <c>Decimal32</c>/<c>Decimal64</c> Arrow types are
+    /// newer and not reliably handled by Arrow C-data-interface consumers — DuckDB, for one, reads the
+    /// exported format string as 128-bit over the 4/8-byte buffer and corrupts the values. The decoders
+    /// sign-extend to any target width, so widening is lossless and precision/scale are preserved.
+    /// Choose this when the batches cross the C data interface or feed a consumer of unknown vintage.
+    /// </summary>
+    Decimal128,
+}
+
+/// <summary>
 /// Options that control how Parquet data is read and mapped to Apache Arrow types.
 /// </summary>
 public sealed class ParquetReadOptions
@@ -43,6 +66,11 @@ public sealed class ParquetReadOptions
     /// Controls the Arrow output type for BYTE_ARRAY (string/binary) columns.
     /// </summary>
     public ByteArrayOutputKind ByteArrayOutput { get; init; } = ByteArrayOutputKind.Default;
+
+    /// <summary>
+    /// Controls the Arrow output type for DECIMAL columns.
+    /// </summary>
+    public DecimalOutputKind DecimalOutput { get; init; } = DecimalOutputKind.Default;
 
     /// <summary>
     /// Maximum number of rows per <see cref="Apache.Arrow.RecordBatch"/>. When set, row groups
