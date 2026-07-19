@@ -17,9 +17,12 @@ namespace EngineeredWood.DeltaLake.Table;
 /// <param name="PartitionValues">The Hive partition values for this file, or null/empty when unpartitioned.</param>
 /// <param name="StatsJson">The Delta stats JSON (<c>{numRecords, minValues, maxValues, nullCount}</c>). When null,
 /// <see cref="DeltaTable.CommitDataFilesAsync"/> emits minimal <c>{"numRecords":N}</c> stats.</param>
+/// <param name="Tags">Optional <c>add.tags</c> for the file (e.g. a clustering OPTIMIZE's <c>ZCUBE_ID</c> —
+/// Spark's incremental-clustering cube identity). Null = no tags.</param>
 public readonly record struct WrittenDataFile(
     string RelativePath,
     long SizeBytes,
     long NumRecords,
     System.Collections.Generic.IReadOnlyDictionary<string, string>? PartitionValues,
-    string? StatsJson);
+    string? StatsJson,
+    System.Collections.Generic.IReadOnlyDictionary<string, string>? Tags = null);

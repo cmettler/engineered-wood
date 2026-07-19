@@ -350,6 +350,10 @@ granularity), and v2 goes past Databricks. Opt-in per call; default behavior byt
 - **Tests**: `CompactionTests.Compact_PartitionedTable_CompactsPerPartition` (the corruption pin: exact
   per-partition values + per-partition files in their Hive dirs) and
   `Compact_PartitionedTable_SingleFilePartitionLeftAlone`.
+- **Tags seam**: `WrittenDataFile` gained optional `Tags`, stamped as `add.tags` by
+  `CommitDataFilesAsync` — carries the consuming provider's incremental-clustering cube identity
+  (`ZCUBE_ID`, Spark's tag) on externally-written clustered files. Round-trip pinned in
+  `ClusteredTableTests`.
 
 ## Suggested order
 

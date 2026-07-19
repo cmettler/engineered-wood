@@ -3978,6 +3978,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
                     DeletionVector = dv,
                     ClusteringProvider = clusteringProvider,
+                    Tags = f.Tags,
                 });
                 if (rowTrackingEnabled)
                     nextRowId += f.NumRecords;

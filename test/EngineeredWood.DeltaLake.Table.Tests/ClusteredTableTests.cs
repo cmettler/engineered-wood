@@ -240,7 +240,8 @@ public class ClusteredTableTests : IDisposable
         await table.WriteAsync([Batch(4, 3)]);
 
         long v = await table.CommitDataFilesAsync(
-            [new WrittenDataFile("clustered-rewrite.parquet", 1234, 6, null, null)],
+            [new WrittenDataFile("clustered-rewrite.parquet", 1234, 6, null, null,
+                new Dictionary<string, string> { ["ZCUBE_ID"] = "cube-1" })],
             DeltaWriteMode.Overwrite,
             expectedVersion: table.CurrentSnapshot.Version,
             operation: "OPTIMIZE",
@@ -256,6 +257,8 @@ public class ClusteredTableTests : IDisposable
         var add = commit.OfType<AddFile>().Single();
         Assert.False(add.DataChange);
         Assert.Equal("liquid", add.ClusteringProvider);
+        // the per-file tags (the incremental-clustering ZCUBE identity) round-trip
+        Assert.Equal("cube-1", add.Tags?["ZCUBE_ID"]);
         // The clustering domain still survives the rewrite commit.
         Assert.True(table.CurrentSnapshot.DomainMetadata.ContainsKey(ClusteringDomain));
     }
