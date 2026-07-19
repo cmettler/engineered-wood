@@ -57,6 +57,64 @@ execution aliases → turn off "python.exe" and "python3.exe").
 | Avro | `fastavro` | 7 cross-validation tests | EngineeredWood writes → fastavro reads |
 | Parquet | *(none — uses ParquetSharp NuGet)* | all tests always run | Bidirectional with ParquetSharp |
 
+### Delta Lake interop tiers (optional)
+
+Delta support is validated against two independent implementations, in
+`test/EngineeredWood.DeltaLake.Table.Tests/Interop/`. Both directions are
+covered — EngineeredWood writes and the tool reads, and vice versa.
+
+Round-tripping through EngineeredWood's own reader only proves the reader
+and writer agree on a dialect, not that the dialect is Delta. Every interop
+bug found so far round-tripped perfectly, so these tiers are the only thing
+standing between a spec divergence and shipping it.
+
+| Tier | Install | Tests | Reaches |
+|---|---|---|---|
+| 1 — delta-rs | `pip install deltalake` | 9 | Log/checkpoint replay, path encoding, per-file stats, filtered reads. Seconds to run. |
+| 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 12 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival. ~25s to run. |
+
+Tier 2 (DuckDB) was evaluated and **dropped**: delta-rs embeds
+delta-kernel-rs, which is what DuckDB's delta extension is, so tier 1
+already subsumes it. See [`upstream-landing-notes.md`](upstream-landing-notes.md).
+
+**Version pairing matters.** `delta-spark`'s major version must match
+`pyspark`'s — 4.x with Spark 4.0, 3.x with Spark 3.5. The assertions were
+established against `deltalake` 1.6.2 and `pyspark` 4.0.1 /
+`delta-spark` 4.0.0; those are recorded in `DeltaRs.ValidatedAgainstVersion`
+and `Spark.ValidatedAgainstVersion`. If these tests fail after an upgrade,
+check the tool version before assuming an EngineeredWood regression.
+
+**Tier 3 on Windows** additionally needs Hadoop's `winutils.exe` +
+`hadoop.dll` (Apache does not publish them; community builds exist for each
+Hadoop line — match the version bundled in `pyspark/jars/hadoop-client-api-*.jar`):
+
+```
+# PowerShell (session)
+$env:JAVA_HOME = "C:\Program Files\Microsoft\jdk-17.x.x-hotspot"
+$env:HADOOP_HOME = "C:\Users\<you>\.hadoop\hadoop-3.4.0"
+```
+
+Setting `HADOOP_HOME` alone is **not** enough — `hadoop.dll` must also be
+findable on `PATH`, or Hadoop throws `UnsatisfiedLinkError:
+NativeIO$Windows.access0` on the first directory listing. The harness
+prepends `%HADOOP_HOME%\bin` to the child process `PATH` so callers don't
+have to.
+
+#### Making a missing toolchain fail loudly
+
+Like the ORC/Avro tests, these no-op when their toolchain is absent. At this
+scale that is a hazard: a whole tier can go dark in CI and quietly leave the
+suite back at round-trip-only, with nothing red to show for it. **Set these
+in CI:**
+
+```
+EW_REQUIRE_DELTA_INTEROP=1
+EW_REQUIRE_SPARK_INTEROP=1
+```
+
+With either set, an unavailable toolchain becomes a hard failure naming the
+exact missing prerequisite instead of a silent skip.
+
 ### Regenerating Avro Test Data
 
 The Avro test suite includes pre-generated `.avro` files in
@@ -119,11 +177,18 @@ the Python packages are not installed.
 
 ### Expected test counts
 
-| Suite | Total | Always run | Python-dependent |
+| Suite | Total | Always run | Tool-dependent |
 |---|---|---|---|
-| **Parquet** | 481 | 481 | 0 |
+| **Parquet** | 590 | 590 | 0 |
 | **ORC** | 204 | 194 | 10 (PyArrow) |
 | **Avro** | 272 | 265 | 7 (fastavro) |
+| **DeltaLake** | 199 | 199 | 0 |
+| **DeltaLake.Table** | 290 | 242 | 21 interop (9 delta-rs + 12 PySpark) |
+
+`DeltaLake.Table` also reports 27 **skipped** tests unconditionally — those
+are `PendingCoverageTests`, which pin behaviour from PR #4 that has not
+landed yet. Each names the exact API it is waiting on. They are skipped
+rather than failing so that a red suite still means a real regression.
 
 ## Parquet Compatibility Tool
 
