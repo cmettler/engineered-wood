@@ -354,6 +354,15 @@ granularity), and v2 goes past Databricks. Opt-in per call; default behavior byt
   `CommitDataFilesAsync` — carries the consuming provider's incremental-clustering cube identity
   (`ZCUBE_ID`, Spark's tag) on externally-written clustered files. Round-trip pinned in
   `ClusteredTableTests`.
+- **`SetClusteringColumnsAsync` (the ALTER CLUSTER BY analog)**: declares, re-keys, or removes the
+  `delta.clustering` domain as ONE metadata commit — logical names resolved to physical through the
+  mapped schema, partitioned tables rejected (mutually exclusive), caller `extraActions` (e.g. a
+  table-property update) fused into the same commit. Includes `UpgradeProtocolForWriterFeatures`: the
+  WRITER-ONLY twin of `UpgradeProtocolForFeatures` (clustering/domainMetadata are writer features —
+  adding them to readerFeatures would wrongly lock readers out; the reader side stays untouched, e.g.
+  a legacy reader-1 table upgrades to writer-7 with legacy features enumerated while remaining
+  reader-1). `ClusteredTableTests` 10 (declare/re-key/remove/no-op + the partitioned throw + the
+  writer-only upgrade pin).
 
 ## Suggested order
 

@@ -264,6 +264,61 @@ public class ClusteredTableTests : IDisposable
     }
 
     [Fact]
+    public async Task SetClusteringColumns_DeclaresRekeysAndRemoves()
+    {
+        // The ALTER CLUSTER BY analog. A LEGACY-writer table (no features) gets the WRITER-ONLY protocol
+        // upgrade (writer 7 + legacy features enumerated + clustering/domainMetadata; the READER side is
+        // untouched — they are not reader features); re-keying replaces the domain; null removes it.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("a", Int64Type.Default, true))
+            .Field(new Field("b", Int64Type.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
+        Assert.Equal(2, table.CurrentSnapshot.Protocol.MinWriterVersion); // legacy writer, no features
+
+        long v1 = await table.SetClusteringColumnsAsync(["a"]);
+        Assert.Equal(1, v1);
+        var protocol = table.CurrentSnapshot.Protocol;
+        Assert.Equal(1, protocol.MinReaderVersion); // reader side UNTOUCHED (writer-only features)
+        Assert.Equal(7, protocol.MinWriterVersion);
+        Assert.Null(protocol.ReaderFeatures);
+        Assert.Contains("clustering", protocol.WriterFeatures!);
+        Assert.Contains("domainMetadata", protocol.WriterFeatures!);
+        Assert.Contains("appendOnly", protocol.WriterFeatures!); // legacy v2 features enumerated
+        Assert.True(table.CurrentSnapshot.DomainMetadata.TryGetValue(ClusteringDomain, out var dm));
+        Assert.Contains("[\"a\"]", dm!.Configuration);
+
+        // re-key: the domain is replaced (no second protocol upgrade needed)
+        long v2 = await table.SetClusteringColumnsAsync(["b"]);
+        Assert.Equal(2, v2);
+        Assert.True(table.CurrentSnapshot.DomainMetadata.TryGetValue(ClusteringDomain, out dm));
+        Assert.Contains("[\"b\"]", dm!.Configuration);
+        Assert.DoesNotContain("[\"a\"]", dm.Configuration);
+
+        // remove: the domain tombstones away
+        long v3 = await table.SetClusteringColumnsAsync(null);
+        Assert.Equal(3, v3);
+        Assert.False(table.CurrentSnapshot.DomainMetadata.ContainsKey(ClusteringDomain));
+
+        // removing again with no extra actions is a NO-OP (no commit)
+        Assert.Equal(3, await table.SetClusteringColumnsAsync(null));
+    }
+
+    [Fact]
+    public async Task SetClusteringColumns_OnPartitionedTable_Throws()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("region", StringType.Default, true))
+            .Field(new Field("id", Int64Type.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema, partitionColumns: ["region"]);
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.SetClusteringColumnsAsync(["id"]));
+        Assert.Contains("mutually exclusive", ex.Message);
+    }
+
+    [Fact]
     public async Task ClusteringProvider_RoundTripsThroughLogReplay()
     {
         // add.clusteringProvider (a Databricks/Spark clustering writer tags its clustered files) must
