@@ -46,6 +46,7 @@ The buffered multi-statement surface (`Compute*` schema ALTERs, identity chainin
 |---|---|---|
 | 1 | `705a4e2` | `ConflictChecker` (pure verdict function) + `IsolationLevel` + `ConflictCheckerTests` (9). |
 | 2 | `b8e4fc6` | `DeltaTransaction` + `StartTransaction()` + the OCC commit loop + `DeltaTransactionTests` (4). |
+| 3 | `7964d07` | Auto-committers routed through the OCC loop: `DeleteAsync` and the blind-append `WriteAsync` now rebase-retry instead of throwing on any collision. OCC loop generalised to `CommitOccAsync`; `AutoCommitConcurrencyTests` (6) + a rebased-commit tier-3 Spark test. |
 
 Entry points:
 
@@ -90,14 +91,21 @@ Design facts worth keeping:
 
 ## Remaining work, in suggested order
 
-1. **Step 3 — route the auto-committers through the OCC loop.** Make single-shot `DeleteAsync` (and
-   ideally the append path) get rebase-retry for free instead of throwing on any collision. `DeleteAsync`
-   already delegates to `ComputeDeleteActionsAsync`, so wiring it to `CommitTransactionAsync`-style
-   logic is small; the append path is the harder one (see limitation 1). Add a
-   concurrent-disjoint-writes-both-land test.
+1. ~~**Step 3 — route the auto-committers through the OCC loop.**~~ **DONE (`7964d07`).** Single-shot
+   `DeleteAsync` now delegates to `StartTransaction()` + `DeleteAsync` + `CommitAsync`, and blind-append
+   `WriteAsync` (mode `Append`, not dynamic-overwrite) commits through the shared `CommitOccAsync` — both
+   rebase-retry instead of throwing on a non-conflicting collision, and abort with `DeltaConflictException`
+   only on a real conflict. Covered by `AutoCommitConcurrencyTests`. **Deliberately NOT rebased:** the
+   overwrite family (full / partition-scoped / dynamic) keeps the single-attempt commit — its remove-set is
+   a read of the active-file set, so a verbatim rebase could silently drop a concurrent append; making it
+   rebase-safe needs the partition-predicate plumbing of step 3-below (was limitation 3). Row-tracking
+   writes also stay single-attempt (`rebaseSafe: false`) for the baseRowId reason (limitation 2).
 2. **Appends/updates on the transaction** (closes limitation 1). Enables "two concurrent INSERTs both
-   land" on the transaction API.
-3. **Expression-predicate DELETE overload** (closes limitation 3) — makes concurrentAppend precise.
+   land" on the transaction API. NOTE the auto-committer append already rebases via `CommitOccAsync`
+   with `ReadSet.Blind`; staging on the transaction just needs a `ComputeWriteActionsAsync` extraction
+   mirroring `ComputeDeleteActionsAsync` (the hard part is `WriteCoreAsync`'s size — see limitation 1).
+3. **Expression-predicate DELETE overload** (closes limitation 3) — makes concurrentAppend precise, and
+   is the prerequisite for rebasing partition/dynamic overwrite (their read-set is a partition predicate).
 4. **Layer 3 — row-level concurrency.** The Databricks extension. Largest remaining piece; needs
    row-tracking-through-rewrite in EW's own rewrite path (confirm master's state first — the write path
    assigns baseRowId per file but the copy-on-write *rewrite* path likely does not preserve original
@@ -114,6 +122,15 @@ measuring corrected it. During slice 9 specifically: the VACUUM landing-notes pl
 unexpired tombstones — Spark measurement showed it must not. Before starting layer 3, **verify against
 Spark** (tier 3) rather than trust the PR notes or these notes. The interop tiers make measuring cheap;
 use them.
+
+**Step 3's cross-engine posture (measured).** Step 3 deliberately introduces **no new on-disk artifact**: a
+rebased commit is byte-identical to a sequential one (same add/remove actions, a higher version number). The
+only new *policy* is the blind-append conflict rule, which lives in the step-1 `ConflictChecker` (modeled on
+Spark's own) and is unit-tested. The claim that a rebased commit reads correctly in a foreign engine was
+**measured, not assumed**: `SparkInteropTests.EwConcurrentAppends_Rebased_SparkReadsAllRows` drives two racing
+EW handles so the second commit rebases through `CommitOccAsync`, then has Spark 4.0.1 / delta-spark 4.0.0 read
+the table — all rows present, versions consecutive. The full tier-3 suite (13) and delta-rs tier (9) also pass
+against the rewired write path. Running it needs `JAVA_HOME` (JDK 17) + `HADOOP_HOME` (winutils) + `EW_REQUIRE_SPARK_INTEROP=1`.
 
 ## Running the tests
 
