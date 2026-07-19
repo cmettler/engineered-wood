@@ -415,6 +415,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 cancellationToken: cancellationToken).ConfigureAwait(false))
             {
                 var logicalBatch = ColumnMapping.RenameColumns(batch, physicalToLogical);
+                if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
+                    logicalBatch = ColumnMappingRecursive.ToLogical(logicalBatch, snapshot.Schema, mappingMode);
                 var mask = predicate(logicalBatch);
                 var matchRows = new List<int>();
 
@@ -515,11 +517,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
             snapshot.Metadata.Configuration);
 
+        // ColumnMappingRecursive reads the physical names / field ids off the schema itself — no flat maps needed.
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
-        var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
-            snapshot.Schema, mappingMode);
-        var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
-            snapshot.Schema, mappingMode);
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
@@ -598,10 +597,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 foreach (var batch in outputBatches)
                 {
-                    // Rename to physical names for Parquet storage
-                    var physicalBatch = ColumnMapping.RenameToPhysical(batch, logicalToPhysical);
-                    physicalBatch = ColumnMapping.SetParquetFieldIds(
-                        physicalBatch, snapshot.Schema, mappingMode);
+                    // Physical names + parquet field ids at EVERY level (nested struct children included —
+                    // the top-level-only rename/stamp pair left them logical-named and id-less).
+                    var physicalBatch = ColumnMappingRecursive.ToPhysical(
+                        batch, snapshot.Schema, mappingMode);
 
                     // Strip row tracking column if present
                     var (cleanBatch, _) = RowTracking.RowTrackingWriter.StripRowIdColumn(physicalBatch);
@@ -934,8 +933,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (dataBatch.Length == 0)
                     continue;
 
-                // Rename logical columns to physical names for Parquet storage
-                var physicalBatch = ColumnMapping.RenameToPhysical(dataBatch, logicalToPhysical);
+                // Rename logical columns to physical names + stamp field ids, at EVERY level (nested struct
+                // children included — the top-level-only pair left them logical-named/id-less).
+                var physicalBatch = ColumnMappingRecursive.ToPhysical(
+                    dataBatch, snapshot.Schema, mappingMode);
 
                 // IcebergCompat: materialize partition columns into Parquet file
                 if (Schema.IcebergCompat.RequiresPartitionMaterialization(icebergVersion) &&
@@ -946,9 +947,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         logicalToPhysical);
                 }
 
-                // Set PARQUET:field_id metadata for column mapping (both id and name modes)
-                physicalBatch = ColumnMapping.SetParquetFieldIds(
-                    physicalBatch, snapshot.Schema, mappingMode);
+                // (field ids already stamped recursively above; IcebergCompat-appended partition columns are
+                // physical-named by AppendPartitionColumns and carry no mapping ids of their own)
 
                 // Assign row IDs if row tracking is enabled
                 long fileBaseRowId = nextRowId;
@@ -980,12 +980,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     fileSize = file.Position;
                 }
 
-                // Collect stats from the data batch using logical names
+                // Stats keys are PHYSICAL at every level under mapping (nested struct leaves included) —
+                // readers resolve stats by the same physical names the data file uses.
                 // IcebergCompat requires numRecords in stats regardless of options
                 string? stats = null;
                 if (_options.CollectStats ||
                     Schema.IcebergCompat.RequiresNumRecords(icebergVersion))
-                    stats = CollectStats(dataBatch);
+                    stats = CollectStats(
+                        ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode));
 
                 actions.Add(new AddFile
                 {
@@ -1206,7 +1208,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             columnNames: fileColumns, cancellationToken: cancellationToken)
             .ConfigureAwait(false))
         {
-            // Rename columns back to logical names
+            // Rename columns back to logical names (flat, top level), then recursively for nested struct
+            // children (the flat renames leave them under their physical names).
             RecordBatch result;
             if (isIdMode && fieldIdToLogical is not null && parquetSchema is not null)
             {
@@ -1215,6 +1218,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             else
             {
                 result = ColumnMapping.RenameColumns(batch, physicalToLogical);
+            }
+            if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
+            {
+                result = ColumnMappingRecursive.ToLogical(result, snapshot.Schema, mappingMode);
             }
 
             // Apply deletion vector filtering

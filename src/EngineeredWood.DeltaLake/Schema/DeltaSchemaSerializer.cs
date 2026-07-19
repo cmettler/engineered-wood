@@ -125,7 +125,15 @@ internal static class DeltaSchemaSerializer
                     {
                         writer.WriteStartObject();
                         foreach (var kvp in field.Metadata)
-                            writer.WriteString(kvp.Key, kvp.Value);
+                        {
+                            // delta.columnMapping.id is a NUMERIC field-id in the Delta spec — a strict reader
+                            // (Spark: Metadata.getLong) fails if it's serialized as a string. Emit it as a JSON
+                            // number; every other metadata value (physicalName, comments, …) stays a string.
+                            if (kvp.Key == ColumnMapping.FieldIdKey && long.TryParse(kvp.Value, out var fieldId))
+                                writer.WriteNumber(kvp.Key, fieldId);
+                            else
+                                writer.WriteString(kvp.Key, kvp.Value);
+                        }
                         writer.WriteEndObject();
                     }
                     else

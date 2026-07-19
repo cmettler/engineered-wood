@@ -187,4 +187,62 @@ public class ColumnMappingTests
 
         Assert.Equal(12, ColumnMapping.GetMaxColumnId(schema));
     }
+
+    private static StructType MappedSchema() => new()
+    {
+        Fields =
+        [
+            new StructField
+            {
+                Name = "logical",
+                Type = new PrimitiveType { TypeName = "long" },
+                Nullable = false,
+                Metadata = new Dictionary<string, string>
+                {
+                    { ColumnMapping.FieldIdKey, "7" },
+                    { ColumnMapping.PhysicalNameKey, "col-abc" },
+                },
+            },
+        ],
+    };
+
+    // The Delta protocol requires data files to use PHYSICAL names in BOTH mapping modes — id mode
+    // additionally stamps the parquet field_id, but the NAMES are physical either way. Returning the
+    // logical name in id mode made every id-mode file read as all-NULLs for a spec reader.
+    [Theory]
+    [InlineData(ColumnMappingMode.Name)]
+    [InlineData(ColumnMappingMode.Id)]
+    public void GetPhysicalName_UsesPhysicalName_InBothModes(ColumnMappingMode mode)
+    {
+        var field = MappedSchema().Fields[0];
+        Assert.Equal("col-abc", ColumnMapping.GetPhysicalName(field, mode));
+
+        Assert.Equal("col-abc", ColumnMapping.BuildLogicalToPhysicalMap(MappedSchema(), mode)["logical"]);
+        Assert.Equal("logical", ColumnMapping.BuildPhysicalToLogicalMap(MappedSchema(), mode)["col-abc"]);
+    }
+
+    [Fact]
+    public void GetPhysicalName_WithoutMapping_IsLogicalName()
+    {
+        var field = MappedSchema().Fields[0];
+        Assert.Equal("logical", ColumnMapping.GetPhysicalName(field, ColumnMappingMode.None));
+        Assert.Empty(ColumnMapping.BuildLogicalToPhysicalMap(MappedSchema(), ColumnMappingMode.None));
+    }
+
+    // delta.columnMapping.id is a NUMERIC field in the spec — Spark reads it with Metadata.getLong and
+    // fails on a quoted string. Every other metadata value stays a string.
+    [Fact]
+    public void Serialize_EmitsColumnMappingIdAsJsonNumber()
+    {
+        string json = DeltaSchemaSerializer.Serialize(MappedSchema());
+
+        Assert.Contains("\"delta.columnMapping.id\":7", json);
+        Assert.DoesNotContain("\"delta.columnMapping.id\":\"7\"", json);
+        Assert.Contains("\"delta.columnMapping.physicalName\":\"col-abc\"", json);
+
+        // ...and it parses back to the same in-memory metadata (the parser reads a non-string as raw text).
+        var reparsed = DeltaSchemaSerializer.Parse(json);
+        Assert.Equal("7", reparsed.Fields[0].Metadata![ColumnMapping.FieldIdKey]);
+        Assert.Equal("col-abc", reparsed.Fields[0].Metadata![ColumnMapping.PhysicalNameKey]);
+    }
 }
