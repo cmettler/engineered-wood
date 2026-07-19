@@ -587,8 +587,11 @@ internal static class ActionSerializer
             writer.WritePropertyName("format");
             writer.WriteStartObject();
             writer.WriteString("provider", metadata.Format.Provider);
-            if (metadata.Format.Options.Count > 0)
-                WriteStringDict(writer, "options", metadata.Format.Options);
+            // ALWAYS emit options, even when empty. delta-kernel-rs decodes format.options as a
+            // non-nullable map and fails the whole log read ("Encountered unmasked nulls in
+            // non-nullable StructArray child") when the field is absent — so omitting it on the
+            // common empty case made every EW-written table unreadable by delta-rs and DuckDB.
+            WriteStringDict(writer, "options", metadata.Format.Options);
             writer.WriteEndObject();
 
             writer.WriteString("schemaString", metadata.SchemaString);
@@ -599,8 +602,10 @@ internal static class ActionSerializer
                 writer.WriteStringValue(col);
             writer.WriteEndArray();
 
-            if (metadata.Configuration is not null)
-                WriteStringDict(writer, "configuration", metadata.Configuration);
+            // Always emitted, like format.options above: delta-kernel-rs decodes configuration as a
+            // non-nullable map and fails the log read outright when it is absent.
+            WriteStringDict(writer, "configuration",
+                metadata.Configuration ?? (IReadOnlyDictionary<string, string>)new Dictionary<string, string>());
             if (metadata.CreatedTime.HasValue) writer.WriteNumber("createdTime", metadata.CreatedTime.Value);
             writer.WriteEndObject();
         }
@@ -717,6 +722,17 @@ internal static class ActionSerializer
 
                 string propName = reader.GetString()!;
                 reader.Read();
+
+                // An explicit JSON null means "absent" for every Delta action field — there is no
+                // field where null and omitted differ. delta-rs writes optional fields out as
+                // explicit nulls (`"baseRowId": null, "tags": null, ...`) where EW omits them, so
+                // handlers must never see a Null token: they call GetInt64/GetBoolean directly and
+                // would throw. Skipping here leaves the handler's local at its default, which is
+                // exactly what an omitted field produces, and keeps the `?? throw` checks on
+                // required fields reporting a useful message.
+                if (reader.TokenType == JsonTokenType.Null)
+                    continue;
+
                 handler(ref reader, propName);
             }
         }
