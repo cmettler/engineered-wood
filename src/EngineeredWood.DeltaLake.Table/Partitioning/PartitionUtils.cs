@@ -236,6 +236,15 @@ internal static class PartitionUtils
     {
         switch (source)
         {
+            // Extension arrays (VARIANT) filter through their STORAGE and are re-wrapped. Without
+            // this a partitioned write of ANY table containing a variant column would throw, even
+            // when variant is not the partition column — BuildFilteredBatch takes rows from every
+            // non-partition column. Must precede the storage-shaped cases below.
+            case ExtensionArray ext:
+            {
+                var filteredStorage = TakeRows(ext.Storage, rows);
+                return ((ExtensionType)ext.Data.DataType).CreateArray(filteredStorage);
+            }
             case Int64Array int64:
             {
                 var b = new Int64Array.Builder();

@@ -97,6 +97,13 @@ public static class SchemaConverter
             "date" => Date32Type.Default,
             "timestamp" => new TimestampType(TimeUnit.Microsecond, (string?)"UTC"),
             "timestamp_ntz" => new TimestampType(TimeUnit.Microsecond, (string?)null),
+            // The Delta "variant" type maps to Arrow's arrow.parquet.variant extension over
+            // struct<metadata: binary, value: binary>. The parquet layer keys its VARIANT logical-type
+            // annotation off this ExtensionType on write, and materialises it (reassembling any
+            // shredding) on read when the reader is given a registry that knows the extension —
+            // DeltaTableOptions ensures that. Declaring the type here is what makes the
+            // `variantType` table feature reachable; see DeltaTable.RequiredSchemaFeatures.
+            "variant" => VariantType.Default,
             _ => throw new DeltaLake.DeltaFormatException(
                 $"Unknown Delta primitive type: {typeName}"),
         };
@@ -131,6 +138,15 @@ public static class SchemaConverter
 
     private static DeltaDataType FromArrowType(IArrowType arrowType) => arrowType switch
     {
+        // MUST precede the struct arm: VariantType is an ExtensionType (not a StructType), so it
+        // would otherwise fall through to the throw — but any future extension over a struct storage
+        // type would be silently written as its storage struct, losing the annotation. Match the
+        // extension explicitly and reject unknown ones rather than degrading them.
+        VariantType => new PrimitiveType { TypeName = "variant" },
+        ExtensionType ext => throw new DeltaLake.DeltaFormatException(
+            $"Arrow extension type '{ext.Name}' has no Delta equivalent. Only "
+            + "'arrow.parquet.variant' is supported; strip the extension to write its storage type."),
+
         StringType or LargeStringType or StringViewType =>
             new PrimitiveType { TypeName = "string" },
         Int64Type => new PrimitiveType { TypeName = "long" },

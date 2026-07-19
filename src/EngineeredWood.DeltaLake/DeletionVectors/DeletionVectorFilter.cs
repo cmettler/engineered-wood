@@ -64,6 +64,12 @@ public static class DeletionVectorFilter
     private static IArrowArray CreateEmptyArray(Apache.Arrow.Types.IArrowType type) =>
         type switch
         {
+            // An extension column's empty array must keep its extension type — the string fallback
+            // below would produce a batch whose column type contradicts its own schema.
+            ExtensionType ext => ext.CreateArray(CreateEmptyArray(ext.StorageType)),
+            Apache.Arrow.Types.StructType st => new StructArray(
+                st, 0, st.Fields.Select(f => CreateEmptyArray(f.DataType)).ToArray(),
+                ArrowBuffer.Empty),
             Apache.Arrow.Types.Int64Type => new Int64Array.Builder().Build(),
             Apache.Arrow.Types.Int32Type => new Int32Array.Builder().Build(),
             Apache.Arrow.Types.Int16Type => new Int16Array.Builder().Build(),
@@ -89,6 +95,16 @@ public static class DeletionVectorFilter
     {
         switch (source)
         {
+            // Extension arrays (VARIANT) filter through their STORAGE and are re-wrapped, so the
+            // extension type survives the copy-on-write rewrite. Must precede the storage-shaped
+            // cases below: a VariantArray is not a StructArray, but any future extension over a
+            // primitive storage type would otherwise be filtered down to bare storage and silently
+            // lose its annotation on the rewritten file.
+            case ExtensionArray ext:
+            {
+                var filteredStorage = TakeRows(ext.Storage, rows);
+                return ((ExtensionType)ext.Data.DataType).CreateArray(filteredStorage);
+            }
             case Int64Array a:
             {
                 var b = new Int64Array.Builder();

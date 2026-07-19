@@ -23,6 +23,10 @@ public static class ProtocolVersions
         "typeWidening",
         "v2Checkpoint",
         "vacuumProtocolCheck",
+        // Delta "variant" columns, read as the arrow.parquet.variant extension over
+        // struct<metadata, value>. Shredded layouts (Spark and DuckDB shred by default) are
+        // reassembled by the parquet layer, so a shredded table reads correctly here.
+        "variantType",
     };
 
     /// <summary>Named writer features supported by this implementation.</summary>
@@ -60,6 +64,10 @@ public static class ProtocolVersions
         "typeWidening",
         "v2Checkpoint",
         "vacuumProtocolCheck",
+        // Writing variant columns emits the parquet VARIANT logical-type annotation (with
+        // specification_version = 1, which Spark requires). Values are written UNSHREDDED, which is
+        // spec-legal — shredding is a writer optimisation, not a compatibility requirement.
+        "variantType",
     };
 
     /// <summary>

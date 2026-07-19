@@ -107,10 +107,21 @@ internal static class SchemaEvolution
     }
 
     /// <summary>Builds an all-NULL array of the given Arrow type and length (for schema-evolution backfill).</summary>
+    /// <summary>Builds an all-null array of <paramref name="type"/>. Shared with
+    /// <see cref="TypeWidening.ValueWidener"/> so both backfill paths agree on the typed-NULL shape
+    /// (and neither silently substitutes a string column).</summary>
+    internal static IArrowArray MakeNullArrayPublic(IArrowType type, int length) =>
+        MakeNullArray(type, length);
+
     private static IArrowArray MakeNullArray(IArrowType type, int length)
     {
         switch (type)
         {
+            // MUST precede the StructType case: an extension over a struct storage type (VARIANT)
+            // would otherwise backfill as a bare storage struct, dropping the annotation and
+            // producing a batch whose column type contradicts the schema it is backfilled into.
+            case ExtensionType ext:
+                return ext.CreateArray(MakeNullArray(ext.StorageType, length));
             case BooleanType:
             { var b = new BooleanArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
             case Int8Type:

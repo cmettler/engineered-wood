@@ -406,6 +406,11 @@ internal static class ValueWidener
 
         return (a, b) switch
         {
+            // Every extension type reports TypeId.Extension, so the `_ => true` fallback below would
+            // call two DIFFERENT extensions equal. Compare by extension name and storage instead.
+            (ExtensionType ea, ExtensionType eb) =>
+                string.Equals(ea.Name, eb.Name, StringComparison.Ordinal)
+                && TypesMatch(ea.StorageType, eb.StorageType),
             (Decimal128Type da, Decimal128Type db) =>
                 da.Precision == db.Precision && da.Scale == db.Scale,
             (TimestampType ta, TimestampType tb) =>
@@ -425,6 +430,12 @@ internal static class ValueWidener
             DoubleType => BuildNullDouble(length),
             FloatType => BuildNullFloat(length),
             BooleanType => BuildNullBoolean(length),
+            // An extension column (VARIANT) must keep its type: the string fallback below would put a
+            // StringArray into a batch declaring the extension type — a silent schema/array mismatch
+            // rather than a failure. Delegate to the schema-evolution builder, which handles the
+            // storage type and re-wraps.
+            ExtensionType ext => ext.CreateArray(
+                SchemaEvolution.MakeNullArrayPublic(ext.StorageType, length)),
             _ => BuildNullString(length),
         };
     }

@@ -145,4 +145,89 @@ public class SchemaConverterTests
         Assert.True(parsed.Fields[1].Nullable);
         Assert.Equal("decimal(10,2)", ((PrimitiveType)parsed.Fields[2].Type).TypeName);
     }
+
+    // VARIANT. The load-bearing property throughout is that a variant column must never degrade into an
+    // undifferentiated struct-of-binary: that would strip the parquet VARIANT annotation and mislead
+    // every spec reader, silently. These pin both directions of the mapping and the degradation guard.
+
+    [Fact]
+    public void VariantDeltaType_MapsToTheArrowVariantExtension()
+    {
+        // A Spark 4.x / Delta 4.x table with a VARIANT column serializes its schema this way.
+        const string json = """
+            {"type":"struct","fields":[
+              {"name":"v","type":"variant","nullable":true,"metadata":{}}
+            ]}
+            """;
+
+        var arrow = SchemaConverter.ToArrowSchema(DeltaSchemaSerializer.Parse(json));
+
+        var field = arrow.GetFieldByName("v");
+        Assert.IsType<VariantType>(field.DataType);
+        Assert.True(field.IsNullable);
+
+        // Storage must be the spec's struct<metadata: binary, value: binary> — that is what the parquet
+        // writer emits as the annotated group.
+        var storage = Assert.IsType<Apache.Arrow.Types.StructType>(
+            ((VariantType)field.DataType).StorageType);
+        Assert.Equal(["metadata", "value"], storage.Fields.Select(f => f.Name));
+    }
+
+    [Fact]
+    public void VariantArrowType_MapsBackToTheDeltaVariantTypeName()
+    {
+        // VariantType derives from ExtensionType, NOT StructType. If it ever became struct-derived
+        // upstream, FromArrowType's ArrowStructType arm would silently convert it to a Delta
+        // struct<metadata,value> — the exact degradation this mapping exists to prevent.
+        Assert.False(
+            typeof(Apache.Arrow.Types.StructType).IsAssignableFrom(typeof(VariantType)),
+            "VariantType must not be StructType-derived; FromArrowType would silently map it to a struct.");
+
+        var arrowSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("v", VariantType.Default, true))
+            .Build();
+
+        var delta = SchemaConverter.FromArrowSchema(arrowSchema);
+        Assert.Equal("variant", ((PrimitiveType)delta.Fields.Single(f => f.Name == "v").Type).TypeName);
+    }
+
+    [Fact]
+    public void VariantRoundTrips_ThroughBothConvertersAndTheSerializer()
+    {
+        var arrowSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("v", VariantType.Default, true))
+            .Build();
+
+        var json = DeltaSchemaSerializer.Serialize(SchemaConverter.FromArrowSchema(arrowSchema));
+        var back = SchemaConverter.ToArrowSchema(DeltaSchemaSerializer.Parse(json));
+
+        Assert.IsType<VariantType>(back.GetFieldByName("v").DataType);
+        Assert.IsType<Int64Type>(back.GetFieldByName("id").DataType);
+    }
+
+    [Fact]
+    public void UnknownArrowExtensionType_IsRejected_RatherThanDegradedToStorage()
+    {
+        // Only arrow.parquet.variant has a Delta equivalent. Any other extension must throw rather than
+        // be written as its bare storage type, which would silently drop the extension's meaning.
+        var unknown = new UnknownExtensionType(Apache.Arrow.Types.StringType.Default);
+        var arrowSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", unknown, true))
+            .Build();
+
+        var ex = Assert.Throws<DeltaFormatException>(() => SchemaConverter.FromArrowSchema(arrowSchema));
+        Assert.Contains("extension", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private sealed class UnknownExtensionType(IArrowType storageType)
+        : Apache.Arrow.ExtensionType(storageType)
+    {
+        public override string Name => "test.unknown";
+
+        public override string ExtensionMetadata => string.Empty;
+
+        public override Apache.Arrow.ExtensionArray CreateArray(Apache.Arrow.IArrowArray storage) =>
+            throw new NotSupportedException("test stub");
+    }
 }

@@ -37,11 +37,39 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         _fs = fileSystem;
         _options = options;
+        _dataFileReadOptions = WithVariantExtension(options.ParquetReadOptions);
         _log = new TransactionLog(fileSystem);
         _checkpointReader = new CheckpointReader(fileSystem);
         _dvReader = new DeletionVectorReader(fileSystem);
         _checkpointWriter = new CheckpointWriter(fileSystem, options.ParquetWriteOptions);
         _currentSnapshot = snapshot;
+    }
+
+    /// <summary>
+    /// The read options used for DATA files: the caller's options with the
+    /// <c>arrow.parquet.variant</c> extension guaranteed to be registered.
+    /// <para>Delta's <c>variant</c> type maps to that Arrow extension, and the parquet reader only
+    /// materialises it (reassembling any shredding) when its registry knows it — with no registry a
+    /// VARIANT-annotated group decodes as a bare <c>struct&lt;metadata, value&gt;</c>, which would not
+    /// match the table's declared schema. Registering it is therefore a correctness requirement here,
+    /// not a caller preference. A caller-supplied registry is CLONED rather than mutated, and any
+    /// other extensions it carries are preserved.</para>
+    /// <para>Applies to data files only; log and checkpoint parquet never contains variant.</para>
+    /// </summary>
+    private readonly ParquetReadOptions _dataFileReadOptions;
+
+    private static ParquetReadOptions WithVariantExtension(ParquetReadOptions options)
+    {
+        var registry = options.ExtensionRegistry;
+        if (registry is not null
+            && registry.TryGetDefinition(VariantExtensionDefinition.Instance.ExtensionName, out _))
+        {
+            return options; // already registered — nothing to do
+        }
+
+        var augmented = registry?.Clone() ?? new ExtensionTypeRegistry();
+        augmented.Register(VariantExtensionDefinition.Instance);
+        return options with { ExtensionRegistry = augmented };
     }
 
     /// <summary>The current point-in-time table state.</summary>
@@ -165,14 +193,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var readerFeatures = new List<string>();
         var writerFeatures = new List<string>();
 
-        // timestamp_ntz (a naive TIMESTAMP column) is itself a table feature: the spec requires the
-        // 'timestampNtz' READER+WRITER feature whenever the schema contains the type, at any nesting depth.
-        if (SchemaUsesTimestampNtz(deltaSchema))
+        // Schema-driven READER+WRITER features — currently 'timestampNtz' (a naive TIMESTAMP column) and
+        // 'variantType' (a variant column), each required by the spec whenever the type appears at any
+        // nesting depth. Both are reader-3 / writer-7 named features, so either puts the table in
+        // table-features mode. This shares RequiredSchemaFeatures with the ALTER path
+        // (AddColumnAsync/SetSchemaAsync) deliberately: when the two were separate, adding a type here
+        // meant remembering to add it there too, and variant support was written against the ALTER path
+        // while CREATE silently kept emitting a legacy protocol.
+        foreach (var feature in RequiredSchemaFeatures(deltaSchema))
         {
             minReaderVersion = 3;
             minWriterVersion = 7;
-            readerFeatures.Add("timestampNtz");
-            writerFeatures.Add("timestampNtz");
+            readerFeatures.Add(feature);
+            writerFeatures.Add(feature);
         }
 
         // Identity columns (delta.identity.* field metadata) are a WRITER-only feature ('identityColumns',
@@ -676,15 +709,29 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     };
 
     /// <summary>
-    /// The schema-driven reader+writer table features <paramref name="type"/> requires per the Delta spec
-    /// (currently <c>timestampNtz</c> for a naive timestamp; <c>variantType</c> joins this list when variant
-    /// columns are supported).
+    /// True when <paramref name="type"/> contains a <c>variant</c> column at any nesting depth.
+    /// </summary>
+    private static bool SchemaUsesVariant(DeltaDataType type) => type switch
+    {
+        PrimitiveType p => string.Equals(p.TypeName, "variant", StringComparison.Ordinal),
+        StructType st => st.Fields.Any(f => SchemaUsesVariant(f.Type)),
+        ArrayType at => SchemaUsesVariant(at.ElementType),
+        MapType mt => SchemaUsesVariant(mt.KeyType) || SchemaUsesVariant(mt.ValueType),
+        _ => false,
+    };
+
+    /// <summary>
+    /// The schema-driven reader+writer table features <paramref name="type"/> requires per the Delta spec:
+    /// <c>timestampNtz</c> for a naive timestamp, <c>variantType</c> for a variant column. Both are
+    /// reader-3 / writer-7 named features, so declaring either upgrades the table to table-features mode.
     /// </summary>
     private static List<string> RequiredSchemaFeatures(DeltaDataType type)
     {
         var features = new List<string>();
         if (SchemaUsesTimestampNtz(type))
             features.Add("timestampNtz");
+        if (SchemaUsesVariant(type))
+            features.Add("variantType");
         return features;
     }
 
@@ -1005,7 +1052,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             await using var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new Parquet.ParquetFileReader(
-                file, ownsFile: false, _options.ParquetReadOptions);
+                file, ownsFile: false, _dataFileReadOptions);
 
             var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
             var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
@@ -1368,7 +1415,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
         return ChangeDataFeed.CdfReader.ReadChangesAsync(
             _fs, _log, startVersion, endVersion,
-            _options.ParquetReadOptions, cancellationToken);
+            _dataFileReadOptions, cancellationToken);
     }
 
     /// <summary>
@@ -1923,7 +1970,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         options ??= CompactionOptions.Default;
         var result = await Compaction.CompactionExecutor.ExecuteAsync(
             _fs, _log, CurrentSnapshot, options,
-            _options.ParquetWriteOptions, _options.ParquetReadOptions,
+            _options.ParquetWriteOptions, _dataFileReadOptions,
             cancellationToken, _options.DataFileWriter, _options.DataFileReader)
             .ConfigureAwait(false);
 
@@ -2054,7 +2101,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         await using var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(
-            file, ownsFile: false, _options.ParquetReadOptions);
+            file, ownsFile: false, _dataFileReadOptions);
 
         Parquet.Schema.SchemaDescriptor? parquetSchema = null;
 
