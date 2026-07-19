@@ -25,9 +25,6 @@ public class PendingCoverageTests
         "Blocked: needs the buffered-transaction seam (WriteDataFilesAsync / CommitDataFilesAsync / the " +
         "Compute* family / ReadRowsByRowIdsAsync / ReconcileBatchToFields) — PR #4 slice 9.";
 
-    private const string LogicalRebase =
-        "Blocked: needs CheckLogicalRebaseAsync (the Spark-parity ConflictChecker) — PR #4 slice 9.";
-
     private const string RowLevelConcurrency =
         "Blocked: needs row-level concurrency (ComputeDeletionVectorActionsAsync(resolveAgainst:) + the " +
         "row-level conflict/retry path) — PR #4 slice 9.";
@@ -92,38 +89,16 @@ public class PendingCoverageTests
     public void WriteDataFiles_WithoutPreGeneratedFlag_RejectsIdentityTable() { }
 
     // ── Logical rebase / ConflictChecker parity — pr-4 LogicalRebaseTests ──
-
-    /// <summary>A blind append whose files match the transaction's read predicates conflicts under
-    /// Serializable.</summary>
-    [Fact(Skip = LogicalRebase)]
-    public void BlindAppend_MatchingReads_Conflicts_Serializable() { }
-
-    /// <summary>...but PASSES under WriteSerializable — the isolation level is the whole distinction.</summary>
-    [Fact(Skip = LogicalRebase)]
-    public void BlindAppend_MatchingReads_Passes_WriteSerializable() { }
-
-    /// <summary>A blind append whose files cannot match the read predicates passes even under
-    /// Serializable (stats/partition-based read matching, conservative).</summary>
-    [Fact(Skip = LogicalRebase)]
-    public void BlindAppend_NonMatchingPredicate_Passes_Serializable() { }
-
-    /// <summary>A concurrent data-changing REMOVE of a file the transaction READ conflicts
-    /// (concurrentDeleteReadCheck).</summary>
-    [Fact(Skip = LogicalRebase)]
-    public void ConcurrentDeleteOfReadFile_Conflicts() { }
-
-    /// <summary>Two transactions removing the same file conflict (delete/delete).</summary>
-    [Fact(Skip = LogicalRebase)]
-    public void DeleteDelete_SameFile_Conflicts() { }
-
-    /// <summary>A concurrent metadata change conflicts unconditionally.</summary>
-    [Fact(Skip = LogicalRebase)]
-    public void ConcurrentMetadataChange_Conflicts() { }
-
-    /// <summary>dataChange=false commits (compaction) are EXEMPT from the read checks — they rearrange
-    /// files without changing rows, so they cannot invalidate another transaction's reads.</summary>
-    [Fact(Skip = LogicalRebase)]
-    public void Compaction_ExemptFromReadChecks() { }
+    //
+    // UN-PARKED (verdict logic): the seven ConflictChecker cases these tests pinned — blind-append
+    // matching under Serializable vs WriteSerializable, non-matching pass, concurrentDeleteRead,
+    // delete/delete, metadata change, and the dataChange=false compaction exemption — are now live in
+    // ConflictCheckerTests, against the ConflictChecker that slice 9 layer 1 introduced.
+    //
+    // STILL PARKED (integration): those are pure input→verdict tests. The end-to-end transaction path —
+    // a transaction that reads, has a concurrent commit land in the log, and then either rebases onto it
+    // and commits or aborts — lands with the DeltaTransaction API (slice 9 layer 1, step 2) and its
+    // integration tests. When it does, add the two-concurrent-transaction test here.
 
     // ── Row-level concurrency — pr-4 RowLevelConcurrencyTests ──
 
