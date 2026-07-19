@@ -118,6 +118,45 @@ public class SparkInteropTests : IDisposable
         Assert.Equal(2, detail.GetProperty("min_writer_version").GetInt32());
     }
 
+    /// <summary>
+    /// <para>Two independent EW handles blind-append concurrently (slice 9 step 3). The second holds a
+    /// stale snapshot, so its commit collides and REBASES onto the winner through the optimistic-
+    /// concurrency loop rather than failing. The reference implementation must then read all rows.</para>
+    ///
+    /// <para>This is the one cross-engine surface the OCC work touches. The race logic itself is
+    /// single-process and unit-tested, but the ARTIFACT a rebase leaves on disk had never been read by
+    /// a foreign engine. The claim being measured is that a rebased commit is byte-for-byte an ordinary
+    /// sequential commit (same add action, next version number) with nothing special for Spark to
+    /// interpret — if a rebase ever mis-numbered a commit or duplicated an action, the row count here
+    /// would be wrong. A round-trip through EW alone could not catch that.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwConcurrentAppends_Rebased_SparkReadsAllRows()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        await using (var setup = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema))
+        {
+            await setup.WriteAsync([IdRegionBatch([1], ["us"])]);
+        }
+
+        // Two handles at the same base version; each blind-appends without seeing the other.
+        await using var tableA = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        await using var tableB = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        long baseVersion = tableA.CurrentSnapshot.Version;
+
+        long vA = await tableA.WriteAsync([IdRegionBatch([2], ["eu"])]);
+        long vB = await tableB.WriteAsync([IdRegionBatch([3], ["apac"])]); // stale -> collides -> rebases
+
+        Assert.Equal(baseVersion + 1, vA);
+        Assert.Equal(baseVersion + 2, vB); // landed one version past the winner, not thrown
+
+        var result = Spark.Invoke("read", new { path = _tempDir });
+        Assert.Equal(3, result.GetProperty("row_count").GetInt32());
+        Assert.Equal([(1L, "us"), (2L, "eu"), (3L, "apac")], RowsFromJson(result));
+    }
+
     /// <summary>The reference implementation writes, EW reads.</summary>
     [Fact]
     public async Task SparkWritten_SimpleTable_EwReadsSameRows()

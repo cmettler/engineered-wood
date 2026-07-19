@@ -1035,21 +1035,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Runs the optimistic-concurrency commit loop for <paramref name="transaction"/>. Attempts the
-    /// commit at the version after the transaction's read version; on a collision it reads the
-    /// intervening commits, runs the <see cref="Concurrency.ConflictChecker"/>, and either aborts (a
-    /// real conflict) or rebases onto the latest version and retries (no conflict — the staged actions
-    /// remain valid, since nothing the transaction read or removed was touched).
+    /// Runs the optimistic-concurrency commit loop for <paramref name="transaction"/>. A DELETE reads
+    /// exactly the files it removes, so the removed paths are both the read-set (concurrentDeleteRead)
+    /// and the planned removes (delete/delete).
     /// </summary>
-    internal async ValueTask<long> CommitTransactionAsync(
+    internal ValueTask<long> CommitTransactionAsync(
         DeltaTransaction transaction, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
 
         var baseSnapshot = transaction.BaseSnapshot;
-        var dataActions = transaction.DataActions;
-        if (dataActions.Count == 0)
-            return baseSnapshot.Version; // nothing staged — no commit
 
         // A rebased add would need its baseRowId recomputed against the advanced high-water mark, which
         // is not implemented yet. A row-tracking transaction may still commit if it wins the FIRST
@@ -1057,9 +1052,46 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             baseSnapshot.Metadata.Configuration);
 
-        // A DELETE reads exactly the files it removes, so the removed paths are both the read-set
-        // (concurrentDeleteRead) and the planned removes (delete/delete).
         var reads = new Concurrency.ReadSet { Files = transaction.RemovedPaths };
+
+        return CommitOccAsync(
+            baseSnapshot, transaction.DataActions, reads, transaction.RemovedPaths,
+            transaction.IsolationLevel, transaction.Operation, rebaseSafe: !rowTracking,
+            cancellationToken);
+    }
+
+    /// <summary>Shared by blind-append commits, which plan no removes.</summary>
+    private static readonly HashSet<string> NoRemovedPaths = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The optimistic-concurrency commit loop shared by the transactional path, the auto-committing
+    /// <see cref="DeleteAsync"/>, and single-shot appends. Attempts the commit at the version after
+    /// <paramref name="baseSnapshot"/>; on a collision it reads the intervening commits, runs the
+    /// <see cref="Concurrency.ConflictChecker"/> against <paramref name="reads"/> /
+    /// <paramref name="plannedRemovePaths"/>, and either aborts (a real conflict) or — when
+    /// <paramref name="rebaseSafe"/> — rebases onto the latest version and retries. A no-conflict rebase
+    /// re-commits the staged actions verbatim, valid precisely because nothing the commit read or removed
+    /// was touched.
+    ///
+    /// <para><paramref name="rebaseSafe"/> is <c>false</c> when the staged actions embed the attempted
+    /// version — row tracking's <c>baseRowId</c> / <c>defaultRowCommitVersion</c> would be wrong after a
+    /// rebase — so such a commit succeeds only uncontended and otherwise aborts rather than corrupt.</para>
+    /// </summary>
+    internal async ValueTask<long> CommitOccAsync(
+        Snapshot.Snapshot baseSnapshot,
+        IReadOnlyList<DeltaAction> dataActions,
+        Concurrency.ReadSet reads,
+        ISet<string> plannedRemovePaths,
+        IsolationLevel isolationLevel,
+        string operation,
+        bool rebaseSafe,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+
+        if (dataActions.Count == 0)
+            return baseSnapshot.Version; // nothing staged — no commit
+
         var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns);
 
         long attemptVersion = baseSnapshot.Version + 1;
@@ -1067,7 +1099,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         for (int attempt = 0; ; attempt++)
         {
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                dataActions, baseSnapshot.Metadata.Configuration, transaction.Operation);
+                dataActions, baseSnapshot.Metadata.Configuration, operation);
             try
             {
                 await _log.WriteCommitAsync(attemptVersion, finalActions, cancellationToken)
@@ -1088,15 +1120,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 }
 
                 var verdict = Concurrency.ConflictChecker.Check(
-                    reads, transaction.RemovedPaths, pruner, transaction.IsolationLevel, concurrent);
+                    reads, plannedRemovePaths, pruner, isolationLevel, concurrent);
                 if (verdict.HasConflict)
                     throw new DeltaConflictException(verdict.Message!);
 
-                if (rowTracking)
+                if (!rebaseSafe)
                 {
                     throw new DeltaConflictException(
-                        "Cannot rebase a row-tracking transaction onto a concurrent commit "
-                        + "(baseRowId reassignment is not yet supported); retry the operation.");
+                        "A concurrent commit landed and this operation cannot be safely rebased onto it "
+                        + "(row-tracking baseRowId reassignment is not yet supported); retry the operation.");
                 }
 
                 attemptVersion = latest + 1; // no conflict — rebase and retry
@@ -1122,24 +1154,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
         HonorWriterFeatures(isAppend: false); // DELETE is a data change
 
-        var snapshot = CurrentSnapshot;
-        var plan = await ComputeDeleteActionsAsync(snapshot, predicate, cancellationToken)
+        // Route the single-shot DELETE through the optimistic-concurrency loop: a DELETE that races a
+        // concurrent commit rebases and retries (when nothing it read was removed) instead of failing on
+        // the version collision, and aborts with a DeltaConflictException only on a real conflict
+        // (delete/delete on the same file, or a concurrent metadata/protocol change). When no rows match,
+        // nothing is staged and CommitAsync returns the unchanged read version.
+        var transaction = StartTransaction();
+        long rowsDeleted = await transaction.DeleteAsync(predicate, cancellationToken)
             .ConfigureAwait(false);
-
-        if (plan.DataActions.Count == 0)
-            return (0, snapshot.Version);
-
-        var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-            plan.DataActions, snapshot.Metadata.Configuration, "DELETE");
-
-        long newVersion = snapshot.Version + 1;
-        await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
-            .ConfigureAwait(false);
-
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            snapshot, _log, cancellationToken).ConfigureAwait(false);
-
-        return (plan.TotalDeleted, newVersion);
+        long version = await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return (rowsDeleted, version);
     }
 
     /// <summary>The remove/add (and CDC) actions a DELETE produces, its removed-file paths, and the row
@@ -2043,27 +2067,46 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
         }
 
-        // Prepend CommitInfo with inCommitTimestamp if enabled
-        var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-            actions, snapshot.Metadata.Configuration, "WRITE");
-
-        // Commit (newVersion computed earlier for row tracking)
-        await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
-            .ConfigureAwait(false);
-
-        // Refresh snapshot
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            snapshot, _log, cancellationToken).ConfigureAwait(false);
-
-        // Auto-checkpoint
-        if (_options.CheckpointInterval > 0 &&
-            newVersion % _options.CheckpointInterval == 0)
+        // Commit. A pure (blind) append has no read dependency, so a single-shot append that races a
+        // concurrent commit rebases and retries through the optimistic-concurrency loop — aborting only
+        // on a concurrent metadata/protocol change — instead of failing on the version collision. The
+        // overwrite family (full / partition-scoped / dynamic) reads the active-file set to decide what
+        // to remove, so its staged removes are NOT rebase-safe without partition-predicate plumbing; it
+        // keeps the single-attempt commit (a collision still throws, exactly as before). Row tracking
+        // embeds the attempted version in its adds, so it stays single-attempt too (rebaseSafe=false).
+        long committedVersion;
+        bool blindAppend = mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite;
+        if (blindAppend)
         {
-            await _checkpointWriter.WriteCheckpointAsync(
-                _currentSnapshot, cancellationToken).ConfigureAwait(false);
+            committedVersion = await CommitOccAsync(
+                snapshot, actions, Concurrency.ReadSet.Blind, NoRemovedPaths,
+                IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: !rowTrackingEnabled,
+                cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            // Overwrite family: a single atomic attempt at the read version + 1 (unchanged behavior).
+            var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
+                actions, snapshot.Metadata.Configuration, "WRITE");
+            await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
+                .ConfigureAwait(false);
+            _currentSnapshot = await SnapshotBuilder.UpdateAsync(
+                snapshot, _log, cancellationToken).ConfigureAwait(false);
+            committedVersion = newVersion;
         }
 
-        return newVersion;
+        // Auto-checkpoint on the version that actually committed (a rebased append may differ from the
+        // read version + 1). Skipped when nothing was staged (an all-empty append returns the read
+        // version without committing).
+        if (committedVersion > snapshot.Version &&
+            _options.CheckpointInterval > 0 &&
+            committedVersion % _options.CheckpointInterval == 0)
+        {
+            await _checkpointWriter.WriteCheckpointAsync(
+                CurrentSnapshot, cancellationToken).ConfigureAwait(false);
+        }
+
+        return committedVersion;
     }
 
     /// <summary>
