@@ -153,6 +153,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             };
         }
 
+        // The legacy protocol versions this table would carry if NO table feature forced it into
+        // table-features mode. Captured before any feature escalates the versions below, because
+        // switching to reader 3 / writer 7 means every capability the legacy versions IMPLIED must be
+        // spelled out explicitly -- see the merge just before the ProtocolAction is built.
+        int legacyReaderVersion = minReaderVersion;
+        int legacyWriterVersion = minWriterVersion;
+
         // Schema-driven table features must be DECLARED at creation, else a strict reader (Spark,
         // delta-kernel) rejects the table with "feature enabled in metadata but not listed in protocol".
         var readerFeatures = new List<string>();
@@ -199,6 +206,33 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             minWriterVersion = 7;
             readerFeatures.Add("columnMapping");
             writerFeatures.Add("columnMapping");
+        }
+
+        // Table-features mode is all-or-nothing: at writer 7 / reader 3 there are no implicit
+        // capabilities left, so every feature the LEGACY versions implied must be listed or the table
+        // is self-inconsistent. Spark rejects it outright --
+        //   DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH: ... enabled in metadata but not listed in
+        //   protocol: invariants
+        // -- which is exactly what happened to every clustered table this library wrote, because
+        // clustering forces writer 7 from a writer-2 baseline whose implied appendOnly/invariants were
+        // then dropped on the floor. UpgradeProtocolForFeatures already does this for ALTER; creation
+        // has to do it too.
+        if (minWriterVersion >= 7)
+        {
+            foreach (string feature in LegacyWriterFeatures(legacyWriterVersion))
+            {
+                if (!writerFeatures.Contains(feature))
+                    writerFeatures.Add(feature);
+            }
+        }
+
+        if (minReaderVersion >= 3)
+        {
+            foreach (string feature in LegacyReaderFeatures(legacyReaderVersion))
+            {
+                if (!readerFeatures.Contains(feature))
+                    readerFeatures.Add(feature);
+            }
         }
 
         string schemaString = DeltaSchemaSerializer.Serialize(deltaSchema);
