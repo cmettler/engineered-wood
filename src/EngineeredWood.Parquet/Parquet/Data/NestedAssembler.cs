@@ -64,7 +64,11 @@ internal static class NestedAssembler
             && registry.TryGetDefinition("arrow.parquet.variant", out var def)
             && def.TryCreateType(sa.Data.DataType, metadata: string.Empty, out var ext))
         {
-            return ext.CreateArray(sa);
+            // A shredded column carries its data in `typed_value`, leaving `value` empty; hand back
+            // the reassembled canonical form so GetValueBytes returns the real variant rather than
+            // silently returning nothing. See VariantShredding for the trade-offs.
+            var wrapped = ext.CreateArray(sa);
+            return wrapped is VariantArray va ? VariantShredding.Reassemble(va) : wrapped;
         }
         return array;
     }

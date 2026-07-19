@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Operations.VariantJson;
 using Apache.Arrow.Types;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
@@ -177,6 +178,10 @@ public class VariantArrayRoundTripTests : IDisposable
     /// Each VARIANT-annotated column should materialise as a
     /// <see cref="VariantArray"/>; the test fails if any file errors out or
     /// produces a column we recognise as VARIANT but didn't wrap.
+    /// <para>Structure only — for VALUE-level conformance see
+    /// <see cref="VariantCorpus_MatchesReferenceVariants"/>. The corpus's declared error cases are
+    /// excluded here: reassembly validates the shredding, so those files now throw by design (that
+    /// they throw is asserted by the value-level test).</para>
     /// </summary>
     [Fact]
     public async Task SweepTest_ShreddedVariantCorpus_AllReadAsVariantArray()
@@ -184,13 +189,16 @@ public class VariantArrayRoundTripTests : IDisposable
         string? shreddedRoot = FindShreddedVariantDirectory();
         if (shreddedRoot is null) return; // submodule not initialized in this checkout
 
-        var files = Directory.GetFiles(shreddedRoot, "*.parquet");
+        var errorCases = await ReadManifestErrorCasesAsync(shreddedRoot);
+        var files = Directory.GetFiles(shreddedRoot, "*.parquet")
+            .Where(f => !errorCases.Contains(Path.GetFileName(f)))
+            .ToArray();
         Assert.NotEmpty(files);
 
         var registry = VariantRegistry();
         var failures = new List<string>();
         int variantColumns = 0;
-        int shreddedColumns = 0;
+        int shreddedFiles = 0;
 
         foreach (var filePath in files)
         {
@@ -204,6 +212,10 @@ public class VariantArrayRoundTripTests : IDisposable
                 var meta = await reader.ReadMetadataAsync();
                 if (meta.RowGroups.Count == 0) continue;
 
+                // Shredded-ness is a property of the FILE: the materialised array is always
+                // unshredded now, because the reader reassembles before handing it back.
+                if (meta.Schema.Any(s => s.Name == "typed_value")) shreddedFiles++;
+
                 var batch = await reader.ReadRowGroupAsync(0);
                 for (int i = 0; i < batch.ColumnCount; i++)
                 {
@@ -216,7 +228,10 @@ public class VariantArrayRoundTripTests : IDisposable
                     if (wrapped)
                     {
                         variantColumns++;
-                        if (((VariantArray)batch.Column(i)).IsShredded) shreddedColumns++;
+                        if (((VariantArray)batch.Column(i)).IsShredded)
+                        {
+                            failures.Add($"{name} col[{i}]: still shredded — reassembly did not run");
+                        }
                     }
                 }
             }
@@ -228,7 +243,7 @@ public class VariantArrayRoundTripTests : IDisposable
 
         Assert.Empty(failures);
         Assert.True(variantColumns > 0, "Expected at least one VariantArray column across the corpus.");
-        Assert.True(shreddedColumns > 0, "Expected at least one shredded VariantArray (typed_value present).");
+        Assert.True(shreddedFiles > 0, "Expected at least one shredded file (typed_value present) in the corpus.");
     }
 
     private static string? FindShreddedVariantDirectory()
@@ -276,5 +291,294 @@ public class VariantArrayRoundTripTests : IDisposable
             var b2 = await r2.ReadRowGroupAsync(0);
             Assert.IsType<VariantArray>(b2.Column(0));
         }
+    }
+
+
+    /// <summary>
+    /// VALUE-level conformance against the shredded-variant corpus, driven by its own
+    /// <c>cases.json</c> manifest. The sibling sweep test only asserts that annotation and wrapping
+    /// agree — it never reads a value, so value-level correctness was previously unverified in BOTH
+    /// directions; this is the acceptance gate for <see cref="Data.VariantShredding"/>.
+    ///
+    /// <para><b>Before reassembly landed</b> a shredded row's <c>value</c> child was empty (the data
+    /// lives in <c>typed_value</c>), so <c>GetValueBytes</c> returned ZERO bytes while <c>IsNull</c>
+    /// reported false — a valid row holding an empty variant, i.e. silent data loss. 61 of 131 cases
+    /// failed then.</para>
+    ///
+    /// <para><b>Two assertion strengths, deliberately.</b> Every case is compared SEMANTICALLY (both
+    /// sides rendered to JSON), because reassembly rebuilds the metadata dictionary and may legally
+    /// choose a different encoding than the reference writer did — case 41 differs only in the
+    /// metadata header's offset-size bits, case 43 in dictionary pruning. Unshredded columns are
+    /// additionally compared BYTE-EXACTLY, since those are passed through untouched and any
+    /// difference there would be a real defect.</para>
+    ///
+    /// <para>Manifest error cases must THROW: rejecting malformed shredding (conflicting
+    /// value/typed_value, non-object values with shredded fields, unsupported shredded types) is
+    /// part of the contract, and before reassembly they silently produced garbage.</para>
+    ///
+    /// No-ops when the parquet-testing submodule is not checked out.
+    /// </summary>
+    [Fact]
+    public async Task VariantCorpus_MatchesReferenceVariants()
+    {
+        string? root = FindShreddedVariantDirectory();
+        if (root is null) return; // submodule not initialized in this checkout
+
+        string manifest = Path.Combine(root, "cases.json");
+        if (!File.Exists(manifest)) return;
+
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllBytes(manifest));
+        var registry = VariantRegistry();
+        var failures = new List<string>();
+        int rowsCompared = 0, bytesCompared = 0, errorCases = 0, casesRun = 0, implementationDefined = 0;
+
+        foreach (var c in doc.RootElement.EnumerateArray())
+        {
+            if (!c.TryGetProperty("parquet_file", out var pf)) continue;   // manifest stub (case 3)
+            string caseName = pf.GetString()!;
+            string path = Path.Combine(root, caseName);
+
+            // Error cases: the corpus says these are malformed, so reading must fail loudly.
+            if (c.TryGetProperty("error_message", out var em))
+            {
+                errorCases++;
+                try
+                {
+                    await ReadVariantColumnAsync(path, registry);
+                    failures.Add($"{caseName}: expected a throw ({em.GetString()}), but read succeeded");
+                }
+                catch (Exception)
+                {
+                    // Expected. The corpus's own message is advisory; we only require fail-closed.
+                }
+                continue;
+            }
+
+            // Cases the corpus itself flags as spec-invalid-but-readable: its notes say
+            // "implementations can choose to error, or read the shredded value". The reference
+            // `variant` records Iceberg's choice (prefer the residual); Apache.Arrow reads the
+            // shredded value. Both are conformant, so require only that we do not crash or corrupt —
+            // reading must either throw or produce a well-formed variant, not a specific one.
+            if (c.TryGetProperty("notes", out var notes)
+                && notes.GetString() is { } n
+                && n.Contains("not valid according to the spec", StringComparison.Ordinal))
+            {
+                implementationDefined++;
+                try
+                {
+                    var permissive = await ReadVariantColumnAsync(path, registry);
+                    foreach (var row in permissive.Rows.Where(r => r is not null))
+                    {
+                        // Well-formed means renderable; a corrupt reassembly throws here.
+                        VariantJsonWriter.ToJson(row!.Value.Metadata, row.Value.Value, indented: false);
+                    }
+                }
+                catch (Exception)
+                {
+                    // Erroring is the other permitted choice.
+                }
+                continue;
+            }
+
+            var expectedFiles = new List<string?>();
+            if (c.TryGetProperty("variant_file", out var one))
+            {
+                expectedFiles.Add(one.GetString());
+            }
+            else if (c.TryGetProperty("variant_files", out var many))
+            {
+                foreach (var f in many.EnumerateArray())
+                {
+                    expectedFiles.Add(f.ValueKind == System.Text.Json.JsonValueKind.Null ? null : f.GetString());
+                }
+            }
+            else
+            {
+                continue;
+            }
+
+            casesRun++;
+            try
+            {
+                var actual = await ReadVariantColumnAsync(path, registry);
+
+                if (actual.Rows.Count != expectedFiles.Count)
+                {
+                    failures.Add($"{caseName}: row count {actual.Rows.Count}, manifest lists {expectedFiles.Count}");
+                    continue;
+                }
+
+                for (int i = 0; i < expectedFiles.Count; i++)
+                {
+                    string? expectedFile = expectedFiles[i];
+                    var got = actual.Rows[i];
+
+                    if (expectedFile is null)
+                    {
+                        if (got is not null)
+                        {
+                            failures.Add($"{caseName} row {i}: expected a null variant, got a value");
+                        }
+                        continue;
+                    }
+
+                    if (got is null)
+                    {
+                        failures.Add($"{caseName} row {i}: got a null variant, expected a value");
+                        continue;
+                    }
+
+                    byte[] expected = File.ReadAllBytes(Path.Combine(root, expectedFile));
+                    var (expMeta, expValue) = SplitVariantBinary(expected);
+
+                    // Semantic comparison — always.
+                    string expectedJson = VariantJsonWriter.ToJson(expMeta, expValue, indented: false);
+                    string actualJson = VariantJsonWriter.ToJson(got.Value.Metadata, got.Value.Value, indented: false);
+                    if (expectedJson != actualJson)
+                    {
+                        failures.Add($"{caseName} row {i}: expected {Truncate(expectedJson)}, got {Truncate(actualJson)}");
+                        continue;
+                    }
+                    rowsCompared++;
+
+                    // Byte comparison — only where the reader passes the bytes through untouched.
+                    if (!actual.Shredded)
+                    {
+                        byte[] gotBytes = Concat(got.Value.Metadata, got.Value.Value);
+                        if (!expected.AsSpan().SequenceEqual(gotBytes))
+                        {
+                            failures.Add($"{caseName} row {i}: unshredded byte mismatch — expected "
+                                + $"{Describe(expected)}, got {Describe(gotBytes)}");
+                            continue;
+                        }
+                        bytesCompared++;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"{caseName}: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        Assert.True(casesRun > 0, "cases.json yielded no readable cases.");
+        Assert.True(errorCases > 0, "cases.json yielded no error cases.");
+        Assert.True(implementationDefined > 0, "cases.json yielded no implementation-defined cases.");
+        Assert.True(
+            failures.Count == 0,
+            $"{failures.Count} of {casesRun} corpus cases failed ({rowsCompared} rows matched "
+            + $"semantically, {bytesCompared} byte-exact, {errorCases} error cases, "
+            + $"{implementationDefined} implementation-defined):{Environment.NewLine}"
+            + string.Join(Environment.NewLine, failures.Take(40)));
+    }
+
+    /// <summary>Reads the corpus file's <c>var</c> column across every row group, returning each row's
+    /// metadata/value bytes (null for a null variant) plus whether the FILE was shredded (determined
+    /// from the parquet schema, since reassembly clears <c>IsShredded</c> on the materialised array).</summary>
+    private static async Task<(List<(byte[] Metadata, byte[] Value)?> Rows, bool Shredded)>
+        ReadVariantColumnAsync(string path, ExtensionTypeRegistry registry)
+    {
+        var rows = new List<(byte[], byte[])?>();
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false,
+            new ParquetReadOptions { ExtensionRegistry = registry });
+
+        var meta = await reader.ReadMetadataAsync();
+        bool shredded = meta.Schema.Any(s => s.Name == "typed_value");
+
+        for (int rg = 0; rg < meta.RowGroups.Count; rg++)
+        {
+            var batch = await reader.ReadRowGroupAsync(rg);
+            int idx = batch.Schema.GetFieldIndex("var");
+            if (idx < 0)
+            {
+                throw new InvalidOperationException(
+                    "no 'var' column; columns: " + string.Join(", ", batch.Schema.FieldsList.Select(f => f.Name)));
+            }
+
+            if (batch.Column(idx) is not VariantArray va)
+            {
+                throw new InvalidOperationException(
+                    $"'var' materialised as {batch.Column(idx).GetType().Name}, not VariantArray "
+                    + $"(schema type {batch.Schema.FieldsList[idx].DataType.GetType().Name})");
+            }
+
+            for (int i = 0; i < va.Length; i++)
+            {
+                rows.Add(va.IsNull(i)
+                    ? null
+                    : (va.GetMetadataBytes(i).ToArray(), va.GetValueBytes(i).ToArray()));
+            }
+        }
+
+        return (rows, shredded);
+    }
+
+    /// <summary>
+    /// Splits a <c>*.variant.bin</c> reference file into its metadata and value halves. The file is
+    /// the metadata bytes immediately followed by the value bytes (corpus README); the metadata is
+    /// self-delimiting, so its length is derived from the header: bits 0-3 version, bit 4
+    /// sorted_strings, bits 5-6 offset_size_minus_one, then <c>dictionary_size</c> and
+    /// <c>dictionary_size + 1</c> offsets, each <c>offset_size</c> bytes, then the string bytes
+    /// (whose total length is the final offset).
+    /// </summary>
+    private static (byte[] Metadata, byte[] Value) SplitVariantBinary(byte[] bytes)
+    {
+        int offsetSize = ((bytes[0] >> 6) & 0x03) + 1;
+        int dictSize = ReadLittleEndian(bytes, 1, offsetSize);
+        int offsetsStart = 1 + offsetSize;
+        int stringsStart = offsetsStart + ((dictSize + 1) * offsetSize);
+        int stringBytes = ReadLittleEndian(bytes, offsetsStart + (dictSize * offsetSize), offsetSize);
+        int metadataLength = stringsStart + stringBytes;
+
+        return (bytes.AsSpan(0, metadataLength).ToArray(), bytes.AsSpan(metadataLength).ToArray());
+    }
+
+    private static int ReadLittleEndian(byte[] bytes, int start, int count)
+    {
+        int value = 0;
+        for (int i = count - 1; i >= 0; i--)
+        {
+            value = (value << 8) | bytes[start + i];
+        }
+        return value;
+    }
+
+    private static byte[] Concat(byte[] a, byte[] b)
+    {
+        var result = new byte[a.Length + b.Length];
+        a.CopyTo(result, 0);
+        b.CopyTo(result, a.Length);
+        return result;
+    }
+
+    private static string Truncate(string s) => s.Length <= 100 ? s : s[..100] + "…";
+
+    /// <summary>Parquet file names the corpus manifest declares as malformed.</summary>
+    private static async Task<HashSet<string>> ReadManifestErrorCasesAsync(string root)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        string manifest = Path.Combine(root, "cases.json");
+        if (!File.Exists(manifest)) return result;
+
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllBytes(manifest));
+        foreach (var c in doc.RootElement.EnumerateArray())
+        {
+            if (c.TryGetProperty("error_message", out _)
+                && c.TryGetProperty("parquet_file", out var pf)
+                && pf.GetString() is { } name)
+            {
+                result.Add(name);
+            }
+        }
+        return result;
+    }
+
+    private static string Describe(ReadOnlySpan<byte> bytes)
+    {
+        int n = Math.Min(bytes.Length, 12);
+        var hex = string.Join(" ", bytes[..n].ToArray().Select(b => b.ToString("x2")));
+        return bytes.Length <= n ? $"{bytes.Length}B [{hex}]" : $"{bytes.Length}B [{hex} …]";
     }
 }

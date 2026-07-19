@@ -18,6 +18,14 @@
     <PackageReference Include="Clast.Alp" Version="0.1.0" />
     <PackageReference Include="Clast.BloomFilter" Version="0.1.0" />
     <PackageReference Include="System.IO.Hashing" Version="9.*" />
+    <!--
+      Shredded VARIANT reassembly. Apache.Arrow's VariantArray is storage-level: on a shredded
+      column its `value` child is empty and the data lives in `typed_value`, so GetValueBytes
+      returns zero bytes. Reassembly lives in this companion package (same version line; ships
+      net462/netstandard2.0/net8.0, so it covers every TFM here). Used only by NestedAssembler,
+      and only when the caller opts in via ParquetReadOptions.ExtensionRegistry.
+    -->
+    <PackageReference Include="Apache.Arrow.Operations" Version="23.0.0" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
