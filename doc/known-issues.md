@@ -408,15 +408,20 @@ under-deletes relative to the spec — see the VACUUM alignment plan in
 
 ### Correctness / interop issues
 
-**Partition value encoding.**
-`Partitioning/PartitionUtils.GetStringValue` and
-`FormatTimestampPartitionValue` use `yyyy-MM-dd HH:mm:ss.ffffff` for
-`timestamp` partitions; the spec's reference behavior is `yyyy-MM-dd
-HH:mm:ss` (without microseconds) for `timestamp` and microseconds only
-for `timestamp_ntz`. Decimal and binary partition values are not
-encoded on write and `BuildConstantArray` has no case for them on read.
-The `__HIVE_DEFAULT_PARTITION__` sentinel is written but not
-recognized on read for non-string types — parsing will throw.
+**Binary partition values are unsupported.**
+`Partitioning/PartitionUtils.GetStringValue` throws
+`NotSupportedException` for `binary` (and nested) partition types rather
+than falling back to `.ToString()`. Deliberate — the fallback silently
+wrote the .NET type name as the partition value — but it is still a gap
+against the spec, which defines a binary encoding.
+
+(The rest of this entry previously claimed broken timestamp formatting,
+missing decimal encoding, and an unrecognized `__HIVE_DEFAULT_PARTITION__`
+on read. All three were stale: `FormatTimestampPartitionValue` emits
+`yyyy-MM-dd HH:mm:ss` and only adds `.ffffff` when the fraction is
+non-zero, matching Spark; `Decimal128Array` is encoded on write and has a
+`BuildConstantArray` case on read; and the sentinel decodes as SQL NULL for
+every type.)
 
 **V2 sidecar discovery.** `CheckpointReader.ReadV2CheckpointAsync`
 rebuilds sidecar paths as `_delta_log/_sidecars/{name}` by a slash
