@@ -985,22 +985,34 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             string newFileName = $"{Guid.NewGuid():N}.parquet";
             long fileSize;
 
-            await using (var file = await _fs.CreateAsync(
-                newFileName, cancellationToken: cancellationToken).ConfigureAwait(false))
+            // Physical names + parquet field ids at EVERY level (nested struct children included — the
+            // top-level-only rename/stamp pair left them logical-named and id-less), then strip the internal
+            // row-tracking column. Prepared up front so both the built-in and pluggable writers see the same
+            // batches.
+            var writeBatches = new List<RecordBatch>(outputBatches.Count);
+            foreach (var batch in outputBatches)
             {
+                var physicalBatch = ColumnMappingRecursive.ToPhysical(
+                    batch, snapshot.Schema, mappingMode);
+                var (cleanBatch, _) = RowTracking.RowTrackingWriter.StripRowIdColumn(physicalBatch);
+                writeBatches.Add(cleanBatch);
+            }
+
+            if (_options.DataFileWriter is { } rewriteWriter)
+            {
+                fileSize = await rewriteWriter.WriteAsync(
+                    writeBatches, newFileName, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                await using var file = await _fs.CreateAsync(
+                    newFileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                 await using var writer = new Parquet.ParquetFileWriter(
                     file, ownsFile: false, _options.ParquetWriteOptions);
 
-                foreach (var batch in outputBatches)
+                foreach (var batch in writeBatches)
                 {
-                    // Physical names + parquet field ids at EVERY level (nested struct children included —
-                    // the top-level-only rename/stamp pair left them logical-named and id-less).
-                    var physicalBatch = ColumnMappingRecursive.ToPhysical(
-                        batch, snapshot.Schema, mappingMode);
-
-                    // Strip row tracking column if present
-                    var (cleanBatch, _) = RowTracking.RowTrackingWriter.StripRowIdColumn(physicalBatch);
-                    await writer.WriteRowGroupAsync(cleanBatch, cancellationToken)
+                    await writer.WriteRowGroupAsync(batch, cancellationToken)
                         .ConfigureAwait(false);
                 }
 
@@ -1547,9 +1559,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 long fileSize;
 
-                await using (var file = await _fs.CreateAsync(
-                    fileName, cancellationToken: cancellationToken).ConfigureAwait(false))
+                if (_options.DataFileWriter is { } dataFileWriter)
                 {
+                    // Delegate the parquet bytes to the host writer; it places the file at the location the
+                    // table filesystem maps `fileName` to and returns its byte size.
+                    fileSize = await dataFileWriter.WriteAsync(
+                        [physicalBatch], fileName, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await using var file = await _fs.CreateAsync(
+                        fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
                         file, ownsFile: false, _options.ParquetWriteOptions);
                     await writer.WriteRowGroupAsync(physicalBatch, cancellationToken)
@@ -1700,7 +1720,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var result = await Compaction.CompactionExecutor.ExecuteAsync(
             _fs, _log, CurrentSnapshot, options,
             _options.ParquetWriteOptions, _options.ParquetReadOptions,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken, _options.DataFileWriter, _options.DataFileReader)
+            .ConfigureAwait(false);
 
         if (result.HasValue)
         {
@@ -1753,6 +1774,53 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var fieldIdToLogical = isIdMode
             ? ColumnMapping.BuildFieldIdToLogicalMap(snapshot.Schema)
             : null;
+
+        // Load the deletion vector first — it is independent of the byte source.
+        HashSet<long>? deletedRows = null;
+        if (addFile.DeletionVector is not null)
+        {
+            deletedRows = await _dvReader.ReadAsync(
+                addFile.DeletionVector, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (_options.DataFileReader is { } dataFileReader)
+        {
+            // Pluggable codec read: raw physical batches in file order (DV rows included). Projection resolves
+            // by PHYSICAL NAME in every mode — id-mode field-id resolution needs the parquet footer, which the
+            // seam deliberately hides; Delta-spec files carry physicalName in BOTH modes, so name resolution is
+            // exact for spec-written files. parquetSchema stays null, so the logical rename in the pipeline
+            // falls to the (equivalent for spec files) name-based path.
+            IReadOnlyList<string>? seamColumns = null;
+            if (columns is not null)
+            {
+                var partSet = hasPartitions
+                    ? new HashSet<string>(partitionColumns, StringComparer.Ordinal)
+                    : new HashSet<string>();
+                seamColumns = columns
+                    .Where(c => !partSet.Contains(c))
+                    .Select(c => logicalToPhysical.TryGetValue(c, out var p) ? p : c)
+                    .ToList();
+            }
+            else if (hasPartitions)
+            {
+                var partSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
+                seamColumns = snapshot.Schema.Fields
+                    .Where(f => !partSet.Contains(f.Name))
+                    .Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
+                    .ToList();
+            }
+
+            var seamBatches = dataFileReader.ReadAsync(
+                EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), seamColumns, cancellationToken);
+            await foreach (var processed in ProcessFileBatchesAsync(
+                seamBatches, addFile, snapshot, columns, mappingMode, isIdMode, physicalToLogical,
+                logicalToPhysical, fieldIdToLogical, parquetSchema: null, deletedRows, partitionColumns,
+                hasPartitions, cancellationToken).ConfigureAwait(false))
+            {
+                yield return processed;
+            }
+            yield break;
+        }
 
         // Open the file and read its Parquet schema for field_id resolution
         await using var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
@@ -1814,25 +1882,50 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        // Load deletion vector if present
-        HashSet<long>? deletedRows = null;
-        if (addFile.DeletionVector is not null)
-        {
-            deletedRows = await _dvReader.ReadAsync(
-                addFile.DeletionVector, cancellationToken).ConfigureAwait(false);
-        }
-
         if (parquetSchema is null && isIdMode)
         {
             parquetSchema = await reader.GetSchemaAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
 
+        var builtinBatches = reader.ReadAllAsync(
+            columnNames: fileColumns, cancellationToken: cancellationToken);
+        await foreach (var processed in ProcessFileBatchesAsync(
+            builtinBatches, addFile, snapshot, columns, mappingMode, isIdMode, physicalToLogical,
+            logicalToPhysical, fieldIdToLogical, parquetSchema, deletedRows, partitionColumns,
+            hasPartitions, cancellationToken).ConfigureAwait(false))
+        {
+            yield return processed;
+        }
+    }
+
+    /// <summary>
+    /// The per-batch read pipeline shared by the built-in <c>ParquetFileReader</c> and a pluggable
+    /// <see cref="IDataFileReader"/>: everything ABOVE the raw decode. The source yields RAW batches —
+    /// physical column names, file order, deletion-vector rows included — and this applies the logical
+    /// rename, DV filtering, type widening, partition-column re-add, row-tracking strip, and the
+    /// schema-evolution backfill. Position-keyed steps (DV filtering) depend on the source preserving
+    /// file order, which is part of the <see cref="IDataFileReader"/> contract.
+    /// </summary>
+    private async IAsyncEnumerable<RecordBatch> ProcessFileBatchesAsync(
+        IAsyncEnumerable<RecordBatch> source,
+        AddFile addFile,
+        Snapshot.Snapshot snapshot,
+        IReadOnlyList<string>? columns,
+        ColumnMappingMode mappingMode,
+        bool isIdMode,
+        Dictionary<string, string> physicalToLogical,
+        Dictionary<string, string> logicalToPhysical,
+        Dictionary<int, string>? fieldIdToLogical,
+        Parquet.Schema.SchemaDescriptor? parquetSchema,
+        HashSet<long>? deletedRows,
+        IReadOnlyList<string> partitionColumns,
+        bool hasPartitions,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         long batchStartRow = 0;
 
-        await foreach (var batch in reader.ReadAllAsync(
-            columnNames: fileColumns, cancellationToken: cancellationToken)
-            .ConfigureAwait(false))
+        await foreach (var batch in source.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
             // Rename columns back to logical names (flat, top level), then recursively for nested struct
             // children (the flat renames leave them under their physical names).

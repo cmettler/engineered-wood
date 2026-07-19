@@ -35,4 +35,17 @@ public sealed record DeltaTableOptions
 
     /// <summary>Whether to collect per-column statistics on write. Default: true.</summary>
     public bool CollectStats { get; init; } = true;
+
+    /// <summary>Optional pluggable writer for data-file bytes. When set, the table delegates parquet file
+    /// production to it (e.g. a host's native parquet writer) instead of the built-in <c>ParquetFileWriter</c>;
+    /// all other write logic (partitioning, row tracking, stats, the <c>add</c> action, the commit) is unchanged.
+    /// Default: null (use the built-in writer).</summary>
+    public IDataFileWriter? DataFileWriter { get; init; }
+
+    /// <summary>Optional pluggable reader for data-file bytes — the read-side counterpart of
+    /// <see cref="DataFileWriter"/>. When set, the table decodes each data file through it (raw physical
+    /// batches in file order; see <see cref="IDataFileReader"/>) instead of the built-in
+    /// <c>ParquetFileReader</c>; all processing above the decode (column-mapping rename, DV filtering,
+    /// backfill, partition re-add) is unchanged. Default: null (use the built-in reader).</summary>
+    public IDataFileReader? DataFileReader { get; init; }
 }

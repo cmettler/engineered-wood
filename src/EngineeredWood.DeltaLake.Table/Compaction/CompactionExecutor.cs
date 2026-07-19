@@ -18,6 +18,27 @@ namespace EngineeredWood.DeltaLake.Table.Compaction;
 internal static class CompactionExecutor
 {
     /// <summary>
+    /// A field stripped to name/type/nullability for the clean rebuild before a re-write: reader-carried
+    /// metadata (e.g. the source file's own <c>PARQUET:field_id</c>) malforms the footer when the writer
+    /// re-stamps ids, so it is dropped — EXCEPT the <c>ARROW:extension:*</c> transport markers, which type
+    /// the column for a pluggable host codec (see <see cref="IDataFileReader"/>) and must survive every
+    /// rewrite, or the host loses the column's representation on compaction.
+    /// </summary>
+    internal static Field CleanField(Field f)
+    {
+        Dictionary<string, string>? kept = null;
+        if (f.Metadata is { } md)
+        {
+            foreach (var kv in md)
+            {
+                if (kv.Key.StartsWith("ARROW:extension:", StringComparison.Ordinal))
+                    (kept ??= new Dictionary<string, string>())[kv.Key] = kv.Value;
+            }
+        }
+        return new Field(f.Name, f.DataType, f.IsNullable, kept);
+    }
+
+    /// <summary>
     /// Selects files eligible for compaction and rewrites them.
     /// Returns the new version number, or null if no files were compacted.
     /// </summary>
@@ -28,7 +49,9 @@ internal static class CompactionExecutor
         CompactionOptions options,
         ParquetWriteOptions parquetOptions,
         ParquetReadOptions parquetReadOptions,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IDataFileWriter? dataFileWriter = null,
+        IDataFileReader? dataFileReader = null)
     {
         // Select small files as compaction candidates
         var candidates = snapshot.ActiveFiles.Values
@@ -74,14 +97,29 @@ internal static class CompactionExecutor
                 ? await dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
                 : null;
 
-            await using var file = await fs.OpenReadAsync(
-                EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
-                .ConfigureAwait(false);
-            using var reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
+            // Pluggable read half: raw physical batches in file order (positions drive the DV exclusion
+            // below) — the same contract as the built-in reader.
+            IRandomAccessFile? file = null;
+            ParquetFileReader? reader = null;
+            IAsyncEnumerable<RecordBatch> rawBatches;
+            if (dataFileReader is not null)
+            {
+                rawBatches = dataFileReader.ReadAsync(
+                    EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), null, cancellationToken);
+            }
+            else
+            {
+                file = await fs.OpenReadAsync(
+                    EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+                    .ConfigureAwait(false);
+                reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
+                rawBatches = reader.ReadAllAsync(cancellationToken: cancellationToken);
+            }
 
+            try
+            {
             long batchStartRow = 0;
-            await foreach (var batch in reader.ReadAllAsync(
-                cancellationToken: cancellationToken).ConfigureAwait(false))
+            await foreach (var batch in rawBatches.ConfigureAwait(false))
             {
                 var liveBatch = batch;
                 if (deletedRows is not null)
@@ -103,7 +141,7 @@ internal static class CompactionExecutor
                     // tolerant matching renames nothing — it only stamps the ids.
                     var cleanFields = new List<Field>(outBatch.Schema.FieldsList.Count);
                     foreach (var f in outBatch.Schema.FieldsList)
-                        cleanFields.Add(new Field(f.Name, f.DataType, f.IsNullable));
+                        cleanFields.Add(CleanField(f));
                     var cleanArrays = new List<IArrowArray>(outBatch.ColumnCount);
                     for (int c = 0; c < outBatch.ColumnCount; c++)
                         cleanArrays.Add(outBatch.Column(c));
@@ -112,6 +150,15 @@ internal static class CompactionExecutor
                     outBatch = ColumnMappingRecursive.ToPhysical(outBatch, snapshot.Schema, mappingMode);
                 }
                 allBatches.Add(outBatch);
+            }
+            }
+            finally
+            {
+                reader?.Dispose();
+                if (file is not null)
+                {
+                    await file.DisposeAsync().ConfigureAwait(false);
+                }
             }
         }
 
@@ -177,9 +224,17 @@ internal static class CompactionExecutor
                 long fileSize;
                 long fileBaseRowId = nextRowId;
 
-                await using (var outFile = await fs.CreateAsync(
-                    fileName, cancellationToken: cancellationToken).ConfigureAwait(false))
+                if (dataFileWriter is not null)
                 {
+                    // Keep the host codec's output quality (bloom filters, stats, footer) through an OPTIMIZE
+                    // instead of reverting to the built-in writer for compacted files.
+                    fileSize = await dataFileWriter.WriteAsync(currentBatches, fileName, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await using var outFile = await fs.CreateAsync(
+                        fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
                         outFile, ownsFile: false, parquetOptions);
                     foreach (var batch in currentBatches)
