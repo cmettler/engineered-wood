@@ -199,7 +199,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             },
         };
 
-        await log.WriteCommitAsync(0, actions, cancellationToken).ConfigureAwait(false);
+        // The creation commit gets a commitInfo like every other commit, so version 0 is dated and named in
+        // the history (and resolvable by timestamp time travel) rather than being the one silent version.
+        var createActions = Log.InCommitTimestamp.EnsureCommitInfo(
+            actions, configuration, "CREATE TABLE");
+        await log.WriteCommitAsync(0, createActions, cancellationToken).ConfigureAwait(false);
 
         var snapshot = await SnapshotBuilder.BuildAsync(
             log, checkpointReader: null, atVersion: 0, cancellationToken)
@@ -717,6 +721,46 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 yield return batch;
             }
+        }
+    }
+
+    /// <summary>
+    /// One row of the table's commit history. <see cref="TimestampMs"/> is the commit's inCommitTimestamp
+    /// (or, without that feature, the commitInfo <c>timestamp</c> field) in epoch milliseconds — null only
+    /// for a commit written before commitInfo became unconditional, or by a writer that omits it.
+    /// <see cref="OperationParameters"/> is the raw JSON of <c>commitInfo.operationParameters</c>.
+    /// </summary>
+    public readonly record struct DeltaHistoryEntry(
+        long Version, long? TimestampMs, string? Operation, string? OperationParameters);
+
+    /// <summary>
+    /// Enumerates the table's commit history — every version and its commitInfo — oldest first.
+    /// Reads the Delta log only; no data files are opened.
+    /// </summary>
+    public async IAsyncEnumerable<DeltaHistoryEntry> GetHistoryAsync(
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        await foreach (long version in _log.ListVersionsAsync(0, cancellationToken).ConfigureAwait(false))
+        {
+            var actions = await _log.ReadCommitAsync(version, cancellationToken).ConfigureAwait(false);
+            long? ts = null;
+            string? op = null;
+            string? opParams = null;
+            foreach (var action in actions)
+            {
+                if (action is CommitInfo ci)
+                {
+                    // GetTimestamp prefers inCommitTimestamp and falls back to the standard `timestamp`.
+                    ts = Log.InCommitTimestamp.GetTimestamp(ci);
+                    if (ci.GetValue("operation") is { ValueKind: System.Text.Json.JsonValueKind.String } o)
+                        op = o.GetString();
+                    var p = ci.GetValue("operationParameters");
+                    opParams = p.HasValue ? p.Value.GetRawText() : null;
+                    break;
+                }
+            }
+            yield return new DeltaHistoryEntry(version, ts, op, opParams);
         }
     }
 
@@ -1468,7 +1512,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var retention = retentionPeriod ?? _options.VacuumRetention;
         return await Vacuum.VacuumExecutor.ExecuteAsync(
-            _fs, CurrentSnapshot, retention, dryRun, cancellationToken)
+            _fs, _log, CurrentSnapshot, retention, dryRun, cancellationToken)
             .ConfigureAwait(false);
     }
 

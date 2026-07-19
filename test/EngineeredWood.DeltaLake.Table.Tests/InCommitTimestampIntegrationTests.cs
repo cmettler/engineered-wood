@@ -252,7 +252,7 @@ public class InCommitTimestampIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task TableWithoutInCommitTimestamps_NoTimestampTracked()
+    public async Task TableWithoutInCommitTimestamps_CommitInfoTimestampTracked()
     {
         var fs = new LocalTableFileSystem(_tempDir);
         var schema = new Apache.Arrow.Schema.Builder()
@@ -265,7 +265,9 @@ public class InCommitTimestampIntegrationTests : IDisposable
         var batch = new RecordBatch(schema, [ids], 1);
         await table.WriteAsync([batch]);
 
-        // No in-commit timestamp since feature is not enabled
-        Assert.Null(table.CurrentSnapshot.InCommitTimestamp);
+        // commitInfo (with a timestamp) is written on every commit, so timestamp resolution works
+        // even without the inCommitTimestamp feature — only the in-protocol monotonic guarantee
+        // requires enabling it.
+        Assert.NotNull(table.CurrentSnapshot.InCommitTimestamp);
     }
 }

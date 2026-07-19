@@ -221,9 +221,13 @@ internal static class CompactionExecutor
                 .BuildHighWaterMarkAction(nextRowId));
         }
 
-        // Commit
+        // Commit — with the always-on commitInfo (operation + timestamp) every other commit path writes.
+        // This was the ONLY silent one: history showed a null operation for a compaction, and timestamp time
+        // travel had no timestamp to resolve through the commit.
         long newVersion = snapshot.Version + 1;
-        await log.WriteCommitAsync(newVersion, actions, cancellationToken)
+        var commitActions = InCommitTimestamp.EnsureCommitInfo(
+            actions, snapshot.Metadata.Configuration, "OPTIMIZE");
+        await log.WriteCommitAsync(newVersion, commitActions, cancellationToken)
             .ConfigureAwait(false);
 
         return newVersion;

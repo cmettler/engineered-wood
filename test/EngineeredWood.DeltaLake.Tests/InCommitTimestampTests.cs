@@ -105,8 +105,10 @@ public class InCommitTimestampTests
     }
 
     [Fact]
-    public void EnsureCommitInfo_WhenDisabled_NoChange()
+    public void EnsureCommitInfo_WhenDisabled_StillPrependsCommitInfo()
     {
+        // commitInfo is written on EVERY commit (operation + timestamp are standard feature-free
+        // fields); the inCommitTimestamp field itself is added only when the feature is enabled.
         var actions = new List<DeltaAction>
         {
             new AddFile
@@ -118,7 +120,10 @@ public class InCommitTimestampTests
         };
 
         var result = InCommitTimestamp.EnsureCommitInfo(actions, null);
-        Assert.Same(actions, result);
+        Assert.Equal(2, result.Count);
+        var ci = Assert.IsType<CommitInfo>(result[0]);
+        Assert.False(ci.Values.ContainsKey("inCommitTimestamp"));
+        Assert.IsType<AddFile>(result[1]);
     }
 
     [Fact]

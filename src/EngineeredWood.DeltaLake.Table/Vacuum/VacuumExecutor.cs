@@ -1,6 +1,9 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Text.Json;
+using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.Log;
 using DeltaSnapshot = EngineeredWood.DeltaLake.Snapshot.Snapshot;
 using EngineeredWood.IO;
 
@@ -14,9 +17,15 @@ internal static class VacuumExecutor
 {
     /// <summary>
     /// Finds unreferenced files and optionally deletes them.
+    ///
+    /// <para>A non-dry-run vacuum writes the Spark-parity <c>VACUUM START</c> / <c>VACUUM END</c>
+    /// commitInfo-only commits around the physical deletes, so the operation is visible in the table
+    /// history (auditability — and other engines can see WHY older versions stopped being physically
+    /// readable). A dry run writes nothing.</para>
     /// </summary>
     public static async ValueTask<VacuumResult> ExecuteAsync(
         ITableFileSystem fs,
+        TransactionLog log,
         DeltaSnapshot snapshot,
         TimeSpan retentionPeriod,
         bool dryRun,
@@ -47,21 +56,48 @@ internal static class VacuumExecutor
         // Find unreferenced files older than the retention period
         var cutoff = DateTimeOffset.UtcNow - retentionPeriod;
         var filesToDelete = new List<string>();
+        long bytesToDelete = 0;
 
         foreach (var file in allFiles)
         {
             if (!referencedPaths.Contains(file.Path) && file.LastModified < cutoff)
+            {
                 filesToDelete.Add(file.Path);
+                bytesToDelete += file.Size;
+            }
         }
 
         int deleted = 0;
         if (!dryRun)
         {
+            long startVersion = await WriteCommitInfoAsync(
+                log, snapshot, "VACUUM START",
+                new Dictionary<string, JsonElement>
+                {
+                    ["operationParameters"] = ParseJson(
+                        $"{{\"retentionDurationMillis\":{(long)retentionPeriod.TotalMilliseconds}}}"),
+                    ["operationMetrics"] = ParseJson(
+                        $"{{\"numFilesToDelete\":\"{filesToDelete.Count}\",\"sizeOfDataToDelete\":\"{bytesToDelete}\"}}"),
+                },
+                firstCandidateVersion: snapshot.Version + 1,
+                cancellationToken).ConfigureAwait(false);
+
             foreach (string path in filesToDelete)
             {
                 await fs.DeleteAsync(path, cancellationToken).ConfigureAwait(false);
                 deleted++;
             }
+
+            await WriteCommitInfoAsync(
+                log, snapshot, "VACUUM END",
+                new Dictionary<string, JsonElement>
+                {
+                    ["operationParameters"] = ParseJson("{\"status\":\"COMPLETED\"}"),
+                    ["operationMetrics"] = ParseJson(
+                        $"{{\"numDeletedFiles\":\"{deleted}\",\"numVacuumedDirectories\":\"0\"}}"),
+                },
+                firstCandidateVersion: startVersion + 1,
+                cancellationToken).ConfigureAwait(false);
         }
 
         return new VacuumResult
@@ -69,5 +105,39 @@ internal static class VacuumExecutor
             FilesToDelete = filesToDelete,
             FilesDeleted = deleted,
         };
+    }
+
+    // Writes a commitInfo-only commit, retrying past versions a concurrent writer takes (the commit carries
+    // no data actions, so re-attempting at the next version is always safe). Returns the committed version.
+    private static async ValueTask<long> WriteCommitInfoAsync(
+        TransactionLog log, DeltaSnapshot snapshot, string operation,
+        IDictionary<string, JsonElement> additionalValues, long firstCandidateVersion,
+        CancellationToken cancellationToken)
+    {
+        var commitInfo = InCommitTimestamp.CreateCommitInfo(
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), operation, additionalValues,
+            includeInCommitTimestamp: InCommitTimestamp.IsEnabled(snapshot.Metadata.Configuration));
+        IReadOnlyList<DeltaAction> actions = new DeltaAction[] { commitInfo };
+
+        const int maxAttempts = 16;
+        long version = firstCandidateVersion;
+        for (int attempt = 0; ; attempt++, version++)
+        {
+            try
+            {
+                await log.WriteCommitAsync(version, actions, cancellationToken).ConfigureAwait(false);
+                return version;
+            }
+            catch (DeltaConflictException) when (attempt + 1 < maxAttempts)
+            {
+                // A concurrent writer took this version — try the next one.
+            }
+        }
+    }
+
+    private static JsonElement ParseJson(string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        return doc.RootElement.Clone();
     }
 }
