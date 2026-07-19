@@ -1151,14 +1151,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        HonorWriterFeatures(isAppend: false); // DELETE is a data change
 
         // Route the single-shot DELETE through the optimistic-concurrency loop: a DELETE that races a
         // concurrent commit rebases and retries (when nothing it read was removed) instead of failing on
         // the version collision, and aborts with a DeltaConflictException only on a real conflict
         // (delete/delete on the same file, or a concurrent metadata/protocol change). When no rows match,
-        // nothing is staged and CommitAsync returns the unchanged read version.
+        // nothing is staged and CommitAsync returns the unchanged read version. Write preconditions are
+        // validated by the transaction's DeleteAsync (against the same pinned base snapshot).
         var transaction = StartTransaction();
         long rowsDeleted = await transaction.DeleteAsync(predicate, cancellationToken)
             .ConfigureAwait(false);
@@ -1294,11 +1293,45 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        HonorWriterFeatures(isAppend: false); // UPDATE is a data change
-
         var snapshot = CurrentSnapshot;
+        ValidateWritable(snapshot, isAppend: false); // UPDATE is a data change
+
+        var plan = await ComputeUpdateActionsAsync(snapshot, predicate, updater, cancellationToken)
+            .ConfigureAwait(false);
+
+        bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+            snapshot.Metadata.Configuration);
+
+        // An UPDATE reads exactly the files it rewrites, so — like DELETE — the removed paths are both its
+        // read-set (concurrentDeleteRead) and its planned removes (delete/delete). Route it through the OCC
+        // loop so a single-shot UPDATE rebases past a non-conflicting concurrent commit instead of throwing.
+        long committed = await CommitOccAsync(
+            snapshot, plan.Actions, new Concurrency.ReadSet { Files = plan.RemovedPaths },
+            plan.RemovedPaths, IsolationLevel.WriteSerializable, "UPDATE",
+            rebaseSafe: !rowTracking, cancellationToken).ConfigureAwait(false);
+
+        return (plan.TotalUpdated, committed);
+    }
+
+    /// <summary>The remove/add (and CDC) actions an UPDATE produces, the paths it rewrote, and the row
+    /// count — everything a commit needs, without committing. Shared by the auto-committing
+    /// <see cref="UpdateAsync"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
+    internal sealed record UpdateActions(
+        IReadOnlyList<DeltaAction> Actions, ISet<string> RemovedPaths, long TotalUpdated);
+
+    /// <summary>
+    /// Computes the actions for an UPDATE against <paramref name="snapshot"/> WITHOUT committing. Like a
+    /// DELETE, the removed-file paths double as the read-set: an UPDATE reads exactly the files it rewrites,
+    /// so a concurrent commit that removed one of them is the conflict that must abort it.
+    /// </summary>
+    internal async ValueTask<UpdateActions> ComputeUpdateActionsAsync(
+        Snapshot.Snapshot snapshot,
+        Func<RecordBatch, BooleanArray> predicate,
+        Func<RecordBatch, RecordBatch> updater,
+        CancellationToken cancellationToken)
+    {
         var actions = new List<DeltaAction>();
+        var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         long totalUpdated = 0;
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
             snapshot.Metadata.Configuration);
@@ -1429,6 +1462,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // has the DV's deletions applied, so the source must be removed under its DV-qualified key.
                 DeletionVector = addFile.DeletionVector,
             });
+            removedPaths.Add(addFile.Path);
 
             actions.Add(new AddFile
             {
@@ -1462,20 +1496,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        if (actions.Count == 0)
-            return (0, snapshot.Version);
-
-        var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-            actions, snapshot.Metadata.Configuration, "UPDATE");
-
-        long newVersion = snapshot.Version + 1;
-        await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
-            .ConfigureAwait(false);
-
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            snapshot, _log, cancellationToken).ConfigureAwait(false);
-
-        return (totalUpdated, newVersion);
+        return new UpdateActions(actions, removedPaths, totalUpdated);
     }
 
     private static int CountTrue(BooleanArray mask)
@@ -1660,15 +1681,28 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Returns the committed version number.
     /// </summary>
     /// <summary>
+    /// The write preconditions every data-changing operation shares, validated against the snapshot the
+    /// operation reads from (the transaction's pinned base, or the table's current snapshot for the
+    /// auto-committers): the protocol must be writable by this library, and the table's actively-declared
+    /// writer features must be honored. Kept together so a transactional append/update/delete runs the same
+    /// gate as its single-shot equivalent instead of skipping it.
+    /// </summary>
+    internal void ValidateWritable(Snapshot.Snapshot snapshot, bool isAppend)
+    {
+        ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
+        HonorWriterFeatures(snapshot, isAppend);
+    }
+
+    /// <summary>
     /// Enforces the writer features a table ACTIVELY declares (Delta constraints are write-time only, so a
     /// violating commit would poison the table for every reader). <c>delta.appendOnly=true</c> blocks non-append
     /// data changes; <c>delta.constraints.*</c> / <c>delta.invariants</c> / <c>delta.generationExpression</c>
     /// carry arbitrary SQL this writer cannot evaluate, so an ACTIVE one rejects the write. A table that merely
     /// LISTS these features in its writer-v7 protocol (the common case) is unaffected.
     /// </summary>
-    private void HonorWriterFeatures(bool isAppend)
+    private static void HonorWriterFeatures(Snapshot.Snapshot snapshot, bool isAppend)
     {
-        var cfg = CurrentSnapshot.Metadata.Configuration;
+        var cfg = snapshot.Metadata.Configuration;
         if (cfg is not null)
         {
             if (!isAppend && cfg.TryGetValue("delta.appendOnly", out var ao)
@@ -1686,7 +1720,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 }
             }
         }
-        foreach (var field in CurrentSnapshot.ArrowSchema.FieldsList)
+        foreach (var field in snapshot.ArrowSchema.FieldsList)
         {
             if (field.Metadata is not null && field.Metadata.ContainsKey("delta.invariants"))
             {
@@ -1756,12 +1790,39 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? repartitionTo = null)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
-        HonorWriterFeatures(mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite);
-
         var snapshot = CurrentSnapshot;
+        // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
+        ValidateWritable(snapshot, isAppend: mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite);
 
+        var actions = await ComputeWriteActionsAsync(
+            snapshot, batches, mode, overwritePartitions, dynamicPartitionOverwrite, repartitionTo,
+            cancellationToken).ConfigureAwait(false);
+
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+            snapshot.Metadata.Configuration);
+        long newVersion = snapshot.Version + 1;
+        return await CommitWriteAsync(
+            snapshot, actions, mode, dynamicPartitionOverwrite, rowTrackingEnabled, newVersion,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Computes the full action list for a write against <paramref name="snapshot"/> WITHOUT committing:
+    /// pre-commit removes (overwrite family), the per-batch adds (identity, row tracking, column mapping,
+    /// partition split, stats), dynamic-overwrite removes, and any identity/repartition metaData +
+    /// row-tracking high-water-mark action. Shared by the auto-committing <see cref="WriteCoreAsync"/> and
+    /// the append path of <see cref="DeltaTransaction"/> — the transaction only calls it with
+    /// <see cref="DeltaWriteMode.Append"/>, so the overwrite branches stay inert there.
+    /// </summary>
+    internal async ValueTask<IReadOnlyList<DeltaAction>> ComputeWriteActionsAsync(
+        Snapshot.Snapshot snapshot,
+        IReadOnlyList<RecordBatch> batches,
+        DeltaWriteMode mode,
+        IReadOnlyDictionary<string, string>? overwritePartitions,
+        bool dynamicPartitionOverwrite,
+        IReadOnlyList<string>? repartitionTo,
+        CancellationToken cancellationToken)
+    {
         // Repartition-on-overwrite: changing partitionColumns is protocol-legal ONLY when every active file
         // is removed in the same commit — i.e. a FULL overwrite (a partition-scoped or dynamic overwrite
         // keeps files that would no longer conform to the new partition schema).
@@ -2067,13 +2128,27 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
         }
 
-        // Commit. A pure (blind) append has no read dependency, so a single-shot append that races a
-        // concurrent commit rebases and retries through the optimistic-concurrency loop — aborting only
-        // on a concurrent metadata/protocol change — instead of failing on the version collision. The
-        // overwrite family (full / partition-scoped / dynamic) reads the active-file set to decide what
-        // to remove, so its staged removes are NOT rebase-safe without partition-predicate plumbing; it
-        // keeps the single-attempt commit (a collision still throws, exactly as before). Row tracking
-        // embeds the attempted version in its adds, so it stays single-attempt too (rebaseSafe=false).
+        return actions;
+    }
+
+    /// <summary>
+    /// Commits the actions a write produced. A pure (blind) append has no read dependency, so it goes
+    /// through the optimistic-concurrency loop — rebasing past a non-conflicting concurrent commit,
+    /// aborting only on a concurrent metadata/protocol change — instead of failing on a version collision.
+    /// The overwrite family (full / partition-scoped / dynamic) reads the active-file set to decide what to
+    /// remove, so its removes are NOT rebase-safe without partition-predicate plumbing; it keeps the
+    /// single-attempt commit (a collision still throws, as before). Row tracking embeds the attempted
+    /// version in its adds, so it stays single-attempt too (rebaseSafe=false).
+    /// </summary>
+    private async ValueTask<long> CommitWriteAsync(
+        Snapshot.Snapshot snapshot,
+        IReadOnlyList<DeltaAction> actions,
+        DeltaWriteMode mode,
+        bool dynamicPartitionOverwrite,
+        bool rowTrackingEnabled,
+        long newVersion,
+        CancellationToken cancellationToken)
+    {
         long committedVersion;
         bool blindAppend = mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite;
         if (blindAppend)

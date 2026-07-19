@@ -22,10 +22,13 @@ namespace EngineeredWood.DeltaLake.Table;
 /// reused. Not thread-safe: drive one transaction from one thread, though many transactions may race
 /// across threads, which is the point.</para>
 ///
-/// <para><b>Scope.</b> This first cut supports <see cref="DeleteAsync"/> — the read-modify-write
-/// operation optimistic concurrency exists to protect, and the one whose file-level conflicts are
-/// well-defined. Staging appends and updates on a transaction, and row-level (same-file, disjoint-row)
-/// concurrency, are planned additions.</para>
+/// <para><b>Scope.</b> Appends (<see cref="WriteAsync"/>), deletes (<see cref="DeleteAsync"/>), and
+/// updates (<see cref="UpdateAsync"/>) can be staged, including several on one transaction. An append is
+/// a blind write with no read dependency, so two concurrent transactional appends both land; a
+/// delete/update reads the files it rewrites, so it aborts only if a concurrent commit removed one of
+/// them. Overwrite modes and row-level (same-file, disjoint-row) concurrency are planned additions; a
+/// row-tracking table's staged work still commits uncontended but aborts rather than rebase (its
+/// <c>baseRowId</c> would need recomputing against the advanced high-water mark).</para>
 /// </summary>
 public sealed class DeltaTransaction
 {
@@ -33,6 +36,10 @@ public sealed class DeltaTransaction
     private readonly Snapshot.Snapshot _baseSnapshot;
     private readonly List<DeltaAction> _dataActions = [];
     private readonly HashSet<string> _removedPaths = new(StringComparer.Ordinal);
+    // The operations staged so far, so the commitInfo records what the transaction actually did rather
+    // than a fixed label. A single-operation transaction reports that operation; a mixed one reports
+    // "WRITE" (Delta's operation field is one string, and no engine has a name for a fused DELETE+INSERT).
+    private readonly HashSet<string> _operations = new(StringComparer.Ordinal);
     private bool _committed;
 
     internal DeltaTransaction(
@@ -55,7 +62,37 @@ public sealed class DeltaTransaction
 
     internal ISet<string> RemovedPaths => _removedPaths;
 
-    internal string Operation => "DELETE";
+    internal string Operation => _operations.Count == 1 ? _operations.First() : "WRITE";
+
+    /// <summary>
+    /// Stages an append of <paramref name="batches"/>, evaluated against this transaction's pinned read
+    /// version. An append is a blind write — it depends on nothing the table currently holds — so it
+    /// never conflicts with a concurrent delete or append and two concurrent transactional appends both
+    /// land. It aborts only if a concurrent commit changed the table's metadata or protocol.
+    ///
+    /// <para>Nothing is committed until <see cref="CommitAsync"/>, but the data files ARE written now (an
+    /// aborted transaction leaves them as vacuum-able orphans, like the auto-committer). Returns the
+    /// number of rows staged.</para>
+    /// </summary>
+    public async ValueTask<long> WriteAsync(
+        IReadOnlyList<RecordBatch> batches, CancellationToken cancellationToken = default)
+    {
+        EnsureNotCommitted();
+        _table.ValidateWritable(_baseSnapshot, isAppend: true);
+
+        var actions = await _table.ComputeWriteActionsAsync(
+            _baseSnapshot, batches, DeltaWriteMode.Append,
+            overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
+            cancellationToken).ConfigureAwait(false);
+
+        _dataActions.AddRange(actions);
+        _operations.Add("WRITE");
+
+        long rows = 0;
+        foreach (var batch in batches)
+            rows += batch.Length;
+        return rows;
+    }
 
     /// <summary>
     /// Stages a delete of the rows matching <paramref name="predicate"/>, evaluated against this
@@ -70,6 +107,7 @@ public sealed class DeltaTransaction
         Func<RecordBatch, BooleanArray> predicate, CancellationToken cancellationToken = default)
     {
         EnsureNotCommitted();
+        _table.ValidateWritable(_baseSnapshot, isAppend: false);
 
         var plan = await _table.ComputeDeleteActionsAsync(_baseSnapshot, predicate, cancellationToken)
             .ConfigureAwait(false);
@@ -77,8 +115,36 @@ public sealed class DeltaTransaction
         _dataActions.AddRange(plan.DataActions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
+        _operations.Add("DELETE");
 
         return plan.TotalDeleted;
+    }
+
+    /// <summary>
+    /// Stages an update of the rows matching <paramref name="predicate"/> via <paramref name="updater"/>,
+    /// evaluated against this transaction's pinned read version. Like a delete it reads exactly the files
+    /// it rewrites, so a concurrent commit that removed one of them aborts the commit.
+    ///
+    /// <para>Nothing is committed until <see cref="CommitAsync"/>, but the rewritten files ARE written
+    /// now. Returns the number of rows this update matched.</para>
+    /// </summary>
+    public async ValueTask<long> UpdateAsync(
+        Func<RecordBatch, BooleanArray> predicate,
+        Func<RecordBatch, RecordBatch> updater,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureNotCommitted();
+        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+
+        var plan = await _table.ComputeUpdateActionsAsync(
+            _baseSnapshot, predicate, updater, cancellationToken).ConfigureAwait(false);
+
+        _dataActions.AddRange(plan.Actions);
+        foreach (string path in plan.RemovedPaths)
+            _removedPaths.Add(path);
+        _operations.Add("UPDATE");
+
+        return plan.TotalUpdated;
     }
 
     /// <summary>
