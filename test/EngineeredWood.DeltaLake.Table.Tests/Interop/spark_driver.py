@@ -222,9 +222,46 @@ def cmd_scan(args):
     }
 
 
+def cmd_read_variant(args):
+    """Read an EW-written variant table; report each row's variant as canonical JSON via to_json(v).
+
+    to_json forces Spark to actually DECODE the variant value (a malformed value raises
+    MALFORMED_VARIANT here), so this validates the bytes, not merely that the column was accepted.
+    """
+    spark = _spark()
+    df = spark.read.format("delta").load(_uri(args["path"]))
+    id_col, v_col = args.get("id_col", "id"), args.get("col", "v")
+    rows = (df.selectExpr(id_col, f"to_json({v_col}) AS vjson")
+              .orderBy(id_col).collect())
+    return {"spark": spark.version,
+            "rows": [{"id": r[id_col], "vjson": r["vjson"]} for r in rows]}
+
+
+def cmd_write_variant(args):
+    """Write a variant table WITH Spark (parse_json on JSON literals), for the reference -> EW direction.
+
+    `rows` is a list of {id, json} where json is a JSON text (or null for a SQL-NULL variant). Spark's
+    own writer decides the physical layout (Spark 4.1 annotates the group; 4.0 does not).
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    spark.sql(f"CREATE OR REPLACE TABLE delta.`{path}` (id BIGINT, v VARIANT) USING delta")
+    values = []
+    for r in args["rows"]:
+        if r.get("json") is None:
+            values.append(f"({r['id']}, NULL)")
+        else:
+            lit = r["json"].replace("'", "''")
+            values.append(f"({r['id']}, parse_json('{lit}'))")
+    spark.sql(f"INSERT INTO delta.`{path}` VALUES {', '.join(values)}")
+    return {"spark": spark.version, "written": len(values)}
+
+
 COMMANDS = {
     "probe": cmd_probe,
     "read": cmd_read,
+    "read_variant": cmd_read_variant,
+    "write_variant": cmd_write_variant,
     "write": cmd_write,
     "sql": cmd_sql,
     "scan": cmd_scan,

@@ -44,7 +44,10 @@ internal static class Spark
         preflight: Preflight,
         // One JVM for the whole test run instead of one per command. Startup dominates this tier:
         // per-command it was ~15s of session startup around ~1s of actual work.
-        persistent: true);
+        persistent: true,
+        // Point the tier at a specific interpreter (e.g. an isolated Spark 4.1 venv) without disturbing
+        // the base interpreter delta-rs uses. Unset -> python/python3 on PATH, the existing behaviour.
+        interpreterOverrideEnvVar: "EW_SPARK_PYTHON");
 
     public static bool Available => Driver.Available;
 
@@ -96,8 +99,12 @@ internal static class Spark
         var env = new Dictionary<string, string>();
 
         // Spark launches the Python worker by name; without this it can pick a different interpreter
-        // than the driver, which fails with a version-mismatch error that reads like a Spark bug.
-        env["PYSPARK_PYTHON"] = "python";
+        // than the driver, which fails with a version-mismatch error that reads like a Spark bug. When
+        // the tier is pointed at a venv (EW_SPARK_PYTHON), the worker must use that SAME interpreter, or
+        // pyspark's driver/worker version check fails.
+        env["PYSPARK_PYTHON"] =
+            System.Environment.GetEnvironmentVariable("EW_SPARK_PYTHON") is { Length: > 0 } venv
+                ? venv : "python";
 
         string? hadoopHome = System.Environment.GetEnvironmentVariable("HADOOP_HOME");
         if (!string.IsNullOrEmpty(hadoopHome))

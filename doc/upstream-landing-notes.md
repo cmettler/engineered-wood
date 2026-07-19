@@ -168,15 +168,38 @@ writes to the table root with no partition subdirectory while its `add` carries 
      deriving options gets a compiler-generated copy of every member. A hand-written copy would
      silently drop any option added later.
 
-   Covered by `VariantTests` (9 tests: round-trip, feature declaration, schema JSON, stats, DELETE,
-   partitioned write, compaction, ADD COLUMN backfill, variant-partition-column rejection) plus 4
-   `SchemaConverterTests`. **Still open at the Parquet layer**: variant is wrapped for **top-level
-   columns only** (`NestedAssembler` documents that variants nested inside list/map are not wrapped),
-   and there is **no shredding on write** — EW emits the storage struct as-is, which is spec-legal but
-   an interop asymmetry against Spark/DuckDB. Neither is required for correctness.
+   Covered by `VariantTests` (12 tests: round-trip, feature declaration, schema JSON, stats, DELETE,
+   partitioned write, compaction, ADD COLUMN backfill, variant-partition-column rejection, both
+   annotation modes, and the by-name coercion) plus 4 `SchemaConverterTests`. **Still open at the
+   Parquet layer**: variant is wrapped for **top-level columns only** (`NestedAssembler` documents that
+   variants nested inside list/map are not wrapped), and there is **no shredding on write** — EW emits
+   the storage struct as-is, which is spec-legal but an interop asymmetry against Spark/DuckDB. Neither
+   is required for correctness.
 
-   Not yet validated against an external reader — the tier-1/3 interop suites (delta-rs, PySpark) do
-   not cover variant. That is the natural next step.
+   **Externally validated (2026-07-19)** against delta-rs 1.6.2, Spark 4.0.1 and Spark 4.1.1, both
+   directions, via `VariantInteropTests`. This is where round-trip-through-EW was proven insufficient —
+   it surfaced two real defects, both since fixed:
+
+   - **EW's reader keyed off the parquet annotation, not the Delta schema.** The spec (Reader
+     Requirements for Variant) says the schema is authoritative. So an *unannotated* variant table
+     (Spark 4.0.x, or any spec-minimal writer) silently read back as a bare `struct<value, metadata>`.
+     Fixed by `VariantColumnCoercion`, which wraps a schema-declared variant column whether or not the
+     file is annotated — and reorders the storage children BY NAME first, because Arrow's positional
+     `VariantType` factory would otherwise swap Spark's `(value, metadata)` order.
+   - **Spark 4.0.x cannot read EW's default (annotated) output** — its parquet-mr predates the VARIANT
+     logical type and throws an NPE. The Delta spec does not require the annotation (it defines only the
+     struct-of-binary), so `DeltaTableOptions.EmitVariantLogicalType = false` writes the bare struct for
+     4.0.x compatibility. delta-rs and Spark 4.1 read both forms; Spark 4.0.1 reads only the unannotated
+     one; the annotation is what Spark 4.1+/DuckDB expect. Validated matrix:
+
+     | | delta-rs 1.6.2 | Spark 4.0.1 | Spark 4.1.1 |
+     |---|---|---|---|
+     | annotated (default) | ✅ | ❌ NPE | ✅ |
+     | unannotated (compat) | ✅ | ✅ | ✅ |
+
+   A footgun this exercise caught independently: the first `VariantTests` used INVALID variant value
+   bytes (a truncated int8 as "true"). They passed because EW and delta-rs treat the value as opaque;
+   Spark decodes and rejected them with `MALFORMED_VARIANT`. Fixed to spec-valid encodings.
 3. **Slice 9** (row-level concurrency — **STRATEGIC**) — absorbs slice 8's OCC/conflict-checker material.
 4. **The seam decision** — keep-and-fix vs revert `9302723`; see the seam question above and
    `doc/codec-seam-investigation.md`. `IDataFileRewriter` + row-tracking-through-rewrite only if it

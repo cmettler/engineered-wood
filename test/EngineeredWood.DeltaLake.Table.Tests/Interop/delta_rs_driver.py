@@ -199,9 +199,39 @@ def cmd_write(args):
     return {"written": tbl.num_rows, "columns": names}
 
 
+def cmd_read_variant(args):
+    """Read a table EW wrote whose column `col` is a VARIANT, reporting the raw variant bytes.
+
+    delta-rs has no Variant type — it surfaces the column as the physical struct<value, metadata>
+    (whatever child order the file used). We resolve the two binaries BY NAME and hex-encode them, so
+    the C# side can assert the exact bytes regardless of ordering, and can confirm the column read at
+    all (an unannotated variant that delta-rs failed to open would raise here, not silently degrade).
+    """
+    from deltalake import DeltaTable
+
+    dt = DeltaTable(args["path"])
+    tbl = dt.to_pyarrow_table()
+    col = tbl.column(args["col"]).to_pylist()
+    idcol = tbl.column(args.get("id_col", "id")).to_pylist()
+    rows = []
+    for ident, cell in zip(idcol, col):
+        if cell is None:
+            rows.append({"id": ident, "null": True})
+        else:
+            rows.append({
+                "id": ident,
+                "null": False,
+                "value": cell["value"].hex(),
+                "metadata": cell["metadata"].hex(),
+            })
+    rows.sort(key=lambda r: r["id"])
+    return {"version": dt.version(), "row_count": tbl.num_rows, "rows": rows}
+
+
 COMMANDS = {
     "probe": cmd_probe,
     "read": cmd_read,
+    "read_variant": cmd_read_variant,
     "describe": cmd_describe,
     "checkpoint_only_read": cmd_checkpoint_only_read,
     "raw_log": cmd_raw_log,

@@ -84,6 +84,25 @@ established against `deltalake` 1.6.2 and `pyspark` 4.0.1 /
 and `Spark.ValidatedAgainstVersion`. If these tests fail after an upgrade,
 check the tool version before assuming an EngineeredWood regression.
 
+**Two Spark versions for the VARIANT tests.** Variant is GA in Spark 4.1 and
+experimental in 4.0.x, and they disagree on the parquet layout: 4.1 writes and
+reads the VARIANT logical-type annotation; 4.0.x writes it unannotated and its
+reader throws an NPE on an annotated group (which is why the writer has
+`DeltaTableOptions.EmitVariantLogicalType`). `VariantInteropTests` is
+version-aware — it writes whichever layout the running Spark reads — so the
+tier stays green under either. To run the tier against a Spark 4.1 build
+without disturbing the 4.0.x install the rest of tier 3 is pinned to, put 4.1
+in its own venv (`pyspark` bundles its JARs, so two versions cannot share one
+environment) and point the tier at it:
+
+```
+python -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.1 delta-spark==4.1.0
+$env:EW_SPARK_PYTHON = "…\spark41\Scripts\python.exe"   # tier 3 uses this interpreter; unset -> PATH
+```
+
+delta-rs (tier 1) reads both layouts regardless, so the compat-mode writer is
+covered in every run even without a second Spark.
+
 **Tier 3 on Windows** additionally needs Hadoop's `winutils.exe` +
 `hadoop.dll` (Apache does not publish them; community builds exist for each
 Hadoop line — match the version bundled in `pyspark/jars/hadoop-client-api-*.jar`):

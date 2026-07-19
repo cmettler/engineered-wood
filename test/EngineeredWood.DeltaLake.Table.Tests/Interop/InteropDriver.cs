@@ -41,6 +41,10 @@ internal sealed class InteropDriver
     /// <param name="persistent">Keep ONE driver process alive and stream commands to it, instead of
     /// launching a process per command. Only worth it when startup dominates: Spark pays 15-20s per
     /// JVM, delta-rs pays nothing.</param>
+    /// <param name="interpreterOverrideEnvVar">Optional env var naming a specific Python interpreter to
+    /// use instead of the <c>python3</c>/<c>python</c> on PATH. Lets one tier target an isolated venv
+    /// (e.g. a Spark 4.1 install) without disturbing the interpreter another tier resolves — pyspark
+    /// bundles its JARs, so two Spark versions cannot share one environment.</param>
     public InteropDriver(
         string scriptName,
         string probeExpression,
@@ -48,13 +52,15 @@ internal sealed class InteropDriver
         int timeoutMs,
         Func<IReadOnlyDictionary<string, string>>? environment = null,
         Func<string?>? preflight = null,
-        bool persistent = false)
+        bool persistent = false,
+        string? interpreterOverrideEnvVar = null)
     {
         ScriptName = scriptName;
         RequireEnvVar = requireEnvVar;
         TimeoutMs = timeoutMs;
         Environment = environment;
         Persistent = persistent;
+        InterpreterOverrideEnvVar = interpreterOverrideEnvVar;
         _probe = new Lazy<(string?, string?, string?)>(() =>
         {
             string? blocked = preflight?.Invoke();
@@ -71,6 +77,16 @@ internal sealed class InteropDriver
     private Func<IReadOnlyDictionary<string, string>>? Environment { get; }
 
     private bool Persistent { get; }
+
+    private string? InterpreterOverrideEnvVar { get; }
+
+    /// <summary>The interpreter resolved for this driver — the override env var's value if set and
+    /// non-empty, otherwise null (so <see cref="RunProbe"/> falls back to python3/python on PATH).</summary>
+    private string? InterpreterOverride =>
+        InterpreterOverrideEnvVar is not null
+            ? System.Environment.GetEnvironmentVariable(InterpreterOverrideEnvVar) is { Length: > 0 } ov
+                ? ov : null
+            : null;
 
     /// <summary>Marker the serve loop writes to stdout when a result file is complete.</summary>
     private const string DoneMarker = "__EW_DONE__";
@@ -328,7 +344,11 @@ internal sealed class InteropDriver
 
     private (string?, string?, string?) RunProbe(string probeExpression)
     {
-        foreach (string candidate in new[] { "python3", "python" })
+        // An explicit interpreter (a venv python) wins; otherwise fall back to what is on PATH.
+        var candidates = InterpreterOverride is { } exe
+            ? new[] { exe }
+            : new[] { "python3", "python" };
+        foreach (string candidate in candidates)
         {
             try
             {
