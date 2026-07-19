@@ -191,6 +191,45 @@ public class VariantTests : IDisposable
     }
 
     [Fact]
+    public async Task NestedVariant_InsideStruct_RoundTrips()
+    {
+        // A variant field nested inside a struct column. The feature must be declared (SchemaUsesVariant
+        // recurses), and the nested column must read back as a VariantArray, not a bare struct — the
+        // Delta read path relies on the parquet layer's VariantNestedWrapper to reconcile the arrays
+        // with the schema's nested VariantType field.
+        var inner = new StructType([
+            new Field("v", VariantType.Default, true),
+            new Field("tag", StringType.Default, true),
+        ]);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("s", inner, true))
+            .Build();
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, schema);
+
+        var ids = new Int64Array.Builder().Append(1).Append(2).Build();
+        var variants = new VariantArray.Builder();
+        variants.Append(EmptyMetadata, True);
+        variants.Append(EmptyMetadata, Int8Val);
+        var tags = new StringArray.Builder().Append("x").Append("y").Build();
+        var structArr = new StructArray(inner, 2,
+            [variants.Build(allocator: null), tags], ArrowBuffer.Empty, 0);
+        await table.WriteAsync([new RecordBatch(schema, [ids, structArr], 2)]);
+
+        // Feature declared for the nested variant.
+        var protocol = table.CurrentSnapshot.Protocol;
+        Assert.Contains("variantType", protocol.WriterFeatures!);
+
+        var read = await ReadAllAsync(table);
+        var s = Assert.IsType<StructArray>(read[0].Column(read[0].Schema.GetFieldIndex("s")));
+        var v = Assert.IsType<VariantArray>(s.Fields[0]);
+        Assert.Equal(True, v.GetValueBytes(0).ToArray());
+        Assert.Equal(Int8Val, v.GetValueBytes(1).ToArray());
+    }
+
+    [Fact]
     public async Task Metadata_SerializesVariantSchemaType()
     {
         var fs = new LocalTableFileSystem(_tempDir);

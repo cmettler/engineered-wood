@@ -168,13 +168,19 @@ writes to the table root with no partition subdirectory while its `add` carries 
      deriving options gets a compiler-generated copy of every member. A hand-written copy would
      silently drop any option added later.
 
-   Covered by `VariantTests` (12 tests: round-trip, feature declaration, schema JSON, stats, DELETE,
+   Covered by `VariantTests` (13 tests: round-trip, feature declaration, schema JSON, stats, DELETE,
    partitioned write, compaction, ADD COLUMN backfill, variant-partition-column rejection, both
-   annotation modes, and the by-name coercion) plus 4 `SchemaConverterTests`. **Still open at the
-   Parquet layer**: variant is wrapped for **top-level columns only** (`NestedAssembler` documents that
-   variants nested inside list/map are not wrapped), and there is **no shredding on write** — EW emits
-   the storage struct as-is, which is spec-legal but an interop asymmetry against Spark/DuckDB. Neither
-   is required for correctness.
+   annotation modes, the by-name coercion, and nested variant inside a struct) plus 4
+   `SchemaConverterTests`. **Nested variant** (a variant inside a struct/list/map) now reads correctly:
+   `ArrowSchemaConverter` already produced a `VariantType` field at every depth, and
+   `Parquet/Data/VariantNestedWrapper` reconciles the assembled arrays to match it (top-level stays
+   `NestedAssembler`'s job; the wrapper composes with it). Covered by four parquet tests
+   (struct/list/map + the no-registry symmetry) and the Delta `NestedVariant_InsideStruct_RoundTrips`.
+   Two caveats: nested wrapping needs the annotation (it keys off the parquet reader's
+   variant-awareness), so an *unannotated* nested variant — Spark 4.0.x, or EW's own
+   `EmitVariantLogicalType=false` output — is not wrapped (the Delta-layer coercion is top-level only);
+   and there is still **no shredding on write** — EW emits the storage struct as-is, spec-legal but an
+   interop asymmetry against Spark/DuckDB. Neither caveat affects the common (annotated) path.
 
    **Externally validated (2026-07-19)** against delta-rs 1.6.2, Spark 4.0.1 and Spark 4.1.1, both
    directions, via `VariantInteropTests`. This is where round-trip-through-EW was proven insufficient —

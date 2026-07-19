@@ -30,8 +30,8 @@ internal static class NestedAssembler
     /// <c>arrow.parquet.variant</c>, top-level groups annotated with the
     /// Parquet <c>VARIANT</c> logical type are returned as
     /// <see cref="VariantArray"/> rather than the bare storage
-    /// <see cref="StructArray"/>. Deeply nested VARIANT groups (inside
-    /// list/map) are not yet wrapped.
+    /// <see cref="StructArray"/>. Variants nested inside a struct/list/map are
+    /// wrapped separately, after assembly, by <see cref="VariantNestedWrapper"/>.
     /// </param>
     /// <returns>Top-level arrays matching the root's children.</returns>
     public static IArrowArray[] Assemble(

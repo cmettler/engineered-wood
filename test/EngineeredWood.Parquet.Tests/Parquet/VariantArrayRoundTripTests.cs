@@ -246,6 +246,124 @@ public class VariantArrayRoundTripTests : IDisposable
         Assert.True(shreddedFiles > 0, "Expected at least one shredded file (typed_value present) in the corpus.");
     }
 
+    // ── Nested variant: a variant inside struct / list / map. The schema converter produces a nested
+    //    VariantType field at any depth; these pin that the ARRAY matches it (VariantNestedWrapper),
+    //    rather than silently materialising the nested variant as a bare struct. ──
+
+    private static readonly byte[] Meta = [0x01, 0x00, 0x00];
+    private static readonly byte[] VTrue = [0x04];
+    private static readonly byte[] VFalse = [0x08];
+
+    private static VariantArray MakeVariants(params byte[][] values)
+    {
+        var b = new VariantArray.Builder();
+        foreach (var v in values)
+            b.Append(Meta, v);
+        return b.Build(allocator: null);
+    }
+
+    private async Task<RecordBatch> RoundTrip(Apache.Arrow.Schema schema, IArrowArray[] columns, int rowCount)
+    {
+        string path = Path.Combine(_tempDir, $"nested_{Guid.NewGuid():N}.parquet");
+        await using (var f = new LocalSequentialFile(path))
+        await using (var w = new ParquetFileWriter(f, ownsFile: false))
+        {
+            await w.WriteRowGroupAsync(new RecordBatch(schema, columns, rowCount));
+            await w.CloseAsync();
+        }
+        await using var rf = new LocalRandomAccessFile(path);
+        await using var r = new ParquetFileReader(rf, ownsFile: false,
+            new ParquetReadOptions { ExtensionRegistry = VariantRegistry() });
+        return await r.ReadRowGroupAsync(0);
+    }
+
+    [Fact]
+    public async Task VariantInsideStruct_ReadsAsVariantArray()
+    {
+        var v = MakeVariants(VTrue, VFalse);
+        var st = new StructType([new Field("v", v.Data.DataType, true)]);
+        var s = new StructArray(st, 2, [v], ArrowBuffer.Empty, 0);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("s", st, true)).Build();
+
+        var read = await RoundTrip(schema, [s], 2);
+
+        // Schema field and array must agree: struct<v: variant>, array struct<v: VariantArray>.
+        Assert.IsType<VariantType>(((StructType)read.Schema.GetFieldByName("s").DataType).Fields[0].DataType);
+        var outStruct = Assert.IsType<StructArray>(read.Column(0));
+        var outVar = Assert.IsType<VariantArray>(outStruct.Fields[0]);
+        Assert.Equal(VTrue, outVar.GetValueBytes(0).ToArray());
+        Assert.Equal(VFalse, outVar.GetValueBytes(1).ToArray());
+    }
+
+    [Fact]
+    public async Task VariantInsideList_ReadsAsVariantArray()
+    {
+        var v = MakeVariants(VTrue, VFalse, VTrue);
+        var offsets = new ArrowBuffer.Builder<int>();
+        offsets.Append(0).Append(2).Append(3);          // row 0 -> [true, false], row 1 -> [true]
+        var listType = new ListType(new Field("item", v.Data.DataType, true));
+        var list = new ListArray(listType, 2, offsets.Build(), v, ArrowBuffer.Empty, 0);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("l", listType, true)).Build();
+
+        var read = await RoundTrip(schema, [list], 2);
+
+        Assert.IsType<VariantType>(((ListType)read.Schema.GetFieldByName("l").DataType).ValueDataType);
+        var outList = Assert.IsType<ListArray>(read.Column(0));
+        var outVar = Assert.IsType<VariantArray>(outList.Values);
+        Assert.Equal(VTrue, outVar.GetValueBytes(0).ToArray());
+        Assert.Equal(VFalse, outVar.GetValueBytes(1).ToArray());
+        Assert.Equal(VTrue, outVar.GetValueBytes(2).ToArray());
+    }
+
+    [Fact]
+    public async Task VariantInsideMapValue_ReadsAsVariantArray()
+    {
+        // map<string, variant>: one row with entries {"a": true, "b": false}.
+        var keys = new StringArray.Builder().Append("a").Append("b").Build();
+        var vals = MakeVariants(VTrue, VFalse);
+        var keyField = new Field("key", StringType.Default, false);
+        var valueField = new Field("value", vals.Data.DataType, true);
+        var entryType = new StructType([keyField, valueField]);
+        var entries = new StructArray(entryType, 2, [keys, vals], ArrowBuffer.Empty, 0);
+        var offsets = new ArrowBuffer.Builder<int>();
+        offsets.Append(0).Append(2);
+        var mapType = new MapType(keyField, valueField, keySorted: false);
+        var map = new MapArray(mapType, 1, offsets.Build(), entries, ArrowBuffer.Empty, 0);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("m", mapType, true)).Build();
+
+        var read = await RoundTrip(schema, [map], 1);
+
+        var outMap = Assert.IsType<MapArray>(read.Column(0));
+        var outVar = Assert.IsType<VariantArray>(outMap.KeyValues.Fields[1]);
+        Assert.Equal(VTrue, outVar.GetValueBytes(0).ToArray());
+        Assert.Equal(VFalse, outVar.GetValueBytes(1).ToArray());
+    }
+
+    [Fact]
+    public async Task NoRegistry_LeavesNestedVariantAsStruct()
+    {
+        var v = MakeVariants(VTrue);
+        var st = new StructType([new Field("v", v.Data.DataType, true)]);
+        var s = new StructArray(st, 1, [v], ArrowBuffer.Empty, 0);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("s", st, true)).Build();
+
+        string path = Path.Combine(_tempDir, $"nested_noreg_{Guid.NewGuid():N}.parquet");
+        await using (var f = new LocalSequentialFile(path))
+        await using (var w = new ParquetFileWriter(f, ownsFile: false))
+        {
+            await w.WriteRowGroupAsync(new RecordBatch(schema, [s], 1));
+            await w.CloseAsync();
+        }
+        await using var rf = new LocalRandomAccessFile(path);
+        await using var r = new ParquetFileReader(rf, ownsFile: false); // no registry
+        var read = await r.ReadRowGroupAsync(0);
+
+        // Without a registry the nested group stays a bare struct — symmetric with the top-level
+        // behaviour, and the wrapper pass is skipped entirely.
+        var outStruct = Assert.IsType<StructArray>(read.Column(0));
+        Assert.IsNotType<VariantArray>(outStruct.Fields[0]);
+    }
+
     private static string? FindShreddedVariantDirectory()
     {
         var dir = AppContext.BaseDirectory;
