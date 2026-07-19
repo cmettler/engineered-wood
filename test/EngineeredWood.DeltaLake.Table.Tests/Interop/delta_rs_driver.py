@@ -3,13 +3,14 @@
 # Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 """delta-rs interop driver for the EngineeredWood Delta test suite.
 
-Invoked as:  python delta_rs_driver.py <command> <path-to-json-args-file>
+Invoked as:  python delta_rs_driver.py <command> <json-args-file> [json-result-file]
 
 Arguments arrive via a file rather than inline so the command line never contains JSON quoting --
 net472 has no ProcessStartInfo.ArgumentList, and hand-quoting embedded quotes for Win32 is a
 reliable source of bugs.
 
-Emits a single JSON object on stdout. Any failure is reported as
+Writes a single JSON object to the result file (or stdout if omitted); a file keeps the result
+clear of anything a subprocess prints. Any failure is reported as
 {"ok": false, "error": "..."} with exit code 0 so the C# side can assert on the
 message rather than on a process crash.
 
@@ -186,9 +187,20 @@ COMMANDS = {
 }
 
 
+def _emit(out_path, obj):
+    payload = json.dumps(obj, ensure_ascii=False, default=str)
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+    else:
+        sys.stdout.write(payload)
+
+
 def main():
+    out_path = sys.argv[3] if len(sys.argv) > 3 else None
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
-        print(json.dumps({"ok": False, "error": f"unknown command; expected one of {sorted(COMMANDS)}"}))
+        _emit(out_path, {"ok": False,
+                         "error": f"unknown command; expected one of {sorted(COMMANDS)}"})
         return 0
     if len(sys.argv) > 2:
         with open(sys.argv[2], "r", encoding="utf-8") as fh:
@@ -201,7 +213,7 @@ def main():
     except Exception as exc:  # reported, not raised -- C# asserts on the message
         result = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
                   "traceback": traceback.format_exc()}
-    sys.stdout.write(json.dumps(result, ensure_ascii=False))
+    _emit(out_path, result)
     return 0
 
 

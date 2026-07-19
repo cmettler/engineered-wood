@@ -136,10 +136,44 @@ Iceberg 241, Lance.Table 92 — all green on net10.0/net8.0, all TFMs build.
 **Known tier-1 blind spot**: EW declares column mapping with the legacy `minReader=2`/`minWriter=5`
 numbering. That is spec-legal, but delta-rs 1.6.2 supports only reader version 1 or 3-with-features
 and declines to open the table, so it cannot validate physical-name resolution — that needs tier 3
-(PySpark). `EwWritten_ColumnMapping_CommitShapeIsSpecCorrect_ReadBackNeedsTier3` pins the commit shape
-off-disk and asserts the rejection reason, so it will fail if delta-rs ever gains support. Worth
-considering separately: emitting v3/v7 with a `columnMapping` reader feature would make these tables
-readable by delta-rs and DuckDB too.
+(PySpark), which now covers it. `EwWritten_ColumnMapping_CommitShapeIsSpecCorrect_ReadBackNeedsTier3`
+pins the commit shape off-disk and asserts the rejection reason, so it will fail if delta-rs ever
+gains support. Worth considering separately: emitting v3/v7 with a `columnMapping` reader feature
+would make these tables readable by delta-rs and DuckDB too.
+
+## External validation — tier 3 (PySpark) landed 2026-07-19
+
+`Interop/spark_driver.py` + `Spark.cs` + `SparkInteropTests.cs` (6 tests), validated against
+pyspark 4.0.1 / delta-spark 4.0.0 — the pair PR #4 itself was validated against. Gated by
+`EW_REQUIRE_SPARK_INTEROP=1`. The shared process/JSON plumbing was extracted to `InteropDriver.cs`,
+which tier 1 now uses too.
+
+Tests deliberately do NOT duplicate tier 1 — each covers something delta-rs structurally cannot:
+column-mapping read-back (the tier-1 blind spot), `DESCRIBE DETAIL`, clustering-column resolution,
+Spark `OPTIMIZE` over an EW table, and a Spark-written deletion vector read by EW.
+
+**Finding: every clustered table EW wrote was rejected by Spark.**
+
+```
+DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH: Unable to operate on this table because the following
+table features are enabled in metadata but not listed in protocol: invariants
+```
+
+Table-features mode is all-or-nothing: at writer 7 there are no implicit capabilities left, so every
+feature the legacy version implied must be listed explicitly. `CreateAsync` escalates to writer 7 when
+clustering (or identityColumns, or timestampNtz) is present, but built its feature list from empty —
+dropping the `appendOnly`/`invariants` that writer 2 implied. `UpgradeProtocolForFeatures` already did
+this correctly for ALTER; creation did not. Fixed by capturing the legacy baseline versions before
+feature escalation and merging `LegacyWriterFeatures`/`LegacyReaderFeatures` in before the
+`ProtocolAction` is built. Slice 10's clustering interop never actually worked against OSS Delta.
+
+**Harness note — availability probing must check what the tier actually needs.** `import pyspark`
+succeeds on a machine with no JDK, so the first version of this tier went RED rather than no-op when
+run without `JAVA_HOME` — the exact failure the availability mechanism exists to prevent, in reverse.
+`Spark.Preflight()` now checks for a real JDK and (on Windows) `winutils.exe` before the Python probe,
+so a half-configured machine gets a precise reason instead of a JVM stack trace. Note also that
+`HADOOP_HOME` alone is insufficient on Windows: `hadoop.dll` must be on `PATH` or Hadoop throws
+`UnsatisfiedLinkError: NativeIO$Windows.access0`; `Spark.BuildEnvironment()` handles that for callers.
 
 ## Deferred follow-ups (do after the PR-landing work)
 
