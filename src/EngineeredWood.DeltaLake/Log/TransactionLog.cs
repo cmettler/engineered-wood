@@ -73,13 +73,18 @@ public sealed class TransactionLog
     }
 
     /// <summary>
-    /// Lists available commit versions in the log directory,
-    /// starting from <paramref name="startVersion"/>.
+    /// Lists available commit versions in the log directory, starting from
+    /// <paramref name="startVersion"/>, in ASCENDING order. The underlying directory listing's order is
+    /// filesystem-dependent (Windows/S3/ADLS list sorted; Linux readdir returns inode-hash order), and the
+    /// callers depend on ascending replay — snapshot reconciliation's latest-wins metadata/protocol,
+    /// timestamp resolution's monotonic early-break, the history view — so the versions are materialized
+    /// and sorted here (the log directory is bounded by the checkpoint interval).
     /// </summary>
     public async IAsyncEnumerable<long> ListVersionsAsync(
         long startVersion = 0,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        var versions = new List<long>();
         await foreach (var file in _fs.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
             .ConfigureAwait(false))
         {
@@ -88,8 +93,13 @@ public sealed class TransactionLog
                     Path.GetFileName(fileName), out long version) &&
                 version >= startVersion)
             {
-                yield return version;
+                versions.Add(version);
             }
+        }
+        versions.Sort();
+        foreach (long version in versions)
+        {
+            yield return version;
         }
     }
 
