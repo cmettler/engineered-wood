@@ -48,6 +48,7 @@ The buffered multi-statement surface (`Compute*` schema ALTERs, identity chainin
 | 2 | `b8e4fc6` | `DeltaTransaction` + `StartTransaction()` + the OCC commit loop + `DeltaTransactionTests` (4). |
 | 3 | `7964d07` | Auto-committers routed through the OCC loop: `DeleteAsync` and the blind-append `WriteAsync` now rebase-retry instead of throwing on any collision. OCC loop generalised to `CommitOccAsync`; `AutoCommitConcurrencyTests` (6) + a rebased-commit tier-3 Spark test. |
 | 4 | `3bfb9fb` | Appends + updates stageable on `DeltaTransaction` (`WriteAsync`/`UpdateAsync`), closing limitation 1. Extracted `ComputeWriteActionsAsync` (shared by `WriteCoreAsync` + txn append) and `ComputeUpdateActionsAsync` (shared by `UpdateAsync` + txn update); auto-committer `UpdateAsync` now also rebase-retries via `CommitOccAsync`. Operation-label tracking on the txn; `ValidateWritable(snapshot, isAppend)` shared gate. `DeltaTransactionTests` +5. |
+| 5 | `5a8445f` | Analyzable-predicate `DeleteAsync`/`UpdateAsync` overloads (`Expressions.Predicate`), closing limitation 3. The predicate becomes the operation's `ReadSet.Predicates`, so concurrentAppend is now precise (a concurrent add matching it conflicts, per isolation level); files that can't match are pruned from the read. `EngineeredWood.Expressions.Arrow` project ref added for the `ArrowRowEvaluator` row mask. `ExpressionPredicateTests` (6). |
 
 Entry points:
 
@@ -59,16 +60,21 @@ Entry points:
   `Serializable`. The two differ only on whether a concurrent blind append matching read predicates
   conflicts.
 - `src/EngineeredWood.DeltaLake.Table/DeltaTransaction.cs` — public; thin recorder of staged actions +
-  read-set. `ReadVersion`, `IsolationLevel`, `WriteAsync`, `DeleteAsync`, `UpdateAsync`, `CommitAsync`.
-  Accumulates `_dataActions` + `_removedPaths` + `_operations` (the last drives the commitInfo operation
-  label: single-op → that op, mixed → "WRITE"). Several ops can be staged on one transaction.
+  read-set. `ReadVersion`, `IsolationLevel`, `WriteAsync`, `DeleteAsync`/`UpdateAsync` (each with a
+  functional and an `Expressions.Predicate` overload), `CommitAsync`. Accumulates `_dataActions` +
+  `_removedPaths` + `_operations` + `_readPredicates` (the analyzable predicates → `ReadSet.Predicates`).
+  Several ops can be staged on one transaction; `_operations` drives the commitInfo label (single-op → that
+  op, mixed → "WRITE").
 - `src/EngineeredWood.DeltaLake.Table/DeltaTable.cs` — `StartTransaction()`, the internal
   `CommitTransactionAsync` (thin wrapper) → `CommitOccAsync` (the OCC loop), and the extracted compute
   halves each shared by an auto-committer and the transaction: `ComputeDeleteActionsAsync`,
   `ComputeWriteActionsAsync` (all write modes; the txn calls it with `Append` only), and
-  `ComputeUpdateActionsAsync`. `WriteCoreAsync` = validate + compute + `CommitWriteAsync` (append →
-  `CommitOccAsync`; overwrite family → single-attempt). `ValidateWritable(snapshot, isAppend)` is the
-  shared write-precondition gate (protocol + writer features), validated against the txn's base snapshot.
+  `ComputeUpdateActionsAsync` (the last two take an optional `prunePredicate` for stats-based file
+  pruning). `WriteCoreAsync` = validate + compute + `CommitWriteAsync` (append → `CommitOccAsync`;
+  overwrite family → single-attempt). `ValidateWritable(snapshot, isAppend)` is the shared
+  write-precondition gate (protocol + writer features), validated against the txn's base snapshot.
+  `MaskFor(Expressions.Predicate)` + the shared static `ArrowRowEvaluator` turn a predicate into the
+  row-mask delegate the compute halves consume.
 
 Design facts worth keeping:
 
@@ -91,12 +97,17 @@ Design facts worth keeping:
 2. **Row-tracking tables abort on rebase.** A rebased add's `baseRowId` would need recomputing against
    the advanced high-water mark. They still commit on an uncontended first attempt; on any rebase they
    abort with a clear message. Fail-safe.
-3. **concurrentAppend is inert for DELETE.** `DeleteAsync` takes a functional
-   `Func<RecordBatch, BooleanArray>` predicate, not an analyzable `Expressions.Predicate`, so the
-   transaction cannot feed a read predicate to `DeltaFilePruner`. `ReadSet.Predicates` is left empty
-   (NOT faked with `TruePredicate`, which would wrongly conflict disjoint deletes). Under the default
-   WriteSerializable this is moot. The checker already supports the predicate path (unit-tested); it
-   lights up for free once DELETE gains an expression-predicate overload.
+3. ~~**concurrentAppend is inert for DELETE.**~~ **CLOSED (step 5).** `DeleteAsync`/`UpdateAsync` now have
+   `Expressions.Predicate` overloads (functional overloads unchanged). The analyzable predicate is
+   evaluated to a row mask via `ArrowRowEvaluator` (new `EngineeredWood.Expressions.Arrow` project ref),
+   used to prune files that can't match, AND recorded in the transaction's `ReadSet.Predicates` — so a
+   concurrent add matching it conflicts (concurrentAppend), precise to the isolation level (blind append
+   exempt under WriteSerializable, examined under Serializable). Verified three ways in
+   `ExpressionPredicateTests`. **New constraint from this:** `ArrowRowEvaluator` only evaluates a limited
+   column-type set (bool / (u)int / float / double / string / binary) — a predicate over a
+   date/decimal/timestamp column throws `NotSupportedException` at row-eval time. `DeltaFilePruner` (stats
+   pruning) is independent and broader, so pruning may work where row-eval does not; the fix is to extend
+   the evaluator's type coverage.
 
 ## Remaining work, in suggested order
 
@@ -116,8 +127,12 @@ Design facts worth keeping:
    removed a file it rewrote. Auto-committer `UpdateAsync` gained rebase-retry (routed through
    `CommitOccAsync`) as a side benefit. `DeltaTransactionTests` +5. Still NOT stageable: overwrite modes
    (see limitation 1).
-3. **Expression-predicate DELETE/UPDATE overload** (closes limitation 3) — makes concurrentAppend
-   precise, and is the prerequisite for rebasing partition/dynamic overwrite (partition read-set).
+3. ~~**Expression-predicate DELETE/UPDATE overload**~~ **DONE (`5a8445f`).** Analyzable
+   `Expressions.Predicate` overloads of `DeleteAsync`/`UpdateAsync` (auto-committer + transaction), read
+   predicate recorded so concurrentAppend is precise. Remaining follow-ups it unlocks: (a) extend
+   `ArrowRowEvaluator` to date/decimal/timestamp columns (currently throws on them); (b) rebasing
+   partition/dynamic overwrite now has the predicate machinery it needed, but still needs the overwrite
+   read-set expressed as a partition predicate.
 4. **Layer 3 — row-level concurrency.** The Databricks extension. Largest remaining piece; needs
    row-tracking-through-rewrite in EW's own rewrite path (confirm master's state first — the write path
    assigns baseRowId per file but the copy-on-write *rewrite* path likely does not preserve original
