@@ -44,6 +44,25 @@ internal static class CompactionExecutor
         var targetSchema = SchemaConverter.ToArrowSchema(
             DeltaSchemaSerializer.Parse(snapshot.Metadata.SchemaString));
 
+        // Column mapping: the data files store PHYSICAL column names (both name and id mode), and the compacted
+        // file must keep them + re-stamp each column's parquet field_id — readers resolve by
+        // physicalName/field_id, so a compacted file without them reads as all-NULL. Widening therefore has to
+        // match on the physical-renamed target schema (the logical-named one matches nothing on disk, which
+        // silently skipped widening under mapping).
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        if (mappingMode != ColumnMappingMode.None)
+        {
+            var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+            var physFields = new List<Field>(targetSchema.FieldsList.Count);
+            foreach (var f in targetSchema.FieldsList)
+            {
+                physFields.Add(logicalToPhysical.TryGetValue(f.Name, out var p) && p != f.Name
+                    ? new Field(p, f.DataType, f.IsNullable)
+                    : f);
+            }
+            targetSchema = new Apache.Arrow.Schema(physFields, null);
+        }
+
         // Read all data from candidate files, widening types if needed
         var allBatches = new List<RecordBatch>();
         foreach (var addFile in candidates)
@@ -57,7 +76,24 @@ internal static class CompactionExecutor
                 cancellationToken: cancellationToken).ConfigureAwait(false))
             {
                 // Widen values from old files to match current schema
-                allBatches.Add(TypeWidening.ValueWidener.WidenBatch(batch, targetSchema));
+                var outBatch = TypeWidening.ValueWidener.WidenBatch(batch, targetSchema);
+                if (mappingMode != ColumnMappingMode.None)
+                {
+                    // Rebuild with a CLEAN schema (drop the reader-carried field metadata, e.g. the file's own
+                    // PARQUET:field_id) before re-stamping, then apply the mapping recursively so nested struct
+                    // children keep their physical names + ids too. The batch is already physical-named, so the
+                    // tolerant matching renames nothing — it only stamps the ids.
+                    var cleanFields = new List<Field>(outBatch.Schema.FieldsList.Count);
+                    foreach (var f in outBatch.Schema.FieldsList)
+                        cleanFields.Add(new Field(f.Name, f.DataType, f.IsNullable));
+                    var cleanArrays = new List<IArrowArray>(outBatch.ColumnCount);
+                    for (int c = 0; c < outBatch.ColumnCount; c++)
+                        cleanArrays.Add(outBatch.Column(c));
+                    outBatch = new RecordBatch(
+                        new Apache.Arrow.Schema(cleanFields, null), cleanArrays, outBatch.Length);
+                    outBatch = ColumnMappingRecursive.ToPhysical(outBatch, snapshot.Schema, mappingMode);
+                }
+                allBatches.Add(outBatch);
             }
         }
 

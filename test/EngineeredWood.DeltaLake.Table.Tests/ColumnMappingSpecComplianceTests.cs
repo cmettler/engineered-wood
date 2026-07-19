@@ -147,4 +147,58 @@ public class ColumnMappingSpecComplianceTests : IDisposable
         Assert.Equal(10L, ((Int64Array)readStruct.Fields[0]).GetValue(0));
         Assert.Equal("b", ((StringArray)readStruct.Fields[1]).GetString(1));
     }
+
+    // A compacted file must keep the physical names + field ids of its inputs — without them the OPTIMIZE
+    // output reads as all-NULL for a spec reader even though the pre-compaction files were fine.
+    [Theory]
+    [InlineData(ColumnMappingMode.Id)]
+    [InlineData(ColumnMappingMode.Name)]
+    public async Task Compaction_PreservesPhysicalNamesAndFieldIds(ColumnMappingMode mode)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = FlatSchema();
+        var options = new DeltaTableOptions { CheckpointInterval = 0 };
+
+        await using var table = await DeltaTable.CreateAsync(
+            fs, schema, options, columnMappingMode: mode);
+
+        for (int i = 0; i < 4; i++)
+        {
+            var ids = new Int64Array.Builder().Append(i).Build();
+            var values = new StringArray.Builder().Append($"v{i}").Build();
+            await table.WriteAsync([new RecordBatch(schema, [ids, values], 1)]);
+        }
+        Assert.Equal(4, table.CurrentSnapshot.FileCount);
+
+        var compacted = await table.CompactAsync(new CompactionOptions
+        {
+            MinFileSize = long.MaxValue,
+            TargetFileSize = long.MaxValue,
+        });
+        Assert.NotNull(compacted);
+        Assert.Equal(1, table.CurrentSnapshot.FileCount);
+
+        var expected = table.CurrentSnapshot.Schema.Fields
+            .Select(f => ColumnMapping.GetPhysicalName(f, mode))
+            .ToList();
+
+        var addFile = table.CurrentSnapshot.ActiveFiles.Values.Single();
+        await using var file = await fs.OpenReadAsync(DeltaPath.Decode(addFile.Path));
+        using var reader = new Parquet.ParquetFileReader(file, ownsFile: false);
+        var parquetSchema = await reader.GetSchemaAsync();
+
+        Assert.Equal(expected, parquetSchema.Root.Children.Select(c => c.Element.Name));
+        Assert.All(parquetSchema.Root.Children, c => Assert.True(c.Element.FieldId.HasValue));
+
+        // ...and the compacted table still reads back under the logical names, with all rows intact.
+        var rows = new List<long>();
+        await foreach (var b in table.ReadAllAsync())
+        {
+            Assert.Equal("id", b.Schema.FieldsList[0].Name);
+            var col = (Int64Array)b.Column(0);
+            for (int i = 0; i < b.Length; i++)
+                rows.Add(col.GetValue(i)!.Value);
+        }
+        Assert.Equal([0L, 1L, 2L, 3L], rows.OrderBy(x => x));
+    }
 }
