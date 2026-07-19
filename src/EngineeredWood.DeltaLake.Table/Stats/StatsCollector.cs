@@ -29,7 +29,9 @@ internal static class StatsCollector
         long totalRows = 0;
         var minValues = new Dictionary<string, object?>();
         var maxValues = new Dictionary<string, object?>();
-        var nullCounts = new Dictionary<string, long>();
+        // Values are long (a leaf) or a nested Dictionary<string, object> (a struct subtree) — the Delta
+        // stats JSON nests objects mirroring the schema.
+        var nullCounts = new Dictionary<string, object>();
 
         foreach (var batch in batches)
         {
@@ -43,12 +45,23 @@ internal static class StatsCollector
                 var field = batch.Schema.FieldsList[col];
                 var array = batch.Column(col);
 
-                // Sum null counts across batches
-                nullCounts.TryGetValue(field.Name, out long existing);
-                nullCounts[field.Name] = existing + array.NullCount;
+                if (array is StructArray structCol)
+                {
+                    // Nested stats: recurse into struct leaves (list/map subtrees carry no per-column stats).
+                    var nMin = GetOrAddNested(minValues, field.Name);
+                    var nMax = GetOrAddNested(maxValues, field.Name);
+                    var nNull = GetOrAddNestedCounts(nullCounts, field.Name);
+                    CollectStruct(structCol, allParentValid: structCol.NullCount == 0, nMin, nMax, nNull);
+                }
+                else
+                {
+                    // Sum null counts across batches
+                    long existing = nullCounts.TryGetValue(field.Name, out var ex) && ex is long l ? l : 0;
+                    nullCounts[field.Name] = existing + array.NullCount;
 
-                // Merge min/max across batches
-                CollectMinMax(field.Name, array, minValues, maxValues);
+                    // Merge min/max across batches
+                    CollectMinMax(field.Name, array, minValues, maxValues);
+                }
             }
         }
 
@@ -62,7 +75,7 @@ internal static class StatsCollector
         long numRecords,
         Dictionary<string, object?> minValues,
         Dictionary<string, object?> maxValues,
-        Dictionary<string, long> nullCounts)
+        Dictionary<string, object> nullCounts)
     {
         using var stream = new MemoryStream();
         using var writer = new Utf8JsonWriter(stream);
@@ -70,43 +83,159 @@ internal static class StatsCollector
         writer.WriteStartObject();
         writer.WriteNumber("numRecords", numRecords);
 
-        // Write minValues
+        // minValues / maxValues nest objects for struct subtrees. Long strings are truncated to a
+        // 32-char prefix on the min side; a truncated max gets its last incrementable char bumped so it
+        // stays an UPPER bound (omitted when impossible) — Spark parity, applied at every nesting level.
         writer.WritePropertyName("minValues");
-        writer.WriteStartObject();
-        foreach (var kvp in minValues)
-        {
-            if (kvp.Value is not null)
-            {
-                writer.WritePropertyName(kvp.Key);
-                WriteStatValue(writer, kvp.Value);
-            }
-        }
-        writer.WriteEndObject();
+        WriteBoundsObject(writer, minValues, isMax: false);
 
-        // Write maxValues
         writer.WritePropertyName("maxValues");
-        writer.WriteStartObject();
-        foreach (var kvp in maxValues)
-        {
-            if (kvp.Value is not null)
-            {
-                writer.WritePropertyName(kvp.Key);
-                WriteStatValue(writer, kvp.Value);
-            }
-        }
-        writer.WriteEndObject();
+        WriteBoundsObject(writer, maxValues, isMax: true);
 
-        // Write nullCount
+        // Write nullCount (nested objects for struct subtrees)
         writer.WritePropertyName("nullCount");
-        writer.WriteStartObject();
-        foreach (var kvp in nullCounts)
-            writer.WriteNumber(kvp.Key, kvp.Value);
-        writer.WriteEndObject();
+        WriteNullCountObject(writer, nullCounts);
 
         writer.WriteEndObject();
         writer.Flush();
 
         return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    private static Dictionary<string, object?> GetOrAddNested(
+        Dictionary<string, object?> parent, string key)
+    {
+        if (parent.TryGetValue(key, out var v) && v is Dictionary<string, object?> d)
+            return d;
+        var fresh = new Dictionary<string, object?>();
+        parent[key] = fresh;
+        return fresh;
+    }
+
+    private static Dictionary<string, object> GetOrAddNestedCounts(
+        Dictionary<string, object> parent, string key)
+    {
+        if (parent.TryGetValue(key, out var v) && v is Dictionary<string, object> d)
+            return d;
+        var fresh = new Dictionary<string, object>();
+        parent[key] = fresh;
+        return fresh;
+    }
+
+    /// <summary>
+    /// Recursive stats for a struct column's leaves. nullCount is EXACT (a row counts as null when the
+    /// parent row is null OR the child slot is null — exactness matters, IS NULL pruning relies on it).
+    /// min/max reuse the flat collectors over the child arrays; when the parent has nulls the child slot
+    /// of a parent-null row may hold an arbitrary value, which can only WIDEN the bounds — a superset
+    /// bound never wrongly skips a file, so it is prune-safe (same argument as deletion-vector stats).
+    /// </summary>
+    private static void CollectStruct(
+        StructArray st, bool allParentValid,
+        Dictionary<string, object?> minValues,
+        Dictionary<string, object?> maxValues,
+        Dictionary<string, object> nullCounts)
+    {
+        var structType = (Apache.Arrow.Types.StructType)st.Data.DataType;
+        int offset = st.Data.Offset;
+        for (int c = 0; c < st.Data.Children.Length && c < structType.Fields.Count; c++)
+        {
+            string childName = structType.Fields[c].Name;
+            var child = ArrowArrayFactory.BuildArray(st.Data.Children[c]);
+
+            // Exact per-row null count over the parent's logical rows (children do NOT incorporate the
+            // parent's offset — index at offset + r).
+            long nulls = 0;
+            for (int r = 0; r < st.Length; r++)
+            {
+                if ((!allParentValid && st.IsNull(r)) || child.IsNull(offset + r))
+                    nulls++;
+            }
+
+            if (child is StructArray nestedStruct)
+            {
+                var nMin = GetOrAddNested(minValues, childName);
+                var nMax = GetOrAddNested(maxValues, childName);
+                var nNull = GetOrAddNestedCounts(nullCounts, childName);
+                CollectStruct(nestedStruct, allParentValid && nestedStruct.NullCount == 0, nMin, nMax, nNull);
+            }
+            else
+            {
+                long existing = nullCounts.TryGetValue(childName, out var ex) && ex is long l ? l : 0;
+                nullCounts[childName] = existing + nulls;
+                CollectMinMax(childName, child, minValues, maxValues);
+            }
+        }
+    }
+
+    private static void WriteBoundsObject(
+        Utf8JsonWriter writer, Dictionary<string, object?> values, bool isMax)
+    {
+        writer.WriteStartObject();
+        foreach (var kvp in values)
+        {
+            object? value = kvp.Value;
+            if (value is Dictionary<string, object?> nested)
+            {
+                if (nested.Count == 0)
+                    continue;
+                writer.WritePropertyName(kvp.Key);
+                WriteBoundsObject(writer, nested, isMax);
+                continue;
+            }
+            if (value is string str && str.Length > StringStatMaxLength)
+            {
+                value = isMax ? (object?)TruncateMaxString(str) : str.Substring(0, StringStatMaxLength);
+            }
+            if (value is not null)
+            {
+                writer.WritePropertyName(kvp.Key);
+                WriteStatValue(writer, value);
+            }
+        }
+        writer.WriteEndObject();
+    }
+
+    private static void WriteNullCountObject(Utf8JsonWriter writer, Dictionary<string, object> counts)
+    {
+        writer.WriteStartObject();
+        foreach (var kvp in counts)
+        {
+            if (kvp.Value is Dictionary<string, object> nested)
+            {
+                if (nested.Count == 0)
+                    continue;
+                writer.WritePropertyName(kvp.Key);
+                WriteNullCountObject(writer, nested);
+            }
+            else if (kvp.Value is long n)
+            {
+                writer.WriteNumber(kvp.Key, n);
+            }
+        }
+        writer.WriteEndObject();
+    }
+
+    private const int StringStatMaxLength = 32;
+
+    /// <summary>
+    /// Truncates a max-side string stat to an upper bound of at most <see cref="StringStatMaxLength"/>
+    /// characters: the prefix with its last incrementable char bumped by one (skipping chars whose
+    /// increment would create a lone surrogate). Returns null when no char can be incremented — the
+    /// caller omits the stat (always safe).
+    /// </summary>
+    private static string? TruncateMaxString(string value)
+    {
+        for (int i = StringStatMaxLength - 1; i >= 0; i--)
+        {
+            char c = value[i];
+            if (c == char.MaxValue)
+                continue;
+            char next = (char)(c + 1);
+            if (next is >= '\ud800' and <= '\udfff')
+                continue; // incrementing into the surrogate range would produce invalid UTF-16
+            return value.Substring(0, i) + next;
+        }
+        return null;
     }
 
     private static void CollectMinMax(
