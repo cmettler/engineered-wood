@@ -44,6 +44,20 @@ deferred as refactor-/slice-6-coupled all landed once slice 6 supplied `AddColum
 - ~~Protocol-upgrade-on-ALTER~~ — `70d2384` (on `AddColumnAsync`; `SetSchemaAsync` still doesn't exist —
   see slice-6 leftovers).
 
+### Write-path refactor taken (`808b944`)
+
+`WriteCoreAsync` is now the single write path (append / overwrite / static partition overwrite / dynamic
+partition overwrite / repartition-on-overwrite). Taken **refactor-only**: the codec seam and the
+buffered-transaction + logical-rebase machinery were stripped out of the ported body, so slices 7 and 9 are
+still open decisions. A leakage check (`DataFileWriter|VariantTransport|CheckLogicalRebase|
+CommitDataFilesAsync`) over the Table project returns nothing.
+
+What this means for 7 and 9: the structural prerequisite is now in place, so both can be ported onto
+master's own `WriteCoreAsync` rather than requiring pr-4's whole `DeltaTable.cs`. Note pr-4's file is a
+superset of master's `DeltaTable.cs` work but its `CheckpointReader` (drops slice 3's
+`remove.deletionVector`) and `CompactionExecutor` (regresses slice 4's path encoding) are NOT — never take
+those wholesale.
+
 ### Strategic decision pending for the remainder (slices 7 and 9)
 
 Slices 1–6 are landed piecemeal and fully tested, so the "foundation-first vs piecemeal" question is now
@@ -57,16 +71,16 @@ only about 7–9 — and piecemeal has held up better than expected (slices 5 an
    a usable table history). A defensible stopping point.
 
 Remaining slices: 7 (pluggable codec seam — **STRATEGIC**, discuss project positioning first) and 9
-(row-level concurrency — **STRATEGIC**, most complex). Both want the refactor; everything separable from
-it has now landed. What remains of slice 8 is the OCC/conflict-checker material, which belongs with 9.
+(row-level concurrency — **STRATEGIC**, most complex). The refactor they wanted is now landed, so each can
+be taken on its own merits. What remains of slice 8 is the OCC/conflict-checker material, which belongs
+with 9. Variant support (`VariantTransport`, 316 lines) is an independent third thing the PR carries —
+master has no variant anywhere, so it is its own decision too.
 
 ### Slice-6 leftovers (deliberately not landed)
 
-- **Physical-keyed `add.partitionValues`.** The PR keys committed partition values by the PHYSICAL column
-  name under mapping (`metaData.partitionColumns` stays logical) — matched to Spark empirically. Not landed
-  because it ripples into `DeltaFilePruner` (looks up `PartitionValues` by logical name) and the read path's
-  partition-column injection; master is currently self-consistent with logical keys. Interop gap, not an EW
-  correctness bug. Land as one commit covering writer + pruner + read path together.
+- ~~Physical-keyed `add.partitionValues`~~ — landed with the write-path refactor (`808b944`). It became
+  cheap once the pruner learned dual logical|physical lookup (from the nested-stats work) and
+  `AddPartitionColumns` took the same map.
 - **`SetSchemaAsync`**, the nested-struct `AddFieldAsync` variant, and the buffered-transaction
   (deferred-commit) forms of the ALTER operations — the last are slice-9-coupled.
 - Compaction's non-mapping thread from the same PR diff (row-tracking id materialization, pluggable
