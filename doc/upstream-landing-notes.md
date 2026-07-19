@@ -167,6 +167,15 @@ this correctly for ALTER; creation did not. Fixed by capturing the legacy baseli
 feature escalation and merging `LegacyWriterFeatures`/`LegacyReaderFeatures` in before the
 `ProtocolAction` is built. Slice 10's clustering interop never actually worked against OSS Delta.
 
+**Performance — one JVM for the whole run.** `spark_driver.py serve` keeps a single SparkSession
+alive and takes commands over stdin; `InteropDriver(persistent: true)` drives it. Per-command process
+launch meant ~15s of JVM startup around ~1s of real work. The 12-test interop suite went from **87s to
+22s**, and the cost is now per-run rather than per-test, so adding tier-3 tests is roughly free.
+Protocol: request and result both travel as files (`os.replace` after write, so the file never exists
+half-written) with a `__EW_DONE__<name>` line on stdout purely as the wakeup — stdout carries no
+payload because Spark writes to it freely. Requests are serialized on a lock since one process means
+one stdin. delta-rs stays one-shot; it has no startup cost to amortize.
+
 **Harness note — availability probing must check what the tier actually needs.** `import pyspark`
 succeeds on a machine with no JDK, so the first version of this tier went RED rather than no-op when
 run without `JAVA_HOME` — the exact failure the availability mechanism exists to prevent, in reverse.

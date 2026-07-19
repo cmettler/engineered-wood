@@ -41,7 +41,10 @@ internal static class Spark
         // A cold start pays JVM boot plus Ivy resolution of the Delta jars on first ever run.
         timeoutMs: 600_000,
         environment: BuildEnvironment,
-        preflight: Preflight);
+        preflight: Preflight,
+        // One JVM for the whole test run instead of one per command. Startup dominates this tier:
+        // per-command it was ~15s of session startup around ~1s of actual work.
+        persistent: true);
 
     public static bool Available => Driver.Available;
 

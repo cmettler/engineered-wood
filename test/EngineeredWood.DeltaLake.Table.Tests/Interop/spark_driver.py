@@ -15,10 +15,23 @@ This is tier 3: the reference implementation. It is the only tier that exercises
 features, DESCRIBE DETAIL, clustering and OPTIMIZE, and the only one that reads
 column-mapped tables written with the legacy minReader=2/minWriter=5 numbering.
 
-COST: every invocation starts a JVM and a fresh SparkSession -- roughly 15-20 seconds before
-any work happens. Commands are therefore coarse-grained on purpose: each one does a whole
-scenario rather than a single operation, so a test needs exactly one session. Do not split a
-command into two just to make it read nicer.
+COST: starting a JVM and a SparkSession costs roughly 15-20 seconds. Two ways to run:
+
+  one-shot:  spark_driver.py <command> <args-file> [result-file]
+  serve:     spark_driver.py serve
+
+`serve` keeps ONE SparkSession alive and processes commands from stdin, which is what the test
+suite uses -- it turns a per-test 15-20s startup into a single one for the whole run. One-shot
+remains for manual debugging.
+
+Even so, commands are coarse-grained on purpose: each does a whole scenario rather than a
+single operation. Do not split a command into two just to make it read nicer.
+
+SERVE PROTOCOL. One request per stdin line: `<command> <args-file> <result-file>`. The result is
+written to `<result-file>.tmp` and then atomically renamed, so the file never exists in a partial
+state; a `__EW_DONE__<name>` marker then goes to the real stdout so the caller can stop waiting
+without polling. Anything Spark prints to stdout is noise the caller scans past -- which is
+exactly why the payload travels by file and only the wakeup goes through stdout.
 """
 import json
 import os
@@ -30,7 +43,20 @@ _real_stdout = sys.stdout
 sys.stdout = sys.stderr
 
 
+_SESSION = None
+
+
 def _spark():
+    """The process-wide SparkSession, created on first use.
+
+    Cached because serve mode's entire purpose is to pay JVM + session startup once. Tests are
+    isolated by using a distinct table directory each, not by a fresh session -- Delta's caches are
+    keyed by path, so a shared session cannot leak state between them.
+    """
+    global _SESSION
+    if _SESSION is not None:
+        return _SESSION
+
     from delta import configure_spark_with_delta_pip
     from pyspark.sql import SparkSession
 
@@ -45,7 +71,18 @@ def _spark():
     )
     spark = configure_spark_with_delta_pip(builder).getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
+    _SESSION = spark
     return spark
+
+
+def _shutdown():
+    global _SESSION
+    if _SESSION is not None:
+        try:
+            _SESSION.stop()
+        except Exception:
+            pass
+        _SESSION = None
 
 
 def _uri(path):
@@ -78,27 +115,21 @@ def cmd_probe(args):
     from importlib.metadata import version
     import pyspark
     spark = _spark()
-    try:
-        # `delta` has no __version__; the version lives in the delta-spark dist metadata.
-        return {"spark": spark.version, "delta_spark": version("delta-spark"),
-                "java_home": os.environ.get("JAVA_HOME"), "pyspark": pyspark.__version__}
-    finally:
-        spark.stop()
+    # `delta` has no __version__; the version lives in the delta-spark dist metadata.
+    return {"spark": spark.version, "delta_spark": version("delta-spark"),
+            "java_home": os.environ.get("JAVA_HOME"), "pyspark": pyspark.__version__}
 
 
 def cmd_read(args):
     """Read an EW-written table and report what Spark decoded, plus DESCRIBE DETAIL."""
     spark = _spark()
-    try:
-        df = spark.read.format("delta").load(_uri(args["path"]))
-        return {
-            "columns": list(df.columns),
-            "row_count": df.count(),
-            "rows": _rows(df),
-            "detail": _detail(spark, args["path"]),
-        }
-    finally:
-        spark.stop()
+    df = spark.read.format("delta").load(_uri(args["path"]))
+    return {
+        "columns": list(df.columns),
+        "row_count": df.count(),
+        "rows": _rows(df),
+        "detail": _detail(spark, args["path"]),
+    }
 
 
 def cmd_write(args):
@@ -109,25 +140,22 @@ def cmd_write(args):
     deletion-vector scenarios are driven without a second session.
     """
     spark = _spark()
-    try:
-        path = _uri(args["path"])
-        df = spark.createDataFrame(args["rows"], args["schema"])
-        writer = df.write.format("delta")
-        for k, v in (args.get("options") or {}).items():
-            writer = writer.option(k, v)
-        if args.get("partition_by"):
-            writer = writer.partitionBy(*args["partition_by"])
-        if args.get("cluster_by"):
-            writer = writer.clusterBy(*args["cluster_by"])
-        writer.mode(args.get("mode", "errorifexists")).save(path)
+    path = _uri(args["path"])
+    df = spark.createDataFrame(args["rows"], args["schema"])
+    writer = df.write.format("delta")
+    for k, v in (args.get("options") or {}).items():
+        writer = writer.option(k, v)
+    if args.get("partition_by"):
+        writer = writer.partitionBy(*args["partition_by"])
+    if args.get("cluster_by"):
+        writer = writer.clusterBy(*args["cluster_by"])
+    writer.mode(args.get("mode", "errorifexists")).save(path)
 
-        for stmt in args.get("sql") or []:
-            spark.sql(stmt.format(path=path))
+    for stmt in args.get("sql") or []:
+        spark.sql(stmt.format(path=path))
 
-        return {"detail": _detail(spark, args["path"]),
-                "rows": _rows(spark.read.format("delta").load(path))}
-    finally:
-        spark.stop()
+    return {"detail": _detail(spark, args["path"]),
+            "rows": _rows(spark.read.format("delta").load(path))}
 
 
 def cmd_sql(args):
@@ -137,19 +165,16 @@ def cmd_sql(args):
     way to test that EW's output is not merely readable but writable-through.
     """
     spark = _spark()
-    try:
-        path = _uri(args["path"])
-        results = []
-        for stmt in args["sql"]:
-            rendered = stmt.format(path=path)
-            out = spark.sql(rendered)
-            results.append({"sql": rendered,
-                            "rows": _rows(out) if out.columns else []})
-        df = spark.read.format("delta").load(path)
-        return {"statements": results, "rows": _rows(df), "row_count": df.count(),
-                "detail": _detail(spark, args["path"])}
-    finally:
-        spark.stop()
+    path = _uri(args["path"])
+    results = []
+    for stmt in args["sql"]:
+        rendered = stmt.format(path=path)
+        out = spark.sql(rendered)
+        results.append({"sql": rendered,
+                        "rows": _rows(out) if out.columns else []})
+    df = spark.read.format("delta").load(path)
+    return {"statements": results, "rows": _rows(df), "row_count": df.count(),
+            "detail": _detail(spark, args["path"])}
 
 
 COMMANDS = {
@@ -160,35 +185,85 @@ COMMANDS = {
 }
 
 
+DONE_MARKER = "__EW_DONE__"
+
+
 def _emit(out_path, obj):
     payload = json.dumps(obj, ensure_ascii=False, default=str)
-    if out_path:
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-    else:
+    if not out_path:
         _real_stdout.write(payload)
+        return
+
+    # Write-then-rename so the caller can treat the file's existence as "complete". A reader that
+    # catches the file mid-write would see truncated JSON, and the failure would look like a bug in
+    # whatever command happened to be running.
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(payload)
+    os.replace(tmp, out_path)
+
+
+def _run(command, args_path):
+    """Execute one command, converting any failure into a result object."""
+    try:
+        if command not in COMMANDS:
+            return {"ok": False, "error": f"unknown command; expected one of {sorted(COMMANDS)}"}
+        with open(args_path, "r", encoding="utf-8") as fh:
+            args = json.load(fh)
+        result = COMMANDS[command](args)
+        result.setdefault("ok", True)
+        return result
+    except Exception as exc:
+        # Spark stacks are enormous and the useful part is the innermost Delta/Java message.
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:4000],
+                "traceback": traceback.format_exc()[-4000:]}
+
+
+def _serve():
+    """Process commands from stdin against one long-lived SparkSession.
+
+    Never exits on a command failure: a bad command is a result, not a reason to tear down a
+    session the remaining tests still need. Only EOF or an explicit `shutdown` stops the loop.
+    """
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            if line == "shutdown":
+                break
+
+            parts = line.split("\t")
+            if len(parts) != 3:
+                # Cannot write a result file without knowing its path; report and carry on.
+                _real_stdout.write(f"{DONE_MARKER}<malformed>\n")
+                _real_stdout.flush()
+                continue
+
+            command, args_path, result_path = parts
+            _emit(result_path, _run(command, args_path))
+            # The result is already durable; this only tells the caller to stop waiting.
+            _real_stdout.write(f"{DONE_MARKER}{os.path.basename(result_path)}\n")
+            _real_stdout.flush()
+    finally:
+        _shutdown()
 
 
 def main():
-    out_path = sys.argv[3] if len(sys.argv) > 3 else None
-    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
-        _emit(out_path, {"ok": False,
-                         "error": f"unknown command; expected one of {sorted(COMMANDS)}"})
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        _serve()
         return 0
-    if len(sys.argv) > 2:
-        with open(sys.argv[2], "r", encoding="utf-8") as fh:
-            args = json.load(fh)
-    else:
-        args = {}
+
+    out_path = sys.argv[3] if len(sys.argv) > 3 else None
+    args_path = sys.argv[2] if len(sys.argv) > 2 else None
     try:
-        result = COMMANDS[sys.argv[1]](args)
-        result.setdefault("ok", True)
-    except Exception as exc:
-        # Spark stacks are enormous and the useful part is the innermost Delta/Java message.
-        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:4000],
-                  "traceback": traceback.format_exc()[-4000:]}
-    _emit(out_path, result)
-    return 0
+        if len(sys.argv) < 2 or not args_path:
+            _emit(out_path, {"ok": False, "error": "usage: <command> <args-file> [result-file]"})
+            return 0
+        _emit(out_path, _run(sys.argv[1], args_path))
+        return 0
+    finally:
+        _shutdown()
 
 
 if __name__ == "__main__":

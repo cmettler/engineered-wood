@@ -38,18 +38,23 @@ internal sealed class InteropDriver
     /// an error string when unmet and null when satisfied. Importing <c>pyspark</c> succeeds on a
     /// machine with no JDK, so without this the tier would go RED rather than no-op — the failure mode
     /// this whole availability mechanism exists to avoid.</param>
+    /// <param name="persistent">Keep ONE driver process alive and stream commands to it, instead of
+    /// launching a process per command. Only worth it when startup dominates: Spark pays 15-20s per
+    /// JVM, delta-rs pays nothing.</param>
     public InteropDriver(
         string scriptName,
         string probeExpression,
         string requireEnvVar,
         int timeoutMs,
         Func<IReadOnlyDictionary<string, string>>? environment = null,
-        Func<string?>? preflight = null)
+        Func<string?>? preflight = null,
+        bool persistent = false)
     {
         ScriptName = scriptName;
         RequireEnvVar = requireEnvVar;
         TimeoutMs = timeoutMs;
         Environment = environment;
+        Persistent = persistent;
         _probe = new Lazy<(string?, string?, string?)>(() =>
         {
             string? blocked = preflight?.Invoke();
@@ -64,6 +69,15 @@ internal sealed class InteropDriver
     private int TimeoutMs { get; }
 
     private Func<IReadOnlyDictionary<string, string>>? Environment { get; }
+
+    private bool Persistent { get; }
+
+    /// <summary>Marker the serve loop writes to stdout when a result file is complete.</summary>
+    private const string DoneMarker = "__EW_DONE__";
+
+    private readonly object _serverLock = new();
+
+    private Process? _server;
 
     public bool Available => _probe.Value.Exe is not null;
 
@@ -121,6 +135,9 @@ internal sealed class InteropDriver
 
         try
         {
+            if (Persistent)
+                return InvokeOnServer(driver, command, argsFile, resultFile);
+
             var psi = new ProcessStartInfo(_probe.Value.Exe!)
             {
                 Arguments = $"\"{driver}\" {command} \"{argsFile}\" \"{resultFile}\"",
@@ -163,6 +180,147 @@ internal sealed class InteropDriver
             try { File.Delete(argsFile); } catch { }
             try { File.Delete(resultFile); } catch { }
         }
+    }
+
+    /// <summary>
+    /// Sends one command to the long-lived driver process and waits for its result.
+    ///
+    /// <para>Serialized on <see cref="_serverLock"/>: one process, one stdin, one stdout, so exactly
+    /// one request may be in flight. Test classes can run in parallel under xUnit, and two
+    /// simultaneous writers would interleave into nonsense.</para>
+    /// </summary>
+    private JsonElement InvokeOnServer(string driver, string command, string argsFile, string resultFile)
+    {
+        lock (_serverLock)
+        {
+            var proc = EnsureServer(driver);
+
+            // Tab-separated: paths may contain spaces, but never tabs.
+            proc.StandardInput.WriteLine($"{command}\t{argsFile}\t{resultFile}");
+            proc.StandardInput.Flush();
+
+            string expected = DoneMarker + Path.GetFileName(resultFile);
+
+            // Contains, not equality: Spark may emit a partial line with no trailing newline, which
+            // would leave our marker appended to its text rather than alone on a line.
+            var wait = Task.Run(() =>
+            {
+                string? line;
+                while ((line = proc.StandardOutput.ReadLine()) is not null)
+                {
+                    if (line.Contains(expected, StringComparison.Ordinal))
+                        return true;
+                }
+
+                return false;
+            });
+
+            if (!wait.Wait(TimeoutMs))
+            {
+                StopServer();
+                throw new TimeoutException(
+                    $"{ScriptName} '{command}' timed out after {TimeoutMs / 1000}s; server restarted.");
+            }
+
+            if (!wait.GetAwaiter().GetResult())
+            {
+                string stderr = DrainedStderr;
+                StopServer();
+                throw new InvalidOperationException(
+                    $"{ScriptName} server exited while running '{command}'. "
+                    + $"stderr tail: {Tail(stderr, 2000)}");
+            }
+
+            if (!File.Exists(resultFile))
+            {
+                throw new InvalidOperationException(
+                    $"{ScriptName} '{command}' signalled completion but wrote no result file.");
+            }
+
+            return JsonDocument.Parse(File.ReadAllText(resultFile)).RootElement.Clone();
+        }
+    }
+
+    /// <summary>Starts the serve-mode process, or returns the running one. Caller holds the lock.</summary>
+    private Process EnsureServer(string driver)
+    {
+        if (_server is { HasExited: false })
+            return _server;
+
+        _server = null;
+        _stderr.Clear();
+
+        var psi = new ProcessStartInfo(_probe.Value.Exe!)
+        {
+            Arguments = $"\"{driver}\" serve",
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+        };
+        psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+        // Python buffers stdout when it is a pipe; the done-marker would sit in that buffer forever.
+        psi.EnvironmentVariables["PYTHONUNBUFFERED"] = "1";
+        foreach (var kvp in Environment?.Invoke() ?? new Dictionary<string, string>())
+            psi.EnvironmentVariables[kvp.Key] = kvp.Value;
+
+        var proc = Process.Start(psi)!;
+
+        // Drain stderr continuously: Spark writes far more than the pipe buffer holds, and a full
+        // pipe would block the driver mid-command.
+        proc.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data is null)
+                return;
+            lock (_stderr)
+            {
+                _stderr.AppendLine(e.Data);
+                if (_stderr.Length > 64 * 1024)
+                    _stderr.Remove(0, _stderr.Length - 32 * 1024);
+            }
+        };
+        proc.BeginErrorReadLine();
+
+        _server = proc;
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => StopServer();
+        return proc;
+    }
+
+    private void StopServer()
+    {
+        var proc = _server;
+        _server = null;
+        if (proc is null)
+            return;
+
+        try
+        {
+            if (!proc.HasExited)
+            {
+                proc.StandardInput.WriteLine("shutdown");
+                proc.StandardInput.Flush();
+                if (!proc.WaitForExit(15_000))
+                    proc.Kill();
+            }
+        }
+        catch
+        {
+            try { proc.Kill(); } catch { }
+        }
+        finally
+        {
+            proc.Dispose();
+        }
+    }
+
+    private readonly StringBuilder _stderr = new();
+
+    private string DrainedStderr
+    {
+        get { lock (_stderr) { return _stderr.ToString(); } }
     }
 
     private static string Tail(string s, int max) =>
