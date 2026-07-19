@@ -76,12 +76,11 @@ reads, Time64, nested stats), 9 (row-level concurrency — **STRATEGIC**, most c
 
 ### Slice-8 leftovers (deliberately not landed)
 
-- **Decimal reads always surfacing Decimal128/256.** The PR drops the narrow Decimal32/Decimal64 Arrow
-  types entirely — the rationale is that C-data-interface consumers (DuckDB) misread them, the exported
-  format string being taken as 128-bit over a 4/8-byte buffer. That's real, but engineered-wood added
-  Decimal32/64 support deliberately, and the change rewrites four `DecimalReadTests`. **A fidelity
-  trade-off for Curt to decide, not a straight bug fix.** If adopted, it's a ~15-line change to
-  `ArrowSchemaConverter.MakeDecimalType` plus the test updates.
+- ~~Decimal reads always surfacing Decimal128/256~~ — **RESOLVED** as an option (`e0567cb`), not a
+  behaviour change. The PR dropped the narrow Decimal32/Decimal64 Arrow types outright; instead
+  `ParquetReadOptions.DecimalOutput` (`DecimalOutputKind.Default` | `.Decimal128`) makes the widening the
+  caller's choice, so C-data-interface consumers get what they need without costing everyone else the
+  physical-width fidelity. Delta callers reach it via `DeltaTableOptions.ParquetReadOptions`.
 - **`GetHistoryAsync`** and the always-on `commitInfo` on every commit path (OPTIMIZE's `operation:
   OPTIMIZE`, VACUUM's `VACUUM START`/`VACUUM END` pair). Independent of the refactor; worth landing, just
   not reached. Note `CompactionExecutor`'s commitInfo is a prerequisite for plain-table timestamp travel
