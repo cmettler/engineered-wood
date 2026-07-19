@@ -123,17 +123,25 @@ public sealed class S3TableFileSystem : ITableFileSystem
         string source = Resolve(sourcePath);
         string target = Resolve(targetPath);
 
+        // Conditional-write primitive: read the source and PUT the target with If-None-Match:"*"
+        // ("destination must not exist" — 412 Precondition Failed when it does). S3's documented
+        // conditional writes cover PutObject/CompleteMultipartUpload, NOT CopyObject: a CopyObject
+        // carrying IfNoneMatch is SILENTLY UNGUARDED on at least MinIO (probed — the copy succeeds over
+        // an existing target), so the previous copy-based form gave no commit safety. Rename targets
+        // here are small commit files, so read+put costs nothing.
+        using var got = await _client.GetObjectAsync(_bucket, source, cancellationToken)
+            .ConfigureAwait(false);
+        using var buffer = new MemoryStream();
+        await got.ResponseStream.CopyToAsync(buffer, 81920, cancellationToken).ConfigureAwait(false);
+        buffer.Position = 0;
         try
         {
-            // IfNoneMatch = "*" means "destination must not exist"; S3 enforces this
-            // atomically and fails with 412 Precondition Failed if the target is present.
-            await _client.CopyObjectAsync(
-                new CopyObjectRequest
+            await _client.PutObjectAsync(
+                new PutObjectRequest
                 {
-                    SourceBucket = _bucket,
-                    SourceKey = source,
-                    DestinationBucket = _bucket,
-                    DestinationKey = target,
+                    BucketName = _bucket,
+                    Key = target,
+                    InputStream = buffer,
                     IfNoneMatch = "*",
                 },
                 cancellationToken).ConfigureAwait(false);
