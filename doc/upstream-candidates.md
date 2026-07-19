@@ -318,6 +318,11 @@ granularity), and v2 goes past Databricks. Opt-in per call; default behavior byt
   `ClusteredTableTests` now 6 (adds mapped-create physical-name pin + unknown-column throw); validated
   live — Spark `DESCRIBE DETAIL` shows the logical clusteringColumns and `OPTIMIZE` runs its clustering
   strategy on a table created here with name-mode mapping.
+- **Partitioning guard**: `CreateAsync` THROWS when `clusteringColumns` and `partitionColumns` are both
+  supplied — liquid clustering and partitioning are mutually exclusive (Spark's `CLUSTER BY` REPLACES
+  `PARTITIONED BY`; a table carrying both puts readers' clustering-info resolution in undefined —
+  observed `None.get` — territory). A partitioned table can still be physically sorted at write time;
+  it just must not DECLARE clustering. `ClusteredTableTests` 8.
 - **Rewrite-commit seam**: `CommitDataFilesAsync` gained `dataChange` (default true) + `clusteringProvider`
   — a clustering OPTIMIZE commits Overwrite-shaped with `dataChange=false` on removes AND adds (CDF
   readers exclude it; spec-legal on appendOnly — `HonorWriterFeatures` treats a `dataChange=false` commit

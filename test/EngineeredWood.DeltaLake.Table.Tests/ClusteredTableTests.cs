@@ -204,6 +204,21 @@ public class ClusteredTableTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_ClusteringPlusPartitioning_Throws()
+    {
+        // Liquid clustering and partitioning are mutually exclusive (Spark's CLUSTER BY REPLACES
+        // PARTITIONED BY) — declaring both would put readers' clustering-info paths in undefined territory.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("region", StringType.Default, true))
+            .Field(new Field("id", Int64Type.Default, true))
+            .Build();
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema,
+            partitionColumns: ["region"], clusteringColumns: ["id"]));
+        Assert.Contains("mutually exclusive", ex.Message);
+    }
+
+    [Fact]
     public async Task CreateAsync_WithUnknownClusteringColumn_Throws()
     {
         var schema = new Apache.Arrow.Schema.Builder()

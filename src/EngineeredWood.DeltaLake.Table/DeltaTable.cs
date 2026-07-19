@@ -108,6 +108,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         options ??= DeltaTableOptions.Default;
         var log = new TransactionLog(fileSystem);
 
+        // Liquid clustering and partitioning are mutually exclusive (Spark's CLUSTER BY REPLACES
+        // PARTITIONED BY; no engine creates a table carrying both, so readers' clustering-info paths are
+        // undefined on the combination). A partitioned table can be SORTED at write time — it just must
+        // not DECLARE the clustering.
+        if (clusteringColumns is { Count: > 0 } && partitionColumns is { Count: > 0 })
+            throw new DeltaFormatException(
+                "Liquid clustering and partitioning are mutually exclusive — a partitioned table cannot "
+                + "declare clustering columns.");
+
         // Check that the table doesn't already exist
         long latestVersion = await log.GetLatestVersionAsync(cancellationToken)
             .ConfigureAwait(false);
