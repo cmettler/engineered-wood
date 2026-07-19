@@ -290,7 +290,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             ColumnOrders = ColumnOrderBuilder.Build(_parquetSchema!, _options.FloatColumnOrder),
         };
 
+#pragma warning disable EWPARQUET0002 // Honoring the caller's opt-in; the experimental signal lives on the option itself.
         byte[] footerBytes = MetadataEncoder.EncodeFileMetaData(fileMetaData, writePathInSchema: !_options.OmitPathInSchema);
+#pragma warning restore EWPARQUET0002
         await _file.WriteAsync(footerBytes, cancellationToken).ConfigureAwait(false);
 
         var footerLengthBytes = new byte[4];

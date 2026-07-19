@@ -1,4 +1,4 @@
-// Copyright (c) Curt Hagenlocher. All rights reserved.
+﻿// Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
@@ -784,7 +784,6 @@ public class ParquetFileWriterTests : IDisposable
         var options = new ParquetWriteOptions
         {
             Compression = CompressionCodec.Uncompressed,
-            OmitPathInSchema = false, // ParquetSharp requires path_in_schema
         };
 
         var categories = new[] { "cat_a", "cat_b", "cat_c" };
@@ -1031,7 +1030,6 @@ public class ParquetFileWriterTests : IDisposable
         var options = new ParquetWriteOptions
         {
             Compression = CompressionCodec.Uncompressed,
-            OmitPathInSchema = false, // ParquetSharp requires path_in_schema
         };
 
         var schema = new Apache.Arrow.Schema.Builder()
@@ -1721,7 +1719,7 @@ public class ParquetFileWriterTests : IDisposable
     public async Task RoundTrip_NestedStructAndList_OmitPathInSchema()
     {
         // Verifies that we can write a nested schema with path_in_schema omitted
-        // (the new default) and still round-trip the data correctly. The reader
+        // (opt-in only — see EWPARQUET0002) and still round-trip the data correctly. The reader
         // matches columns to the schema by ordinal position, so the missing field
         // should not affect any value, definition level, or repetition level.
         string path = TempPath("nested_no_path_in_schema.parquet");
@@ -1754,8 +1752,12 @@ public class ParquetFileWriterTests : IDisposable
         var batch = new RecordBatch(schema, [structArray, listArray], 3);
 
         // Default options omit path_in_schema.
+#pragma warning disable EWPARQUET0002 // This test exists specifically to cover the opt-in omission.
+        var omitOptions = new ParquetWriteOptions { OmitPathInSchema = true };
+#pragma warning restore EWPARQUET0002
+
         await using (var file = new LocalSequentialFile(path))
-        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, omitOptions))
         {
             await writer.WriteRowGroupAsync(batch);
             await writer.CloseAsync();

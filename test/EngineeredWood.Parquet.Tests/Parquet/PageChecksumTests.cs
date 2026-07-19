@@ -1,4 +1,4 @@
-// Copyright (c) Curt Hagenlocher. All rights reserved.
+﻿// Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using EngineeredWood.IO.Local;
@@ -191,7 +191,6 @@ public class PageChecksumTests
             await using (var writer = new ParquetFileWriter(file, ownsFile: false, new ParquetWriteOptions
             {
                 PageChecksumEnabled = true,
-                OmitPathInSchema = false, // ParquetSharp requires path_in_schema
             }))
             {
                 await writer.WriteRowGroupAsync(batch);

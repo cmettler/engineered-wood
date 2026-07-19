@@ -375,7 +375,9 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         };
 
         // Encode footer to Thrift
+#pragma warning disable EWPARQUET0002 // Honoring the caller's opt-in; the experimental signal lives on the option itself.
         byte[] footerBytes = MetadataEncoder.EncodeFileMetaData(fileMetaData, writePathInSchema: !_options.OmitPathInSchema);
+#pragma warning restore EWPARQUET0002
 
         // Write footer
         await _file.WriteAsync(footerBytes, cancellationToken).ConfigureAwait(false);

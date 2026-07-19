@@ -1,4 +1,4 @@
-// Copyright (c) Curt Hagenlocher. All rights reserved.
+﻿// Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
@@ -318,7 +318,6 @@ public class PrimitivesBenchmarks
         // so all readers see the same shape (default would split into 10× 1M groups).
         var options = new ParquetWriteOptions
         {
-            OmitPathInSchema = false,
             RowGroupMaxRows = RowCount,
         };
         await using var file = new LocalSequentialFile(path);

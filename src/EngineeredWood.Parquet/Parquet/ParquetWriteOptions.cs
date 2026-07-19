@@ -217,14 +217,23 @@ public sealed record ParquetWriteOptions
     public int BloomFilterMaxBytes { get; init; } = 1024 * 1024;
 
     /// <summary>
-    /// Whether to omit the <c>path_in_schema</c> field from each column chunk's
-    /// metadata. The Parquet spec currently describes the field as required, but
-    /// the row group columns are matched to the schema by ordinal position, so the
-    /// field is redundant — and an in-progress spec change makes it optional.
-    /// Omitting it shrinks the file footer, especially for wide schemas with deep
-    /// nesting. Default is <see langword="true"/>.
+    /// <para>Whether to omit the <c>path_in_schema</c> field from each column chunk's metadata.
+    /// Default is <see langword="false"/> — the field IS written.</para>
+    ///
+    /// <para><b>Setting this to <see langword="true"/> produces files that no other Parquet
+    /// implementation can read.</b> <c>path_in_schema</c> is required by the current Parquet spec.
+    /// Although row group columns are matched to the schema by ordinal position (making the field
+    /// redundant in principle) and an in-progress spec change would make it optional, that change is
+    /// not ratified. Readers in the field — pyarrow, ParquetSharp, delta-kernel-rs — fail to
+    /// deserialize the thrift footer entirely, reporting the file as corrupt rather than as using an
+    /// unsupported feature.</para>
+    ///
+    /// <para>EngineeredWood's own reader tolerates the omission, so a round-trip through this library
+    /// will not detect the incompatibility. Only enable this for size experiments on files that stay
+    /// inside EngineeredWood.</para>
     /// </summary>
-    public bool OmitPathInSchema { get; init; } = true;
+    [Experimental("EWPARQUET0002")]
+    public bool OmitPathInSchema { get; init; }
 
     /// <summary>
     /// Sort order recorded for FLOAT/DOUBLE columns in the footer's
