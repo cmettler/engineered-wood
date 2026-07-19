@@ -26,6 +26,9 @@ change diverges from the original PR.
 | 7 (PARTIAL) — pluggable codec seam | `9302723` | `IDataFileWriter` + `IDataFileReader` on `DeltaTableOptions`, both default-null. Wired into the write path, the CoW UPDATE rewrite, compaction, and `ReadFileAsync` (via the extracted `ProcessFileBatchesAsync`). `CleanField` preserves `ARROW:extension:*`. **`IDataFileRewriter` NOT landed — see below.** |
 | 8 (PARTIAL) — misc reader/DML correctness | `adc3b44`, `8cbf8d2`, `e025880`, `ebeb841`, `e83a232`, `d79abc7`, `1883f51`, `7bf3f6c`, `e0567cb`, `4cd1f06` | Thrift wire-type guards (+ALP test gating; Parquet 585/585, was 573). Empty-page snappy stream. ListVersions ascending. S3 conditional rename. Row-filter type coverage. Nested stats end-to-end. TIME→Time64. DV-qualified removes + compaction DV exclusion. `DecimalOutputKind` read option. Always-on commitInfo + `GetHistoryAsync`. **See slice-8 leftovers below.** |
 
+| 10 — clustered (liquid) table interop | `093185f` | Allowlist the `clustering` writer feature (every write to a Databricks/Fabric CLUSTER BY table failed before), `CreateAsync(clusteringColumns)`, `SetClusteringColumnsAsync`, clustering/partitioning mutual exclusion, `UpgradeProtocolForWriterFeatures`. **Domain stores PHYSICAL names** (OSS Delta `None.get`-crashes otherwise). Interop only — writing clustered layouts is not implemented. |
+| 11 — partitioned compaction (bugfix) | `e26a88f` | Candidates group by partition; each group compacts into its own Hive dir; target schema excludes partition columns. **Pre-existing data-corruption bug** (reproduced at `8d7ef32`): merged across partitions, stamped every row with `candidates[0]`, and threw IndexOutOfRange in the common shape. |
+
 Verification standard for each: builds on net10.0/net8.0/netstandard2.0, Delta suites green on both
 TFMs. GOTCHA: `parquet-testing` is a git submodule — worktrees don't auto-populate it, and without it
 ~98 Parquet reader tests spuriously fail (`git submodule update --init parquet-testing`, or test in
@@ -59,57 +62,45 @@ superset of master's `DeltaTable.cs` work but its `CheckpointReader` (drops slic
 `remove.deletionVector`) and `CompactionExecutor` (regresses slice 4's path encoding) are NOT — never take
 those wholesale.
 
-### Slice-7 leftover (deliberately not landed)
+### The seam question — REOPENED (2026-07-19)
 
-- **`IDataFileRewriter`** — the third seam interface. Its `ReadRewriteAsync` contract requires the transient
-  rowid (`(fileOrdinal << 40) | position`, so the host can match rows for an UPDATE substitution) and the
-  `RowTrackingRewrite` record for materializing ids through a rewrite. Both come from the "row tracking
-  preserved through every rewrite" thread that was excluded from slice 8. Shipping the interface without
-  them would be public surface the implementation cannot honour. Land the two together.
+The slice-7 rationale I first recorded was **wrong**, and the corrected version changes the decision:
 
-### Strategic decision pending for the remainder (slice 9)
+- Master's **Parquet** layer already supports VARIANT (opt-in `arrow.parquet.variant` extension,
+  `VariantArrayRoundTripTests`). `doc/known-issues.md` still says otherwise — **that file is stale**.
+- The PR's variant support runs through **engineered-wood's own codec**, not DuckDB's:
+  `VariantTransport`'s comment says *"this is what lets the BUILT-IN parquet codec read and write variant
+  columns"*. The seam is NOT what makes VARIANT work.
+- The actual gap is a **registration** gap: VARIANT decoding is gated on an `ExtensionTypeRegistry`, and the
+  Delta rewrite path supplies none — so its reader sees a VARIANT-annotated group as a bare struct and a
+  rewrite strips the annotation. That is what `ThrowIfVariantRewrite` guards, and why setting BOTH seams
+  lifts the guard.
+- **Therefore**: registering the variant extension on the Delta layer's internal reader may close the same
+  hole with no new public API. Unverified — shredded reassembly may need more.
+- The PR ships the seam with **no implementations and no tests anywhere**; the real consumer is the
+  out-of-tree `mssql_net`/ArrowNet DuckDB extension. The `CodecSeamTests` on master are the first tests it
+  has ever had.
 
-Slices 1–6 are landed piecemeal and fully tested, so the "foundation-first vs piecemeal" question is now
-only about 7–9 — and piecemeal has held up better than expected (slices 5 and 6 both landed without the
-`WriteCoreAsync` refactor). Options:
+Curt has asked cmettler for more detail. Working assumption: **the seam comes out** once the variant
+extension is registered. `9302723` is a clean single commit to revert; the `ProcessFileBatchesAsync`
+extraction underneath is behaviour-preserving and should be KEPT either way.
 
-1. **Foundation-first for 7+9** — the codec seam and row-level concurrency are the two that genuinely
-   want pr-4's `WriteCoreAsync` refactor underneath. Take it as a base commit before those.
-2. **Pause** — slices 1–6 plus slice 8's independent fixes are a coherent, high-value, fully-tested set
-   (spec/interop bug fixes, safe writes to Spark tables, spec-correct column mapping + schema evolution,
-   a usable table history). A defensible stopping point.
+Two contract gaps found while auditing (fix or delete with the seam): the writer's `relativePath` never
+states whether it is URL-encoded (call site passes the RAW name; the reader's doc says "URL-decoded" —
+the asymmetry invites the wrong guess), and directory creation for partition subdirs is an unstated
+obligation.
 
-Remaining: slice 9 (row-level concurrency — **STRATEGIC**, most complex), which also absorbs slice 8's
-OCC/conflict-checker material and the row-tracking-through-rewrite thread that `IDataFileRewriter` needs.
-Variant support (`VariantTransport`, 316 lines) is an independent third thing the PR carries — master has
-no variant anywhere, so it remains its own decision.
+### Remaining work
 
-### Slice-6 leftovers (deliberately not landed)
-
-- ~~Physical-keyed `add.partitionValues`~~ — landed with the write-path refactor (`808b944`). It became
-  cheap once the pruner learned dual logical|physical lookup (from the nested-stats work) and
-  `AddPartitionColumns` took the same map.
-- **`SetSchemaAsync`**, the nested-struct `AddFieldAsync` variant, and the buffered-transaction
-  (deferred-commit) forms of the ALTER operations — the last are slice-9-coupled.
-- Compaction's non-mapping thread from the same PR diff (row-tracking id materialization, pluggable
-  reader/writer) belongs to slices 7/9. The DV exclusion landed in slice 8 (`7bf3f6c`), the HWM action in
-  slice 5 (`8e3fa8d`).
-
-### Slice-8 leftovers (deliberately not landed)
-
-- ~~Decimal reads always surfacing Decimal128/256~~ — **RESOLVED** as an option (`e0567cb`), not a
-  behaviour change. The PR dropped the narrow Decimal32/Decimal64 Arrow types outright; instead
-  `ParquetReadOptions.DecimalOutput` (`DecimalOutputKind.Default` | `.Decimal128`) makes the widening the
-  caller's choice, so C-data-interface consumers get what they need without costing everyone else the
-  physical-width fidelity. Delta callers reach it via `DeltaTableOptions.ParquetReadOptions`.
-- ~~`GetHistoryAsync` and the always-on `commitInfo`~~ — landed (`4cd1f06`), covering OPTIMIZE, the VACUUM
-  `START`/`END` pair, and CREATE TABLE (the last is beyond the PR — version 0 was left as the only silent
-  commit otherwise). Plain-table timestamp time travel now works.
-- **OCC retry-safe writes / `DeltaConflictException` plumbing** — entangled with slice 9's conflict
-  checker; land with it.
-- Everything the PR files under slice 8 that is really slice 9: logical rebase (`CheckLogicalRebaseAsync`),
-  the buffered-transaction seams (`WriteDataFilesAsync`/`CommitDataFilesAsync`/the `Compute*` family),
-  repartition-on-overwrite, and row-tracking preservation through every rewrite.
+1. **Variant**: register the extension on the Delta layer's reader; verify the rewrite gap closes; then
+   revert `9302723` (keeping `ProcessFileBatchesAsync`). If it does NOT close, the seam earns its place.
+2. **`VariantTransport`** (~316 lines) — shredded read/write at the Delta layer. Independent of the seam.
+3. **Slice 9** (row-level concurrency — **STRATEGIC**) — absorbs slice 8's OCC/conflict-checker material.
+4. **`IDataFileRewriter`** + row-tracking-through-rewrite — only if the seam survives (1).
+5. **Clustering bits coupled to `CommitDataFilesAsync`** — `dataChange`/`clusteringProvider` params and
+   `WrittenDataFile.Tags` -> `add.tags`. Need the buffered-transaction API from slice 9.
+6. **Stale `doc/known-issues.md`** — the VARIANT entry is wrong; the writer-feature table needs
+   `clustering` and `variantType` corrected too.
 
 ## Deferred follow-ups (do after the PR-landing work)
 
