@@ -22,6 +22,7 @@ change diverges from the original PR.
 | 3 — Spec checkpoint content + tombstone DVs | `b41f5ad` | Preserve add.deletionVector/baseRowId/features/config, NULLABLE action structs, retained tombstones. **Added `remove.deletionVector` round-trip** beyond the PR. Row-tracking HWM reconciliation deliberately excluded (deferred to slice 5). |
 | 4 — Spec path encoding (`DeltaPath`) | `74bc1aa` | Hive-escaped partition dirs + URL-encoded `add.path`, decoded at every read site + vacuum. Hand-ported cross-cutting wiring. **See non-ASCII follow-up below.** |
 | 5 (PARTIAL) — writer-feature enforcement | `cc8d6fe`, `c1b1474` | `cc8d6fe`: ToArrowField preserves field metadata (PR #21, prerequisite). `c1b1474`: allowlist appendOnly/invariants/checkConstraints/generatedColumns + `HonorWriterFeatures` on Write/Delete/Update. Lets EW write to Spark writer-v7 tables safely. **Did NOT allowlist variantType/rowTracking** (need later slices). |
+| 6 — column mapping | `aa3f0e2`, `7a327f0`, `4754a72` | `aa3f0e2`: physical names in BOTH modes + new `ColumnMappingRecursive.ToPhysical/ToLogical` (nested struct children) + numeric `delta.columnMapping.id`. `7a327f0`: compaction re-stamps field ids & widens against the physical-named target schema. `4754a72`: `AddColumnAsync`/`RenameColumnAsync`/`DropColumnAsync` metadata-only + `SchemaEvolution.BackfillMissingColumns` read-path reconcile. **See slice-6 leftovers below.** |
 
 Verification standard for each: builds on net10.0/net8.0/netstandard2.0, Delta suites green on both
 TFMs. GOTCHA: `parquet-testing` is a git submodule — worktrees don't auto-populate it, and without it
@@ -40,8 +41,9 @@ The remaining slice-5 pieces were deferred because they're refactor-/slice-6-cou
   id-assigning commit) + the `SnapshotBuilder.Build` `Max(ComputeHighWaterMark, TryReadHighWaterMark+1)`
   reconciliation. `RowTrackingConfig.TryReadHighWaterMark`/`BuildHighWaterMarkAction` are PR additions
   NOT yet landed.
-- **Protocol-upgrade-on-ALTER** (AddColumn/SetSchema emit a protocol upgrade) — **blocked on slice 6**
-  (`AddColumnAsync`/`SetSchemaAsync` don't exist on master).
+- **Protocol-upgrade-on-ALTER** (AddColumn/SetSchema emit a protocol upgrade) — **UNBLOCKED** as of slice 6:
+  `AddColumnAsync` now exists (`4754a72`), so `UpgradeProtocolForFeatures` + `RequiredSchemaFeatures` can land
+  next. (`SetSchemaAsync` still doesn't exist — see slice-6 leftovers.)
 
 ### Strategic decision pending for the remainder (slice-5-rest + 6–9)
 
@@ -52,10 +54,21 @@ The remaining slice-5 pieces were deferred because they're refactor-/slice-6-cou
 3. **Pause** — slices 1–5(enforcement) are a coherent, high-value, fully-tested set (standalone
    spec/interop bug fixes + safe writes to Spark tables). A defensible stopping point.
 
-Remaining slices: 6 (column mapping — larger; unblocks the slice-5 ALTER upgrades), 7 (pluggable codec
-seam — **STRATEGIC**, discuss project positioning first), 8 (misc reader/DML: S3 conditional-write fix,
-ListVersions ascending sort, thrift wire-type guards, Decimal128 reads, Time64, nested stats), 9
-(row-level concurrency — **STRATEGIC**, most complex).
+Remaining slices: 7 (pluggable codec seam — **STRATEGIC**, discuss project positioning first), 8 (misc
+reader/DML: S3 conditional-write fix, ListVersions ascending sort, thrift wire-type guards, Decimal128
+reads, Time64, nested stats), 9 (row-level concurrency — **STRATEGIC**, most complex).
+
+### Slice-6 leftovers (deliberately not landed)
+
+- **Physical-keyed `add.partitionValues`.** The PR keys committed partition values by the PHYSICAL column
+  name under mapping (`metaData.partitionColumns` stays logical) — matched to Spark empirically. Not landed
+  because it ripples into `DeltaFilePruner` (looks up `PartitionValues` by logical name) and the read path's
+  partition-column injection; master is currently self-consistent with logical keys. Interop gap, not an EW
+  correctness bug. Land as one commit covering writer + pruner + read path together.
+- **`SetSchemaAsync`**, the nested-struct `AddFieldAsync` variant, and the buffered-transaction
+  (deferred-commit) forms of the ALTER operations — the last are slice-9-coupled.
+- Compaction's non-mapping thread from the same PR diff (DV exclusion, row-tracking id materialization,
+  pluggable reader/writer, HWM action, OPTIMIZE commitInfo) belongs to slices 7/8/9.
 
 ## Deferred follow-ups (do after the PR-landing work)
 
