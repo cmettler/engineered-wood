@@ -11,6 +11,13 @@ using EngineeredWood.IO.Local;
 
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
+/// <summary>
+/// Row tracking (<c>delta.enableRowTracking=true</c>) is READ-ONLY in this library for now: EngineeredWood
+/// cannot yet maintain stable row IDs through appends and copy-on-write rewrites, so a data-changing write
+/// to a row-tracking table is refused rather than silently corrupting it (a spec-conformant writer — the
+/// deferred Layer 3 (B) work — would lift this). These tests pin the refusal and that reads / non-tracking
+/// writes are unaffected.
+/// </summary>
 public class RowTrackingTests : IDisposable
 {
     private readonly string _tempDir;
@@ -56,165 +63,48 @@ public class RowTrackingTests : IDisposable
         return await DeltaTable.OpenAsync(fs);
     }
 
+    private RecordBatch OneRow(Apache.Arrow.Schema schema) => new(
+        schema,
+        [new Int64Array.Builder().Append(1).Build(),
+         new StringArray.Builder().Append("a").Build()], 1);
+
     [Fact]
-    public async Task Write_AssignsBaseRowId()
+    public async Task Write_RejectedOnRowTrackingTable()
     {
         await using var table = await CreateRowTrackingTable();
-        var schema = table.ArrowSchema;
 
-        var ids = new Int64Array.Builder().Append(1).Append(2).Append(3).Build();
-        var values = new StringArray.Builder().Append("a").Append("b").Append("c").Build();
-        var batch = new RecordBatch(schema, [ids, values], 3);
-
-        await table.WriteAsync([batch]);
-
-        // Check that AddFile has baseRowId set
-        var addFile = table.CurrentSnapshot.ActiveFiles.Values.First();
-        Assert.NotNull(addFile.BaseRowId);
-        Assert.Equal(0L, addFile.BaseRowId); // First file starts at 0
-        Assert.NotNull(addFile.DefaultRowCommitVersion);
-        Assert.Equal(1L, addFile.DefaultRowCommitVersion); // Commit version 1
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(
+            async () => await table.WriteAsync([OneRow(table.ArrowSchema)]));
+        Assert.Contains("row-tracking", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public async Task Write_MultipleFiles_IncrementingRowIds()
+    public async Task Delete_RejectedOnRowTrackingTable()
     {
         await using var table = await CreateRowTrackingTable();
-        var schema = table.ArrowSchema;
 
-        // First write: 3 rows
-        var batch1 = new RecordBatch(schema,
-            [new Int64Array.Builder().Append(1).Append(2).Append(3).Build(),
-             new StringArray.Builder().Append("a").Append("b").Append("c").Build()], 3);
-        await table.WriteAsync([batch1]);
-
-        // Second write: 2 rows
-        var batch2 = new RecordBatch(schema,
-            [new Int64Array.Builder().Append(4).Append(5).Build(),
-             new StringArray.Builder().Append("d").Append("e").Build()], 2);
-        await table.WriteAsync([batch2]);
-
-        var files = table.CurrentSnapshot.ActiveFiles.Values
-            .OrderBy(f => f.BaseRowId)
-            .ToList();
-
-        Assert.Equal(2, files.Count);
-        Assert.Equal(0L, files[0].BaseRowId);   // First file: rows 0-2
-        Assert.Equal(3L, files[1].BaseRowId);   // Second file: rows 3-4
+        // The write-precondition gate fires before any file is read, so an empty table is enough.
+        await Assert.ThrowsAsync<NotSupportedException>(
+            async () => await table.DeleteAsync(_ => new BooleanArray.Builder().Build()));
     }
 
     [Fact]
-    public async Task Write_MultipleFilesInOneBatch_CorrectRowIds()
+    public async Task Update_RejectedOnRowTrackingTable()
     {
         await using var table = await CreateRowTrackingTable();
-        var schema = table.ArrowSchema;
 
-        // Write two batches in one commit
-        var batch1 = new RecordBatch(schema,
-            [new Int64Array.Builder().Append(1).Append(2).Build(),
-             new StringArray.Builder().Append("a").Append("b").Build()], 2);
-        var batch2 = new RecordBatch(schema,
-            [new Int64Array.Builder().Append(3).Build(),
-             new StringArray.Builder().Append("c").Build()], 1);
-
-        await table.WriteAsync([batch1, batch2]);
-
-        var files = table.CurrentSnapshot.ActiveFiles.Values
-            .OrderBy(f => f.BaseRowId)
-            .ToList();
-
-        Assert.Equal(2, files.Count);
-        Assert.Equal(0L, files[0].BaseRowId);
-        Assert.Equal(2L, files[1].BaseRowId);
+        await Assert.ThrowsAsync<NotSupportedException>(
+            async () => await table.UpdateAsync(
+                _ => new BooleanArray.Builder().Build(), b => b));
     }
 
     [Fact]
-    public async Task Read_StripsInternalRowIdColumn()
+    public async Task Compaction_RejectedOnRowTrackingTable()
     {
         await using var table = await CreateRowTrackingTable();
-        var schema = table.ArrowSchema;
 
-        var ids = new Int64Array.Builder().Append(1).Append(2).Build();
-        var values = new StringArray.Builder().Append("a").Append("b").Build();
-        var batch = new RecordBatch(schema, [ids, values], 2);
-
-        await table.WriteAsync([batch]);
-
-        // Read back — should NOT have __delta_row_id column
-        var readBatches = new List<RecordBatch>();
-        await foreach (var b in table.ReadAllAsync())
-            readBatches.Add(b);
-
-        Assert.Single(readBatches);
-        Assert.Equal(2, readBatches[0].ColumnCount); // id + value, no __delta_row_id
-        Assert.Equal("id", readBatches[0].Schema.FieldsList[0].Name);
-        Assert.Equal("value", readBatches[0].Schema.FieldsList[1].Name);
-    }
-
-    [Fact]
-    public async Task HighWaterMark_IncreasesAcrossCommits()
-    {
-        await using var table = await CreateRowTrackingTable();
-        var schema = table.ArrowSchema;
-
-        Assert.Equal(0L, table.CurrentSnapshot.RowIdHighWaterMark);
-
-        // Write 3 rows
-        var batch1 = new RecordBatch(schema,
-            [new Int64Array.Builder().Append(1).Append(2).Append(3).Build(),
-             new StringArray.Builder().Append("a").Append("b").Append("c").Build()], 3);
-        await table.WriteAsync([batch1]);
-
-        Assert.Equal(3L, table.CurrentSnapshot.RowIdHighWaterMark);
-
-        // Write 2 more rows
-        var batch2 = new RecordBatch(schema,
-            [new Int64Array.Builder().Append(4).Append(5).Build(),
-             new StringArray.Builder().Append("d").Append("e").Build()], 2);
-        await table.WriteAsync([batch2]);
-
-        Assert.Equal(5L, table.CurrentSnapshot.RowIdHighWaterMark);
-    }
-
-    [Fact]
-    public async Task Compaction_PreservesRowTracking()
-    {
-        await using var table = await CreateRowTrackingTable();
-        var schema = table.ArrowSchema;
-
-        // Write 3 small files
-        for (int i = 0; i < 3; i++)
-        {
-            var batch = new RecordBatch(schema,
-                [new Int64Array.Builder().Append(i * 10 + 1).Build(),
-                 new StringArray.Builder().Append($"val_{i}").Build()], 1);
-            await table.WriteAsync([batch]);
-        }
-
-        Assert.Equal(3, table.CurrentSnapshot.FileCount);
-        long hwmBeforeCompact = table.CurrentSnapshot.RowIdHighWaterMark;
-
-        // Compact
-        await table.CompactAsync(new CompactionOptions
-        {
-            MinFileSize = long.MaxValue,
-        });
-
-        // Compacted files should have baseRowId and defaultRowCommitVersion
-        foreach (var addFile in table.CurrentSnapshot.ActiveFiles.Values)
-        {
-            Assert.NotNull(addFile.BaseRowId);
-            Assert.NotNull(addFile.DefaultRowCommitVersion);
-        }
-
-        // High water mark should have increased (new baseRowIds assigned)
-        Assert.True(table.CurrentSnapshot.RowIdHighWaterMark >= hwmBeforeCompact);
-
-        // Data should still be readable
-        int totalRows = 0;
-        await foreach (var b in table.ReadAllAsync())
-            totalRows += b.Length;
-        Assert.Equal(3, totalRows);
+        await Assert.ThrowsAsync<NotSupportedException>(
+            async () => await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue }));
     }
 
     [Fact]

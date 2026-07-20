@@ -219,17 +219,30 @@ rewritten files) match the protocol. Tier-3 setup is in [[spark-interop-toolchai
   `ConcurrentDeletes_SameRow_RowLevelConflict`, `WithoutRowLevelRetry_VersionConflictSurfaces` (a
   rewritten-away file — a conflict the row-level path deliberately does NOT silence).
 
-- **(B) Rewrite-preservation (UPDATE, compaction remap) — the harder prerequisite. VERIFIED on master:**
-  `ComputeUpdateActionsAsync` rewrites the file and builds `new AddFile { Path, PartitionValues, Size,
-  ModificationTime, DataChange, Stats }` with **no `BaseRowId`/`DefaultRowCommitVersion`**, and it strips the
-  internal row-id column (`RowTracking.RowTrackingWriter.StripRowIdColumn`). So a copy-on-write rewrite loses
-  row ids. Cases like "a delete whose file was concurrently compacted/updated must remap onto the new file by
-  stable row id" (`DeleteThroughConcurrentCompaction_Remapped`,
-  `DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`, `ConcurrentUpdateAndDelete_DisjointRows_BothLand`)
-  need the rewrite to **carry each surviving row's original baseRowId through** (materialize the row-id column
-  instead of stripping it) plus a remap-by-row-id step on rebase. Closing (B) is also what would let a
-  row-tracking transaction rebase safely — it directly retires **limitation 2** (`rebaseSafe: false` for
-  row tracking).
+- **(B) Rewrite-preservation (UPDATE, compaction remap) — DEFERRED behind a write fail-fast (2026-07-20).**
+  Investigation found the foundation isn't there: EW's row tracking is **EW-internal and not spec-conformant**
+  — `ComputeUpdateActionsAsync` strips the internal row-id column and builds an `AddFile` with **no
+  `BaseRowId`/`DefaultRowCommitVersion`** (copy-on-write loses row ids); the write path materializes a
+  hardcoded non-spec `__delta_row_id` column (not the spec's metadata-named materialized column, no field id);
+  compaction only weakly re-assigns ids; and there is **no interop coverage at all**. There is also no
+  `CreateAsync` surface to enable row tracking — the only way to reach the write path is opening a foreign
+  (Spark/Databricks) row-tracking table, which is exactly where writing wrong would corrupt real invariants.
+  **Decision (user):** rather than ship a half-built feature, make row tracking **READ-ONLY** — refuse any
+  data-changing write to a `delta.enableRowTracking=true` table (`DeltaTable.RejectRowTrackingWrite`, gating
+  `ValidateWritable` + `CompactAsync`, `NotSupportedException`). Reads are unaffected. This is strictly safer
+  than the prior silent corruption. `RowTrackingTests`/`RowTrackingHighWaterMarkTests` reworked: write/compact
+  paths assert the refusal; the read-side HWM-reconciliation test is preserved by seeding the log directly
+  (`SeedTwoFileTableAsync`).
+  **When (B) is actually built** it needs, in order: spec-conformant row tracking (materialized-column naming
+  via `delta.rowTracking.materializedRowIdColumnName` metadata + field ids, stop writing the spurious column
+  for default-id files, tier-3 Spark validation of `baseRowId`/materialized artifacts); then rewrite-
+  preservation — UPDATE preserves row order + `baseRowId` (single-file, no materialized column needed;
+  positions stay stable, so the (A) resolver remaps by matching a removed file to its successor by `baseRowId`
+  range), compaction carries each surviving row's **original** id through a real materialized column; then
+  remap-by-row-id in the resolver + relax `rebaseSafe` for row-tracking deletes. Only then un-skip
+  `ConcurrentUpdateAndDelete_DisjointRows_BothLand`, `DeleteThroughConcurrentCompaction_Remapped`,
+  `DeleteThroughCompaction_RowConcurrentlyDeleted_RowLevelConflict`. Closing (B) also retires **limitation 2**
+  (`rebaseSafe: false` for row tracking).
 
 **The 7 acceptance tests.** Three are LIVE (in `RowLevelConcurrencyTests`, un-parked): the (A) set —
 `ConcurrentDeletes_SameFile_DisjointRows_BothLand`, `ConcurrentDeletes_SameRow_RowLevelConflict`,

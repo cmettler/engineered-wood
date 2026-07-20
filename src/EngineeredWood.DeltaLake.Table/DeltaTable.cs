@@ -1965,7 +1965,28 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     internal void ValidateWritable(Snapshot.Snapshot snapshot, bool isAppend)
     {
         ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
+        RejectRowTrackingWrite(snapshot);
         HonorWriterFeatures(snapshot, isAppend);
+    }
+
+    /// <summary>
+    /// Row tracking (<c>delta.enableRowTracking=true</c>) is READ-ONLY in this library: a data-changing
+    /// write is refused rather than silently producing a broken table. EngineeredWood cannot yet maintain
+    /// stable row IDs the way the protocol requires — it assigns <c>baseRowId</c> on write but DROPS it on
+    /// any copy-on-write rewrite (UPDATE / compaction) and materializes a non-spec internal column — so a
+    /// write would corrupt the row-id invariants a conformant engine (Spark, Databricks) relies on. Reading
+    /// a row-tracking table is fully supported (<c>baseRowId</c> is log metadata that does not affect the
+    /// data). Lifting this gate is the deferred Layer 3 (B) work; see <c>doc/slice9-concurrency-resume.md</c>.
+    /// </summary>
+    private static void RejectRowTrackingWrite(Snapshot.Snapshot snapshot)
+    {
+        if (DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration))
+        {
+            throw new NotSupportedException(
+                "Writing to a row-tracking table (delta.enableRowTracking=true) is not supported: "
+                + "EngineeredWood cannot yet maintain stable row IDs through appends and rewrites without "
+                + "corrupting them. Reading such a table is supported; a spec-conformant writer is planned.");
+        }
     }
 
     /// <summary>
@@ -2486,6 +2507,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        RejectRowTrackingWrite(CurrentSnapshot); // compaction rewrites files — same row-id hazard
 
         options ??= CompactionOptions.Default;
         var result = await Compaction.CompactionExecutor.ExecuteAsync(

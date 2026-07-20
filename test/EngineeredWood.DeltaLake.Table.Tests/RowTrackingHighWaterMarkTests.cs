@@ -30,35 +30,6 @@ public class RowTrackingHighWaterMarkTests : IDisposable
             Directory.Delete(_tempDir, recursive: true);
     }
 
-    private async Task<DeltaTable> CreateRowTrackingTable()
-    {
-        var fs = new LocalTableFileSystem(_tempDir);
-        var log = new TransactionLog(fs);
-
-        await log.WriteCommitAsync(0, new List<DeltaAction>
-        {
-            new ProtocolAction
-            {
-                MinReaderVersion = 1,
-                MinWriterVersion = 7,
-                WriterFeatures = ["rowTracking", "domainMetadata"],
-            },
-            new MetadataAction
-            {
-                Id = "rt-hwm-table",
-                Format = Format.Parquet,
-                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
-                PartitionColumns = [],
-                Configuration = new Dictionary<string, string>
-                {
-                    { RowTrackingConfig.EnableKey, "true" },
-                },
-            },
-        });
-
-        return await DeltaTable.OpenAsync(fs, new DeltaTableOptions { CheckpointInterval = 0 });
-    }
-
     private static RecordBatch Rows(Apache.Arrow.Schema schema, params long[] ids)
     {
         var b = new Int64Array.Builder();
@@ -103,28 +74,50 @@ public class RowTrackingHighWaterMarkTests : IDisposable
         Assert.Null(RowTrackingConfig.TryReadHighWaterMark(new Dictionary<string, DomainMetadata>()));
     }
 
-    [Fact]
-    public async Task Write_EmitsHighWaterMarkDomainMetadata()
+    // EngineeredWood does not WRITE row-tracking tables (that is refused — see RowTrackingTests), but it
+    // must still READ one a foreign engine wrote and reconcile the high-water mark correctly. So the state
+    // here is seeded directly into the log rather than via WriteAsync.
+    private static AddFile SeedFile(string path, long baseRowId, int rows) => new()
     {
-        await using var table = await CreateRowTrackingTable();
-        await table.WriteAsync([Rows(table.ArrowSchema, 1, 2, 3)]);
+        Path = path,
+        PartitionValues = new Dictionary<string, string>(),
+        Size = 100,
+        ModificationTime = 0,
+        DataChange = true,
+        Stats = $"{{\"numRecords\":{rows}}}",
+        BaseRowId = baseRowId,
+        DefaultRowCommitVersion = 1,
+    };
 
-        var domains = table.GetDomainMetadata();
-        Assert.True(domains.ContainsKey(RowTrackingConfig.DomainName));
-        // 3 rows assigned ids 0,1,2 → highest assigned is 2.
-        Assert.Equal(2L, RowTrackingConfig.TryReadHighWaterMark(domains));
-        Assert.Equal(3L, table.CurrentSnapshot.RowIdHighWaterMark);
-    }
-
-    [Fact]
-    public async Task Write_AdvancesTheMarkAcrossCommits()
+    private async Task<(LocalTableFileSystem Fs, TransactionLog Log)> SeedTwoFileTableAsync()
     {
-        await using var table = await CreateRowTrackingTable();
-        await table.WriteAsync([Rows(table.ArrowSchema, 1, 2)]);
-        await table.WriteAsync([Rows(table.ArrowSchema, 3, 4, 5)]);
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
 
-        Assert.Equal(4L, RowTrackingConfig.TryReadHighWaterMark(table.GetDomainMetadata()));
-        Assert.Equal(5L, table.CurrentSnapshot.RowIdHighWaterMark);
+        await log.WriteCommitAsync(0, new List<DeltaAction>
+        {
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 7,
+                WriterFeatures = ["rowTracking", "domainMetadata"] },
+            new MetadataAction
+            {
+                Id = "rt-hwm-table", Format = Format.Parquet,
+                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
+                PartitionColumns = [],
+                Configuration = new Dictionary<string, string> { { RowTrackingConfig.EnableKey, "true" } },
+            },
+        });
+        // Two files carrying baseRowId 0 and 3 (six rows, ids 0..5); the domain HWM ends at 5 (highest assigned).
+        await log.WriteCommitAsync(1, new List<DeltaAction>
+        {
+            SeedFile("f0.parquet", baseRowId: 0, rows: 3),
+            RowTrackingConfig.BuildHighWaterMarkAction(nextAvailableRowId: 3),
+        });
+        await log.WriteCommitAsync(2, new List<DeltaAction>
+        {
+            SeedFile("f1.parquet", baseRowId: 3, rows: 3),
+            RowTrackingConfig.BuildHighWaterMarkAction(nextAvailableRowId: 6),
+        });
+        return (fs, log);
     }
 
     // The case the domainMetadata exists for: once the highest-id file leaves the ACTIVE set (any writer that
@@ -134,24 +127,17 @@ public class RowTrackingHighWaterMarkTests : IDisposable
     [Fact]
     public async Task RemovingTheHighestFile_DoesNotRewindTheMark()
     {
-        var fs = new LocalTableFileSystem(_tempDir);
+        var (fs, log) = await SeedTwoFileTableAsync();
 
-        await using (var table = await CreateRowTrackingTable())
-        {
-            await table.WriteAsync([Rows(table.ArrowSchema, 1, 2, 3)]);
-            await table.WriteAsync([Rows(table.ArrowSchema, 4, 5, 6)]);
-            Assert.Equal(6L, table.CurrentSnapshot.RowIdHighWaterMark);
-        }
-
-        // Tombstone the file holding the highest ids (baseRowId 3) without adding a replacement.
         DeltaTable opened = await DeltaTable.OpenAsync(fs);
+        Assert.Equal(6L, opened.CurrentSnapshot.RowIdHighWaterMark);
         var highest = opened.CurrentSnapshot.ActiveFiles.Values
             .OrderByDescending(f => f.BaseRowId ?? -1).First();
         Assert.Equal(3L, highest.BaseRowId);
         long version = opened.CurrentSnapshot.Version;
         await opened.DisposeAsync();
 
-        var log = new TransactionLog(fs);
+        // Tombstone the file holding the highest ids (baseRowId 3) without adding a replacement.
         await log.WriteCommitAsync(version + 1, new List<DeltaAction>
         {
             new RemoveFile

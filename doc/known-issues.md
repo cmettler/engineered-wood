@@ -327,12 +327,28 @@ Note the domain stores PHYSICAL column names, because OSS Delta
 `EwWritten_Clustered_SparkResolvesClusteringColumns`, which asserts Spark's
 `DESCRIBE DETAIL` resolves the declaration back to the logical names.
 
+**Row tracking (`delta.enableRowTracking=true`) is READ-ONLY.** A
+data-changing write to a row-tracking table is refused with
+`NotSupportedException` (`DeltaTable.RejectRowTrackingWrite`, gating
+`ValidateWritable` and `CompactAsync`) rather than silently corrupting it.
+The write path could assign a `baseRowId` on append but DROPS it on any
+copy-on-write rewrite (UPDATE / compaction) and materializes a non-spec
+internal `__delta_row_id` column, so a write would violate the stable-row-id
+invariants a conformant engine (Spark, Databricks) relies on. Reading a
+row-tracking table is fully supported — `baseRowId` is log metadata that does
+not affect the data, and the `delta.rowTracking` high-water mark is
+reconciled on read (`RowTracking/RowTrackingConfig.cs`). A spec-conformant
+writer (materialized-column naming via metadata, id preservation through
+rewrites, tier-3 Spark validation) is the deferred **Layer 3 (B)** work; it
+is also the prerequisite for row-tracking optimistic-concurrency rebase (the
+`rebaseSafe: false` limitation). There is also no `CreateAsync` surface to
+ENABLE row tracking — the only way to reach a row-tracking table is opening
+one a foreign engine created.
+
 **`rowTracking` read-side classification.** `rowTracking` is a
 reader-writer feature in the spec but is listed only in
 `SupportedWriterFeatures`, so a table carrying it in `readerFeatures` is
-still rejected by `ValidateReadSupport`. (The writer side is done: the
-`delta.rowTracking` domain metadata carrying the row-ID high-water mark IS
-emitted and reconciled — see `RowTracking/RowTrackingConfig.cs`.)
+still rejected by `ValidateReadSupport`.
 
 **Multi-part V1 checkpoints on write.** Read is supported
 (`CheckpointReader.cs`); write always emits a single
