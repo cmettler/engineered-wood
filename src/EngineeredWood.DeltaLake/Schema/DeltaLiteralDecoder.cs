@@ -72,7 +72,7 @@ internal static class DeltaLiteralDecoder
                         ? ParseTimestamp(value.GetString()!) : null;
                 default:
                     if (typeName.StartsWith("decimal(", StringComparison.Ordinal))
-                        return ParseDecimal(value, typeName);
+                        return ParseDecimalJson(value);
                     return null;
             }
         }
@@ -125,10 +125,7 @@ internal static class DeltaLiteralDecoder
                     return ParseTimestamp(value);
                 default:
                     if (typeName.StartsWith("decimal(", StringComparison.Ordinal))
-                    {
-                        var (precision, scale) = ParseDecimalSpec(typeName);
-                        return ParseDecimalString(value, scale);
-                    }
+                        return ParseDecimalText(value);
                     return null;
             }
         }
@@ -149,64 +146,96 @@ internal static class DeltaLiteralDecoder
             DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dto)
             ? (LiteralValue?)LiteralValue.Of(dto) : null;
 
-    private static LiteralValue? ParseDecimal(JsonElement value, string typeName)
+    private static LiteralValue? ParseDecimalJson(JsonElement value) => value.ValueKind switch
     {
-        var (precision, scale) = ParseDecimalSpec(typeName);
+        // Decode the EXACT digits, never System.Decimal — decimal.TryParse and JsonElement.TryGetDecimal
+        // silently ROUND a value with more than ~28-29 significant digits (e.g. a decimal(38,30) stat) to
+        // System.Decimal's precision, which would shift a min/max bound and could wrongly skip a file.
+        JsonValueKind.Number => ParseDecimalText(value.GetRawText()),
+        JsonValueKind.String => ParseDecimalText(value.GetString()),
+        _ => null,
+    };
 
-        if (value.ValueKind == JsonValueKind.Number)
-        {
-            // Try System.Decimal first; fall back to high-precision via raw text.
-            if (value.TryGetDecimal(out decimal d))
-                return LiteralValue.Of(d);
-            return ParseDecimalString(value.GetRawText(), scale);
-        }
-
-        if (value.ValueKind == JsonValueKind.String)
-            return ParseDecimalString(value.GetString()!, scale);
-
-        return null;
-    }
-
-    private static LiteralValue? ParseDecimalString(string s, int scale)
+    /// <summary>
+    /// Parses a decimal number's text (from a stats JSON number or a partition string) into a
+    /// <see cref="LiteralValue"/> WITHOUT loss of precision: the exact digits become an unscaled
+    /// <see cref="BigInteger"/> at the value's own scale, materialized as a <c>System.Decimal</c> only when
+    /// that representation is exact, otherwise as a high-precision decimal. Accepts an optional sign,
+    /// fractional part, and exponent (e.g. <c>1.23e4</c>).
+    /// </summary>
+    private static LiteralValue? ParseDecimalText(string? text)
     {
-        // Accept a textual decimal like "1234.56" or scientific "1.23e4".
-        // Parse to BigInteger by tracking the sign and the position of the decimal point,
-        // then renormalize to the target scale.
-        if (decimal.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out decimal d))
-            return LiteralValue.Of(d);
-
-        // Fall back to high-precision: split on the decimal point.
-        int dot = s.IndexOf('.');
-        bool negative = s.Length > 0 && s[0] == '-';
-        string digits = dot < 0
-            ? s
-            : s.Substring(0, dot) + s.Substring(dot + 1);
-        if (negative) digits = digits.Substring(1);
-
-        if (!BigInteger.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out var unscaled))
+        if (string.IsNullOrWhiteSpace(text))
             return null;
 
-        if (negative) unscaled = -unscaled;
+        string s = text!.Trim();
 
-        int sourceScale = dot < 0 ? 0 : s.Length - dot - 1;
-        if (sourceScale < scale)
-            unscaled *= BigInteger.Pow(10, scale - sourceScale);
-        else if (sourceScale > scale)
-            unscaled /= BigInteger.Pow(10, sourceScale - scale);
+        int e = s.IndexOfAny(ExponentChars);
+        int exponent = 0;
+        string mantissa = s;
+        if (e >= 0)
+        {
+            mantissa = s.Substring(0, e);
+            if (!int.TryParse(s.Substring(e + 1), NumberStyles.AllowLeadingSign,
+                    CultureInfo.InvariantCulture, out exponent))
+                return null;
+        }
 
-        return LiteralValue.HighPrecisionDecimalOf(unscaled, scale);
+        bool negative = false;
+        if (mantissa.Length > 0 && (mantissa[0] == '-' || mantissa[0] == '+'))
+        {
+            negative = mantissa[0] == '-';
+            mantissa = mantissa.Substring(1);
+        }
+
+        int dot = mantissa.IndexOf('.');
+        int fractionalDigits = dot < 0 ? 0 : mantissa.Length - dot - 1;
+        string digits = dot < 0 ? mantissa : mantissa.Substring(0, dot) + mantissa.Substring(dot + 1);
+
+        if (digits.Length == 0
+            || !BigInteger.TryParse(digits, NumberStyles.None, CultureInfo.InvariantCulture, out var unscaled))
+            return null;
+
+        if (negative)
+            unscaled = -unscaled;
+
+        // value = unscaled * 10^(exponent - fractionalDigits); a negative resulting scale is absorbed into
+        // the integer so the stored scale is always >= 0.
+        int scale = fractionalDigits - exponent;
+        if (scale < 0)
+        {
+            unscaled *= BigInteger.Pow(10, -scale);
+            scale = 0;
+        }
+
+        return MakeDecimalLiteral(unscaled, scale);
     }
 
-    private static (int Precision, int Scale) ParseDecimalSpec(string typeName)
+    private static readonly char[] ExponentChars = { 'e', 'E' };
+
+    // The largest magnitude a System.Decimal can hold (96-bit unscaled integer).
+    private static readonly BigInteger Decimal96Max = (BigInteger.One << 96) - 1;
+
+    /// <summary>
+    /// Builds a <c>System.Decimal</c> from <paramref name="unscaled"/> / 10^<paramref name="scale"/> when
+    /// it is exactly representable (scale 0-28, magnitude within 96 bits); otherwise keeps the full value
+    /// as a high-precision decimal. Both forms compare exactly via <see cref="LiteralValue"/>.
+    /// </summary>
+    private static LiteralValue MakeDecimalLiteral(BigInteger unscaled, int scale)
     {
-        // typeName is "decimal(p,s)"
-        int open = typeName.IndexOf('(');
-        int comma = typeName.IndexOf(',', open);
-        int close = typeName.IndexOf(')', comma);
-        int precision = int.Parse(typeName.Substring(open + 1, comma - open - 1).Trim(),
-            NumberStyles.Integer, CultureInfo.InvariantCulture);
-        int scale = int.Parse(typeName.Substring(comma + 1, close - comma - 1).Trim(),
-            NumberStyles.Integer, CultureInfo.InvariantCulture);
-        return (precision, scale);
+        if (scale >= 0 && scale <= 28)
+        {
+            BigInteger magnitude = BigInteger.Abs(unscaled);
+            if (magnitude <= Decimal96Max)
+            {
+                uint lo = (uint)(magnitude & uint.MaxValue);
+                uint mid = (uint)((magnitude >> 32) & uint.MaxValue);
+                uint hi = (uint)((magnitude >> 64) & uint.MaxValue);
+                return LiteralValue.Of(
+                    new decimal((int)lo, (int)mid, (int)hi, unscaled.Sign < 0, (byte)scale));
+            }
+        }
+
+        return LiteralValue.HighPrecisionDecimalOf(unscaled, scale);
     }
 }

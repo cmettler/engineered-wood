@@ -288,6 +288,50 @@ public class ExpressionPredicateTests : IDisposable
         Assert.Equal([2L], await ReadIds(table)); // id 1 (100.00) deleted, id 2 (10.00) survives
     }
 
+    /// <summary>
+    /// A high-scale decimal bound must not be rounded away when it is read back for pruning. The one row
+    /// holds <c>1.000000000000000000000000000001</c> (decimal(38,30)); its stats max exceeds 1 only in the
+    /// 30th fractional digit. If the decoder rounded that bound to System.Decimal precision it would become
+    /// 1.0, and an <c>amt &gt; 1</c> filter would then prove the file empty and SKIP it — silently dropping
+    /// the row. With exact decoding the file is kept and the row is returned.
+    /// </summary>
+    [Fact]
+    public async Task HighScaleDecimal_ExactBoundNotRoundedAwayByPruning()
+    {
+        var type = new Decimal128Type(38, 30);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("amt", type, false))
+            .Build();
+        var unscaled = BigInteger.Pow(10, 30) + 1; // value = 1.000000000000000000000000000001
+
+        var ids = new Int64Array.Builder().Append(1L).Build();
+        var bytes = new byte[16];
+        var dest = bytes.AsSpan();
+        dest.Fill(0);
+#if NET6_0_OR_GREATER
+        unscaled.TryWriteBytes(dest, out _, isUnsigned: false, isBigEndian: false);
+#else
+        var bb = unscaled.ToByteArray();
+        bb.AsSpan(0, Math.Min(bb.Length, 16)).CopyTo(dest);
+#endif
+        var data = new ArrayData(type, 1, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(bytes)]);
+        var batch = new RecordBatch(schema, [ids, new Decimal128Array(data)], 1);
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, schema);
+        await table.WriteAsync([batch]);
+
+        var seen = new List<long>();
+        await foreach (var b in table.ReadAllAsync(columns: null, Ex.GreaterThan("amt", 1m)))
+        {
+            var col = (Int64Array)b.Column("id");
+            for (int i = 0; i < b.Length; i++) seen.Add(col.GetValue(i)!.Value);
+        }
+
+        Assert.Equal([1L], seen); // file kept: the bound is exactly > 1 (would be pruned if rounded to 1.0)
+    }
+
     private static Apache.Arrow.Schema IdDateSchema { get; } = new Apache.Arrow.Schema.Builder()
         .Field(new Field("id", Int64Type.Default, false))
         .Field(new Field("d", Date32Type.Default, false))
