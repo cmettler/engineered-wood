@@ -129,10 +129,19 @@ Design facts worth keeping:
    (see limitation 1).
 3. ~~**Expression-predicate DELETE/UPDATE overload**~~ **DONE (`5a8445f`).** Analyzable
    `Expressions.Predicate` overloads of `DeleteAsync`/`UpdateAsync` (auto-committer + transaction), read
-   predicate recorded so concurrentAppend is precise. Remaining follow-ups it unlocks: (a) extend
-   `ArrowRowEvaluator` to date/decimal/timestamp columns (currently throws on them); (b) rebasing
-   partition/dynamic overwrite now has the predicate machinery it needed, but still needs the overwrite
-   read-set expressed as a partition predicate.
+   predicate recorded so concurrentAppend is precise. Follow-ups:
+   - ~~extend `ArrowRowEvaluator` to date/decimal/timestamp columns~~ **DONE (`119242e`).** Added
+     Date32/Date64/Timestamp + Decimal32/64/128/256 cases (mapped to the same `LiteralValue` kinds the stats
+     decoder uses — `DateTimeOffset`/`Decimal`/`HighPrecisionDecimal`), plus `LiteralValue` cross-type
+     comparison for Decimal↔HighPrecisionDecimal, integer↔decimal, and DateOnly↔DateTimeOffset. Stats-path
+     check: date/decimal are not pruned (date stats are emitted as a number the decoder rejects; decimal
+     stats are not collected) — both SAFE (never wrongly prune); timestamp DOES prune and round-trips.
+     **Gotcha found:** the Delta/parquet reader NARROWS a decimal column to the smallest
+     `Decimal{32,64,128,256}Array` that fits its precision, so all four array widths must be handled (a
+     `decimal(12,2)` reads back as `Decimal64Array`). Tests: `ArrowRowEvaluatorTests` +5, `LiteralValueTests`
+     +4, `ExpressionPredicateTests` +3 (incl. an end-to-end timestamp concurrentAppend-precision case).
+   - rebasing partition/dynamic overwrite now has the predicate machinery it needed, but still needs the
+     overwrite read-set expressed as a partition predicate.
 4. **Layer 3 — row-level concurrency.** The Databricks extension. Largest remaining piece; needs
    row-tracking-through-rewrite in EW's own rewrite path (confirm master's state first — the write path
    assigns baseRowId per file but the copy-on-write *rewrite* path likely does not preserve original
