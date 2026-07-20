@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Globalization;
+using System.Numerics;
 using System.Text.Json;
 using Apache.Arrow;
 
@@ -193,6 +194,13 @@ internal static class StatsCollector
                 writer.WriteStringValue(iso);
                 continue;
             }
+            if (value is DecimalStat dec)
+            {
+                // A high-precision decimal bound is written as a raw JSON number to preserve full precision.
+                writer.WritePropertyName(kvp.Key);
+                writer.WriteRawValue(dec.ToNumberString());
+                continue;
+            }
             if (value is string str && str.Length > StringStatMaxLength)
             {
                 value = isMax ? (object?)TruncateMaxString(str) : str.Substring(0, StringStatMaxLength);
@@ -288,6 +296,23 @@ internal static class StatsCollector
                 break;
             case TimestampArray ts:
                 CollectTimestampMinMax(name, ts, minValues, maxValues);
+                break;
+            // Decimal32/64 always fit System.Decimal (precision <= 18); 128/256 may not, so read the exact
+            // unscaled integer from the value bytes. Delta writes decimal bounds as JSON NUMBERS (Spark
+            // emits even 38-digit values as raw numbers), which is what makes them decodable and prune.
+            case Decimal32Array d32:
+                CollectSmallDecimalMinMax(name, i => d32.GetValue(i), d32, minValues, maxValues);
+                break;
+            case Decimal64Array d64:
+                CollectSmallDecimalMinMax(name, i => d64.GetValue(i), d64, minValues, maxValues);
+                break;
+            case Decimal128Array d128:
+                CollectWideDecimalMinMax(name, d128, d128.ValueBuffer, 16,
+                    ((Apache.Arrow.Types.Decimal128Type)d128.Data.DataType).Scale, minValues, maxValues);
+                break;
+            case Decimal256Array d256:
+                CollectWideDecimalMinMax(name, d256, d256.ValueBuffer, 32,
+                    ((Apache.Arrow.Types.Decimal256Type)d256.Data.DataType).Scale, minValues, maxValues);
                 break;
             // For complex types (struct, list, map), we skip min/max
         }
@@ -525,6 +550,109 @@ internal static class StatsCollector
         }
     }
 
+    // Decimal32/64: the value always fits System.Decimal, so compare and store it directly; a null slot
+    // makes GetValue return null.
+    private static void CollectSmallDecimalMinMax(
+        string name, Func<int, decimal?> get, IArrowArray array,
+        Dictionary<string, object?> minValues, Dictionary<string, object?> maxValues)
+    {
+        decimal? min = null;
+        decimal? max = null;
+        for (int i = 0; i < array.Length; i++)
+        {
+            decimal? v = get(i);
+            if (v is null) continue;
+            if (min is null || v.Value < min.Value) min = v;
+            if (max is null || v.Value > max.Value) max = v;
+        }
+
+        if (min is not null)
+        {
+            decimal m = min.Value;
+            if (minValues.TryGetValue(name, out var em) && em is decimal e) m = Math.Min(m, e);
+            minValues[name] = m;
+        }
+        if (max is not null)
+        {
+            decimal m = max.Value;
+            if (maxValues.TryGetValue(name, out var ex) && ex is decimal e) m = Math.Max(m, e);
+            maxValues[name] = m;
+        }
+    }
+
+    // Decimal128/256: the value may exceed System.Decimal, so track the exact unscaled integer read from
+    // the fixed-width little-endian value bytes (scale is constant per column). Serialized as a raw JSON
+    // number so full precision survives.
+    private static void CollectWideDecimalMinMax(
+        string name, Apache.Arrow.Array array, ArrowBuffer valueBuffer, int width, int scale,
+        Dictionary<string, object?> minValues, Dictionary<string, object?> maxValues)
+    {
+        BigInteger? min = null;
+        BigInteger? max = null;
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (array.IsNull(i)) continue;
+            BigInteger u = ToBigInteger(valueBuffer.Span.Slice(i * width, width));
+            if (min is null || u < min.Value) min = u;
+            if (max is null || u > max.Value) max = u;
+        }
+
+        if (min is not null)
+        {
+            BigInteger m = min.Value;
+            if (minValues.TryGetValue(name, out var em) && em is DecimalStat e && e.Scale == scale)
+                m = BigInteger.Min(m, e.Unscaled);
+            minValues[name] = new DecimalStat(m, scale);
+        }
+        if (max is not null)
+        {
+            BigInteger m = max.Value;
+            if (maxValues.TryGetValue(name, out var ex) && ex is DecimalStat e && e.Scale == scale)
+                m = BigInteger.Max(m, e.Unscaled);
+            maxValues[name] = new DecimalStat(m, scale);
+        }
+    }
+
+    private static BigInteger ToBigInteger(ReadOnlySpan<byte> littleEndianTwosComplement)
+    {
+#if NET6_0_OR_GREATER
+        return new BigInteger(littleEndianTwosComplement, isUnsigned: false, isBigEndian: false);
+#else
+        return new BigInteger(littleEndianTwosComplement.ToArray());
+#endif
+    }
+
+    /// <summary>
+    /// A high-precision decimal min/max bound kept as its exact unscaled integer plus the column's scale,
+    /// rendered to the plain decimal number text (the JSON-number form Delta uses) only when written.
+    /// </summary>
+    private readonly struct DecimalStat
+    {
+        public DecimalStat(BigInteger unscaled, int scale)
+        {
+            Unscaled = unscaled;
+            Scale = scale;
+        }
+
+        public BigInteger Unscaled { get; }
+
+        public int Scale { get; }
+
+        public string ToNumberString()
+        {
+            if (Scale <= 0)
+                return Unscaled.ToString(CultureInfo.InvariantCulture);
+
+            bool negative = Unscaled.Sign < 0;
+            string digits = BigInteger.Abs(Unscaled).ToString(CultureInfo.InvariantCulture);
+            if (digits.Length <= Scale)
+                digits = new string('0', Scale - digits.Length + 1) + digits;
+            int point = digits.Length - Scale;
+            return (negative ? "-" : string.Empty)
+                + digits.Substring(0, point) + "." + digits.Substring(point);
+        }
+    }
+
     private static void WriteStatValue(Utf8JsonWriter writer, object value)
     {
         switch (value)
@@ -535,6 +663,7 @@ internal static class StatsCollector
             case sbyte sb: writer.WriteNumberValue(sb); break;
             case double d: writer.WriteNumberValue(d); break;
             case float f: writer.WriteNumberValue(f); break;
+            case decimal dm: writer.WriteNumberValue(dm); break;
             case string str: writer.WriteStringValue(str); break;
             case bool b: writer.WriteBooleanValue(b); break;
             default: writer.WriteNullValue(); break;

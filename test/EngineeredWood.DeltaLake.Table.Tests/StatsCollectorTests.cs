@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Numerics;
 using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -115,6 +116,72 @@ public class StatsCollectorTests
         Assert.Equal("2021-01-01", min.GetString());
         Assert.Equal("2021-12-31", max.GetString());
         Assert.Equal(1, doc.RootElement.GetProperty("nullCount").GetProperty("d").GetInt64());
+    }
+
+    private static RecordBatch Decimal128Batch(
+        string name, int precision, int scale, params BigInteger?[] unscaled)
+    {
+        var type = new Decimal128Type(precision, scale);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field(name, type, true)).Build();
+        const int w = 16;
+        var bytes = new byte[unscaled.Length * w];
+        var nulls = new ArrowBuffer.BitmapBuilder();
+        int nullCount = 0;
+        for (int i = 0; i < unscaled.Length; i++)
+        {
+            if (unscaled[i] is null) { nulls.Append(false); nullCount++; continue; }
+            nulls.Append(true);
+            var bi = unscaled[i]!.Value;
+            var dest = bytes.AsSpan(i * w, w);
+            dest.Fill(bi.Sign < 0 ? (byte)0xFF : (byte)0x00);
+#if NET6_0_OR_GREATER
+            bi.TryWriteBytes(dest, out _, isUnsigned: false, isBigEndian: false);
+#else
+            var bb = bi.ToByteArray();
+            bb.AsSpan(0, Math.Min(bb.Length, w)).CopyTo(dest);
+#endif
+        }
+        var data = new ArrayData(type, unscaled.Length, nullCount, 0,
+            [nulls.Build(), new ArrowBuffer(bytes)]);
+        return new RecordBatch(schema, [new Decimal128Array(data)], unscaled.Length);
+    }
+
+    [Fact]
+    public void Collect_DecimalColumn_EmitsJsonNumbers()
+    {
+        // decimal(12,2): unscaled 1234 / 5678 -> 12.34 / 56.78, written as JSON NUMBERS (the form Delta
+        // uses and can decode/prune on).
+        var batch = Decimal128Batch("amt", 12, 2, 1234, 5678, null);
+
+        string? stats = StatsCollector.Collect(batch);
+        Assert.NotNull(stats);
+
+        var doc = JsonDocument.Parse(stats);
+        var min = doc.RootElement.GetProperty("minValues").GetProperty("amt");
+        var max = doc.RootElement.GetProperty("maxValues").GetProperty("amt");
+        Assert.Equal(JsonValueKind.Number, min.ValueKind);
+        Assert.Equal(12.34m, min.GetDecimal());
+        Assert.Equal(56.78m, max.GetDecimal());
+        Assert.Equal(1, doc.RootElement.GetProperty("nullCount").GetProperty("amt").GetInt64());
+    }
+
+    [Fact]
+    public void Collect_DecimalColumn_HighPrecision_PreservedAsRawNumber()
+    {
+        // decimal(38,0): 10^31 exceeds System.Decimal and must survive as a raw 32-digit JSON number,
+        // exactly as Spark writes it.
+        var huge = BigInteger.Pow(10, 31);
+        var batch = Decimal128Batch("big", 38, 0, huge, 5);
+
+        string? stats = StatsCollector.Collect(batch);
+        Assert.NotNull(stats);
+
+        var doc = JsonDocument.Parse(stats);
+        var min = doc.RootElement.GetProperty("minValues").GetProperty("big");
+        var max = doc.RootElement.GetProperty("maxValues").GetProperty("big");
+        Assert.Equal(JsonValueKind.Number, max.ValueKind);
+        Assert.Equal("5", min.GetRawText());
+        Assert.Equal("1" + new string('0', 31), max.GetRawText()); // 10^31, full precision preserved
     }
 
     [Fact]

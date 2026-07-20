@@ -262,6 +262,32 @@ public class ExpressionPredicateTests : IDisposable
         Assert.Equal([1L, 3L], await ReadIds(table));
     }
 
+    /// <summary>
+    /// End-to-end precision for a DECIMAL predicate, which relies on decimal file statistics now being
+    /// emitted as JSON numbers. A Serializable transaction deletes <c>amt &gt; 50</c>; a concurrent append
+    /// of a small-amount row lands first. Its decimal stats prove it holds nothing above 50, so it does not
+    /// match the delete's read predicate — no conflict, the delete rebases and lands. Without decimal stats
+    /// the checker would treat the append as an unknown match and wrongly abort, so this guards the fix.
+    /// </summary>
+    [Fact]
+    public async Task Serializable_ConcurrentDecimalAppendDisjoint_Lands()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdAmountSchema);
+        await table.WriteAsync([AmountBatch([1], [100.00m])]);
+
+        var tx = table.StartTransaction(IsolationLevel.Serializable);
+        long matched = await tx.DeleteAsync(Ex.GreaterThan("amt", 50m));
+        Assert.Equal(1, matched);
+
+        // Concurrent append of a small amount — provably at or below 50 by its decimal stats.
+        await table.WriteAsync([AmountBatch([2], [10.00m])]);
+
+        await tx.CommitAsync(); // no conflict — the append cannot satisfy amt > 50
+
+        Assert.Equal([2L], await ReadIds(table)); // id 1 (100.00) deleted, id 2 (10.00) survives
+    }
+
     private static Apache.Arrow.Schema IdDateSchema { get; } = new Apache.Arrow.Schema.Builder()
         .Field(new Field("id", Int64Type.Default, false))
         .Field(new Field("d", Date32Type.Default, false))

@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Numerics;
 using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -374,6 +375,53 @@ public class SparkInteropTests : IDisposable
 
         Assert.Equal(3, result.GetProperty("files_total").GetInt32());
         Assert.Equal(2, result.GetProperty("files_scanned").GetInt32()); // the 2020 file is skipped
+        Assert.Equal(2, result.GetProperty("row_count").GetInt32());
+    }
+
+    /// <summary>
+    /// DECIMAL column statistics written by EW must let the reference implementation skip files. Delta
+    /// stores decimal bounds as JSON numbers; EW previously collected no decimal stats at all, so it pruned
+    /// nothing. This writes three single-row files and asserts Spark skips the out-of-range one under a
+    /// decimal predicate — proving EW's decimal stats are in the numeric form a foreign reader prunes on.
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_DecimalStats_SparkSkipsFilesWithoutLosingRows()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var type = new Decimal128Type(12, 2);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("amt", type, false))
+            .Build();
+
+        RecordBatch AmtRow(long id, decimal amt)
+        {
+            var ids = new Int64Array.Builder().Append(id).Build();
+            var unscaled = new BigInteger(amt * 100m); // scale 2
+            var bytes = new byte[16];
+            var dest = bytes.AsSpan();
+            dest.Fill(unscaled.Sign < 0 ? (byte)0xFF : (byte)0x00);
+#if NET6_0_OR_GREATER
+            unscaled.TryWriteBytes(dest, out _, isUnsigned: false, isBigEndian: false);
+#else
+            var bb = unscaled.ToByteArray();
+            bb.AsSpan(0, Math.Min(bb.Length, 16)).CopyTo(dest);
+#endif
+            var data = new ArrayData(type, 1, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(bytes)]);
+            return new RecordBatch(schema, [ids, new Decimal128Array(data)], 1);
+        }
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, schema);
+        await table.WriteAsync([AmtRow(1, 10.00m)]);    // pruned
+        await table.WriteAsync([AmtRow(2, 500.00m)]);
+        await table.WriteAsync([AmtRow(3, 2000.00m)]);
+
+        var result = Spark.Invoke("scan", new { path = _tempDir, filter = "amt >= 100" });
+
+        Assert.Equal(3, result.GetProperty("files_total").GetInt32());
+        Assert.Equal(2, result.GetProperty("files_scanned").GetInt32()); // the 10.00 file is skipped
         Assert.Equal(2, result.GetProperty("row_count").GetInt32());
     }
 
