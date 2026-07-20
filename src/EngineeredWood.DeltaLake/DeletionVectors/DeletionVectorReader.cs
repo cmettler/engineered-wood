@@ -144,7 +144,7 @@ public sealed class DeletionVectorReader
     /// Decodes a UUID from the Z85-encoded path segment.
     /// The path is a Base85-encoded 16-byte UUID.
     /// </summary>
-    private static string DecodeUuidFromPath(string encodedPath)
+    internal static string DecodeUuidFromPath(string encodedPath)
     {
         // The encoded path may have a random prefix before the Z85-encoded UUID
         // Z85-encoded 16 bytes = 20 characters

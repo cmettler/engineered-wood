@@ -3,6 +3,7 @@
 
 using System.Text.Json;
 using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Log;
 using DeltaSnapshot = EngineeredWood.DeltaLake.Snapshot.Snapshot;
 using EngineeredWood.IO;
@@ -22,6 +23,13 @@ internal static class VacuumExecutor
     /// commitInfo-only commits around the physical deletes, so the operation is visible in the table
     /// history (auditability — and other engines can see WHY older versions stopped being physically
     /// readable). A dry run writes nothing.</para>
+    ///
+    /// <para>Sweeps BOTH data files (<c>.parquet</c>) and on-disk deletion-vector files (<c>.bin</c>): a
+    /// <c>.bin</c> not referenced by any active add's deletion vector is an orphan (left by a superseded
+    /// DELETE/UPDATE) and is collected past retention like any other unreferenced file. Live DVs are
+    /// protected by deriving each active add's on-disk DV path (the SAME derivation the reader uses —
+    /// <see cref="DeletionVectorReader.DecodeUuidFromPath"/>). A table with an absolute-path (<c>p</c>)
+    /// deletion vector is refused: its file cannot be proven to lie inside the swept directory.</para>
     /// </summary>
     public static async ValueTask<VacuumResult> ExecuteAsync(
         ITableFileSystem fs,
@@ -31,38 +39,58 @@ internal static class VacuumExecutor
         bool dryRun,
         CancellationToken cancellationToken)
     {
-        // Collect all referenced file paths from the current snapshot
+        // Collect all referenced DATA file paths + the live on-disk DELETION-VECTOR file paths from the
+        // current snapshot. Anything on disk not in these sets (and older than the cutoff) is an orphan.
         var referencedPaths = new HashSet<string>(StringComparer.Ordinal);
+        var liveDvPaths = new HashSet<string>(StringComparer.Ordinal);
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
             referencedPaths.Add(addFile.Path);
             referencedPaths.Add(DeltaPath.Decode(addFile.Path)); // on-disk name (add.path is URL-encoded)
+
+            var dv = addFile.DeletionVector;
+            if (dv is null)
+                continue;
+            switch (dv.StorageType)
+            {
+                case "i": // inline — no file to protect or collect
+                    break;
+                case "u": // on-disk, table-relative (optional random prefix dir)
+                    string rel = OnDiskDvPath(dv.PathOrInlineDv);
+                    liveDvPaths.Add(rel);
+                    liveDvPaths.Add(DeltaPath.Decode(rel));
+                    break;
+                default: // "p" absolute path (or unknown) — can't prove it's inside the swept dir
+                    throw new NotSupportedException(
+                        $"VACUUM: an active deletion vector uses storage type '{dv.StorageType}', whose "
+                        + "file cannot be proven to lie inside the table directory; refusing to vacuum "
+                        + "rather than risk deleting a live deletion vector.");
+            }
         }
 
-        // List all data files in the table directory
-        // Data files are Parquet files not in _delta_log/
-        var allFiles = new List<TableFileInfo>();
+        // List candidate files: data (.parquet) + on-disk deletion vectors (.bin), never the log dir.
+        var candidates = new List<TableFileInfo>();
         await foreach (var file in fs.ListAsync("", cancellationToken).ConfigureAwait(false))
         {
-            // Skip log files and non-parquet files
             if (file.Path.StartsWith("_delta_log/", StringComparison.Ordinal) ||
                 file.Path.StartsWith("_delta_log\\", StringComparison.Ordinal))
                 continue;
 
-            if (!file.Path.EndsWith(".parquet", StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            allFiles.Add(file);
+            bool isParquet = file.Path.EndsWith(".parquet", StringComparison.OrdinalIgnoreCase);
+            bool isDv = file.Path.EndsWith(".bin", StringComparison.OrdinalIgnoreCase);
+            if (isParquet || isDv)
+                candidates.Add(file);
         }
 
-        // Find unreferenced files older than the retention period
+        // Find unreferenced files older than the retention period.
         var cutoff = DateTimeOffset.UtcNow - retentionPeriod;
         var filesToDelete = new List<string>();
         long bytesToDelete = 0;
 
-        foreach (var file in allFiles)
+        foreach (var file in candidates)
         {
-            if (!referencedPaths.Contains(file.Path) && file.LastModified < cutoff)
+            bool live = referencedPaths.Contains(file.Path) || liveDvPaths.Contains(file.Path);
+            if (!live && file.LastModified < cutoff)
             {
                 filesToDelete.Add(file.Path);
                 bytesToDelete += file.Size;
@@ -107,6 +135,19 @@ internal static class VacuumExecutor
             FilesToDelete = filesToDelete,
             FilesDeleted = deleted,
         };
+    }
+
+    // The on-disk relative path of a storage-type-"u" deletion vector. MUST match the reader's derivation
+    // (DeletionVectorReader.ReadUuidFileAsync) exactly — if the two disagreed, vacuum could delete a live
+    // deletion vector. pathOrInlineDv = "<optional random-prefix dir><z85-encoded uuid (last 20 chars)>";
+    // resolves to "<prefix>/deletion_vector_<uuid>.bin" (or without the dir when there is no prefix).
+    private static string OnDiskDvPath(string pathOrUuid)
+    {
+        string uuid = DeletionVectorReader.DecodeUuidFromPath(pathOrUuid);
+        string prefix = pathOrUuid.Length > 20 ? pathOrUuid.Substring(0, pathOrUuid.Length - 20) : "";
+        return prefix.Length > 0
+            ? $"{prefix}/deletion_vector_{uuid}.bin"
+            : $"deletion_vector_{uuid}.bin";
     }
 
     // Writes a commitInfo-only commit, retrying past versions a concurrent writer takes (the commit carries

@@ -4991,7 +4991,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // features this implementation doesn't recognize.
         ProtocolVersions.ValidateVacuumSupport(CurrentSnapshot.Protocol);
 
-        var retention = retentionPeriod ?? _options.VacuumRetention;
+        // Retention precedence: explicit argument > the table's delta.deletedFileRetentionDuration
+        // property (Spark's default-retention knob, an interval string like "interval 7 days") >
+        // DeltaTableOptions.VacuumRetention. The property is a DEFAULT for a RETAIN-less vacuum, not an
+        // independent protection window, so an explicit argument overrides it.
+        TimeSpan retention;
+        var vacuumConfig = CurrentSnapshot.Metadata.Configuration;
+        if (retentionPeriod is not null)
+            retention = retentionPeriod.Value;
+        else if (vacuumConfig is not null
+            && vacuumConfig.TryGetValue("delta.deletedFileRetentionDuration", out var retentionProp)
+            && IntervalParser.TryParse(retentionProp, out var parsedRetention))
+            retention = parsedRetention;
+        else
+            retention = _options.VacuumRetention;
         var result = await Vacuum.VacuumExecutor.ExecuteAsync(
             _fs, _log, CurrentSnapshot, retention, dryRun, cancellationToken)
             .ConfigureAwait(false);
