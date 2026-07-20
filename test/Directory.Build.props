@@ -1,0 +1,12 @@
+<Project>
+
+  <!--
+    Test and benchmark projects are never published. Opting them out of packing
+    here (one file for the whole test/ tree) means `dotnet pack` on the solution
+    produces only the src/ libraries — no stray test/benchmark .nupkg files.
+  -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+</Project>

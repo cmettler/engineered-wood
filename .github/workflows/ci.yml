@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    # windows-latest is required because several test projects target net472,
+    # which exercises the netstandard2.0 build of the libraries.
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # parquet-testing is a git submodule that the Parquet compatibility
+          # tests read their fixtures from.
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Restore
+        run: dotnet restore engineered-wood.slnx
+
+      - name: Build
+        run: dotnet build engineered-wood.slnx --no-restore --configuration Release
+
+      - name: Test
+        # The delta-rs / Spark interop tests are gated behind EW_REQUIRE_* and
+        # skip here; the Rust / pyarrow / pylance cross-validation tests
+        # soft-skip when those toolchains aren't installed on the runner.
+        run: dotnet test engineered-wood.slnx --no-build --configuration Release --logger "trx;LogFileName=test-results.trx"
+
+      - name: Pack
+        # test/ and benchmark projects opt out of packing (test/Directory.Build.props),
+        # so this produces only the 15 src/ libraries.
+        run: dotnet pack engineered-wood.slnx --no-build --configuration Release --output artifacts
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: '**/*.trx'
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
