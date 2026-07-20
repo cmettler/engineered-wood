@@ -62,9 +62,19 @@ jobs:
             Write-Error "NUGET_API_KEY secret is not configured."
             exit 1
           }
-          # A wildcard push sends every library package; the matching .snupkg
-          # symbol package next to each .nupkg is pushed automatically.
-          dotnet nuget push "artifacts/*.nupkg" --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
+          # `dotnet nuget push` does not reliably expand a wildcard path, so
+          # enumerate the packages and push each explicitly. The matching
+          # .snupkg symbol package next to each .nupkg is pushed automatically.
+          $pkgs = Get-ChildItem -Path artifacts -Filter *.nupkg
+          if (-not $pkgs) {
+            Write-Error "No .nupkg files found in artifacts/."
+            exit 1
+          }
+          foreach ($pkg in $pkgs) {
+            Write-Host "Pushing $($pkg.Name)"
+            dotnet nuget push $pkg.FullName --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
       - name: Create GitHub Release
         env:
