@@ -40,15 +40,33 @@
     <RepositoryUrl>https://github.com/clast-project/engineered-wood</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
     <PackageTags>arrow;parquet;orc;avro;lance;vortex;delta-lake;iceberg;columnar;analytics</PackageTags>
     <PackageReleaseNotes>Preliminary 0.1.0 release. EngineeredWood is pre-1.0: every public API is subject to change — without notice and without a deprecation cycle — until 1.0.0. Pin an exact version if you depend on a package.</PackageReleaseNotes>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
 
-  <!-- Pack the repository README into every package for the nuget.org listing. -->
+  <!-- Pack the repository README and the shared clast-project icon into every
+       package for the nuget.org / Visual Studio listing. -->
   <ItemGroup Condition="'$(IsPackable)' != 'false'">
     <None Include="$(MSBuildThisFileDirectory)..\README.md" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)..\assets\icon.png" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
+  <!--
+    SourceLink: embed the GitHub repository/commit so consumers can step into
+    the library sources while debugging (paired with the snupkg symbol packages
+    above). ContinuousIntegrationBuild switches on deterministic source paths
+    when building under GitHub Actions.
+  -->
+  <PropertyGroup>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(IsPackable)' != 'false'">
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="all" />
   </ItemGroup>
 
   <!--
