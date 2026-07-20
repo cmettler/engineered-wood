@@ -314,6 +314,58 @@ public class DeltaRsInteropTests : IDisposable
         Assert.Equal([(1L, "us"), (3L, "us")], RowsFromJson(result));
     }
 
+    /// <summary>
+    /// A copy-on-write UPDATE on a PARTITIONED table reads back correctly in delta-rs, whole and
+    /// partition-filtered. Note (measured): delta-rs takes partition values from <c>add.partitionValues</c>
+    /// in the log, not from the directory, so it reads a rewritten file correctly even when EW dropped it at
+    /// the table root — this test does NOT by itself catch the layout bug (that is guarded by
+    /// <c>DeleteUpdateTests.Update_PartitionedTable_WritesRewrittenFileIntoPartitionDir</c>). Its value is
+    /// confirming the fixed layout still reads correctly cross-engine.
+    /// </summary>
+    [Fact]
+    public async Task EwUpdated_PartitionedTable_DeltaRsReadsRewrittenFile()
+    {
+        if (!DeltaRs.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, IdRegionSchema, partitionColumns: ["region"]);
+        await table.WriteAsync([IdRegionBatch([1, 2, 3], ["us", "eu", "us"])]); // us: {1,3}, eu: {2}
+
+        // Rewrite the us partition file: id -> id + 100 where region = 'us'.
+        await table.UpdateAsync(RegionEquals("us"), AddToId(100));
+
+        // Whole-table read: the updated rows must be present exactly once.
+        var all = DeltaRs.Invoke("read", new { path = _tempDir });
+        Assert.Equal([(2L, "eu"), (101L, "us"), (103L, "us")], RowsFromJson(all));
+
+        // Partition-scoped read: delta-rs lists region=us/ only — a root-dropped file would be missing.
+        var us = DeltaRs.Invoke("read", new
+        {
+            path = _tempDir,
+            filters = new object[] { new object[] { "region", "=", "us" } },
+        });
+        Assert.Equal([(101L, "us"), (103L, "us")], RowsFromJson(us));
+    }
+
+    private static Func<RecordBatch, BooleanArray> RegionEquals(string target) => batch =>
+    {
+        var region = (StringArray)batch.Column("region");
+        var mask = new BooleanArray.Builder();
+        for (int i = 0; i < region.Length; i++)
+            mask.Append(region.GetString(i) == target);
+        return mask.Build();
+    };
+
+    private static Func<RecordBatch, RecordBatch> AddToId(long delta) => batch =>
+    {
+        var id = (Int64Array)batch.Column("id");
+        var newIds = new Int64Array.Builder();
+        for (int i = 0; i < id.Length; i++)
+            newIds.Append(id.GetValue(i)!.Value + delta);
+        return new RecordBatch(IdRegionSchema, [newIds.Build(), batch.Column("region")], batch.Length);
+    };
+
     // ── Row-level concurrency — slice 9 Layer 3 sub-problem A (DELETE/DELETE deletion-vector union). ──
 
     /// <summary>

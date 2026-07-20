@@ -54,11 +54,17 @@ What follows is the forward view; everything below this section is the chronolog
 
 **Standalone bugs / interop gaps (still live, not parked)**
 
-6. **CoW UPDATE writes to the wrong directory on partitioned tables.** `ComputeUpdateActionsAsync`
-   (`DeltaTable.cs:1683`) builds the rewrite filename as a bare `{Guid:N}.parquet` with **no partition
-   subdirectory**, while its `add` carries `PartitionValues` and the append path uses
-   `PartitionUtils.BuildPartitionPath`. Pre-existing, present in the built-in branch too, **no test**.
-   Concrete and fixable now, independent of every decision above.
+6. ~~**CoW UPDATE writes to the wrong directory on partitioned tables.**~~ **FIXED (2026-07-20).**
+   `ComputeUpdateActionsAsync` built the rewrite filename as a bare `{Guid:N}.parquet` at the table ROOT
+   while its `add` carried `PartitionValues`. Now the rewritten file joins its source's partition directory,
+   mirroring the compaction rewrite: reuse the source `add.path`'s ENCODED prefix verbatim for the new `add`
+   (never re-encode — that would double-encode a non-ASCII partition value) and its DECODED form for the
+   physical write. **Measured, not assumed**: delta-rs reads a root-dropped file *correctly* (partition
+   values come from `add.partitionValues` in the log, not the directory), so the divergence was a spec-layout
+   inconsistency, not data loss for conformant readers — but appends and updates to one partition would split
+   across the root and the Hive dir, and directory-based tooling would miss the rewrite. Guarded by a
+   layout-asserting local test (`DeleteUpdateTests.Update_PartitionedTable_WritesRewrittenFileIntoPartitionDir`)
+   plus cross-engine read tests on delta-rs (tier 1, runs) and Spark (tier 3, CI).
 7. **Non-ASCII characters left literal in `add.path`** (Deferred follow-up B). Research DONE — the reference
    encoding is two-layer (Hive-escape then percent-encode), pinned by
    `DeltaRs_NonAsciiPartition_PathEncodingGroundTruth`; the fix to `DeltaPath.Encode` is **not applied**. Low

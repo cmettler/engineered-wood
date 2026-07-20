@@ -206,6 +206,48 @@ public class SparkInteropTests : IDisposable
         return mask.Build();
     };
 
+    /// <summary>
+    /// A copy-on-write UPDATE on a PARTITIONED table must write the rewritten file into the partition
+    /// directory the reference engine expects, not the table root. EW rewrites the <c>region='us'</c>
+    /// partition file (id → id+100), then Spark reads it back whole and partition-scoped. The partition
+    /// scan touches exactly the two partition files (us + eu) and returns the updated us rows — proving the
+    /// rewritten file landed where Spark's planner finds it for a <c>region='us'</c> query.
+    /// </summary>
+    [Fact]
+    public async Task EwUpdated_PartitionedTable_SparkReadsRewrittenFile()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, IdRegionSchema, partitionColumns: ["region"]);
+        await table.WriteAsync([IdRegionBatch([1, 2, 3], ["us", "eu", "us"])]); // us: {1,3}, eu: {2}
+
+        await table.UpdateAsync(
+            b =>
+            {
+                var region = (StringArray)b.Column("region");
+                var mask = new BooleanArray.Builder();
+                for (int i = 0; i < region.Length; i++) mask.Append(region.GetString(i) == "us");
+                return mask.Build();
+            },
+            b =>
+            {
+                var id = (Int64Array)b.Column("id");
+                var newIds = new Int64Array.Builder();
+                for (int i = 0; i < id.Length; i++) newIds.Append(id.GetValue(i)!.Value + 100);
+                return new RecordBatch(IdRegionSchema, [newIds.Build(), b.Column("region")], b.Length);
+            });
+
+        var all = Spark.Invoke("read", new { path = _tempDir });
+        Assert.Equal([(2L, "eu"), (101L, "us"), (103L, "us")], RowsFromJson(all));
+
+        var us = Spark.Invoke("scan", new { path = _tempDir, filter = "region = 'us'" });
+        Assert.Equal(2, us.GetProperty("files_total").GetInt32());   // one file per partition
+        Assert.Equal(1, us.GetProperty("files_scanned").GetInt32()); // only region=us pruned in
+        Assert.Equal([(101L, "us"), (103L, "us")], RowsFromJson(us));
+    }
+
     /// <summary>The reference implementation writes, EW reads.</summary>
     [Fact]
     public async Task SparkWritten_SimpleTable_EwReadsSameRows()

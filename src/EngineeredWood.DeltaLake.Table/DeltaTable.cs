@@ -1679,8 +1679,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (!fileModified)
                 continue;
 
-            // Write new file with all output batches
-            string newFileName = $"{Guid.NewGuid():N}.parquet";
+            // Write new file with all output batches. The rewritten file joins its source's partition
+            // directory (a partitioned table's data must live under its Hive dir, matching the append path);
+            // reuse the source path's ENCODED prefix verbatim for the add — never re-encode, which would
+            // double-encode a non-ASCII partition value — and its DECODED form for the physical write. An
+            // empty prefix means an unpartitioned table (files at the root). Mirrors the compaction rewrite.
+            string encodedDir = "";
+            int dirSlash = addFile.Path.LastIndexOf('/');
+            if (dirSlash >= 0)
+                encodedDir = addFile.Path.Substring(0, dirSlash + 1);
+            string baseName = $"{Guid.NewGuid():N}.parquet";
+            string newFileName = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir) + baseName;
             long fileSize;
 
             // Physical names + parquet field ids at EVERY level (nested struct children included — the
@@ -1741,7 +1750,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             actions.Add(new AddFile
             {
-                Path = EngineeredWood.DeltaLake.DeltaPath.Encode(newFileName),
+                Path = encodedDir + baseName, // encoded prefix reused verbatim (see newFileName above)
                 PartitionValues = addFile.PartitionValues,
                 Size = fileSize,
                 ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),

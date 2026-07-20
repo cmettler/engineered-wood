@@ -198,10 +198,13 @@ positions, row ids and commit versions are preserved for free, with no materiali
    **Sequencing consequence (now unblocked).** Delta variant support could not have been built on the
    old foundation: a Delta reader that merely registered the extension would have inherited silent
    empty-value reads for every Spark-written column.
-2. **CoW UPDATE writes to the wrong directory on partitioned tables.** `DeltaTable.cs:1189` builds the
-   rewrite filename as a bare `{Guid:N}.parquet` with no partition subdirectory, while the add action
-   copies `addFile.PartitionValues`. Pre-existing and present in the built-in branch too — not a seam
-   bug, but the seam propagates it to host codecs. No test covers it.
+2. ~~**CoW UPDATE writes to the wrong directory on partitioned tables.**~~ **FIXED (2026-07-20)**, and
+   independent of the seam decision. `ComputeUpdateActionsAsync` built the rewrite filename as a bare
+   `{Guid:N}.parquet` at the table root while the add copied `addFile.PartitionValues`. Now it joins the
+   source's partition directory (reuse the source path's encoded prefix verbatim; decode for the physical
+   write), mirroring the compaction rewrite — so a host codec receives the correct partitioned `fileName`
+   too. Measured: delta-rs read the root-dropped file fine (partition values are authoritative from the log),
+   so it was a spec-layout bug, not data loss. See `doc/upstream-landing-notes.md` gap #6 for the tests.
 3. **`relativePath` encoding is unspecified and the call sites disagree.** The reader's XML doc says
    "URL-decoded"; the writer's says nothing. `DeltaTable.cs` (write path) passes the **raw** name;
    `CompactionExecutor` passes an explicitly `DeltaPath.Decode`d one. They agree only because both

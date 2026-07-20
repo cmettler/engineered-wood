@@ -285,4 +285,67 @@ public class DeleteUpdateTests : IDisposable
         Assert.Equal(5L, allData[3].Id);
         Assert.Equal("e", allData[3].Value);
     }
+
+    private static Apache.Arrow.Schema IdRegionSchema { get; } = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("region", StringType.Default, false))
+        .Build();
+
+    private static RecordBatch IdRegionBatch(long[] ids, string[] regions)
+    {
+        var region = new StringArray.Builder();
+        foreach (var r in regions) region.Append(r);
+        return new RecordBatch(IdRegionSchema,
+            [new Int64Array.Builder().AppendRange(ids).Build(), region.Build()], ids.Length);
+    }
+
+    /// <summary>
+    /// A copy-on-write UPDATE on a PARTITIONED table must write the rewritten file INTO the partition
+    /// directory its <c>add.partitionValues</c> names, exactly as the append path does — not the table
+    /// root. Conformant readers take partition values from the log (delta-rs reads a root-dropped file
+    /// fine), so this asserts the on-disk layout directly, where the divergence is.
+    /// </summary>
+    [Fact]
+    public async Task Update_PartitionedTable_WritesRewrittenFileIntoPartitionDir()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, IdRegionSchema, partitionColumns: ["region"]);
+        await table.WriteAsync([IdRegionBatch([1, 2, 3], ["us", "eu", "us"])]); // us: {1,3}, eu: {2}
+
+        // Rewrite the us partition file: id -> id + 100 where region = 'us'.
+        await table.UpdateAsync(
+            batch =>
+            {
+                var region = (StringArray)batch.Column("region");
+                var mask = new BooleanArray.Builder();
+                for (int i = 0; i < region.Length; i++) mask.Append(region.GetString(i) == "us");
+                return mask.Build();
+            },
+            batch =>
+            {
+                var id = (Int64Array)batch.Column("id");
+                var newIds = new Int64Array.Builder();
+                for (int i = 0; i < id.Length; i++) newIds.Append(id.GetValue(i)!.Value + 100);
+                return new RecordBatch(IdRegionSchema, [newIds.Build(), batch.Column("region")], batch.Length);
+            });
+
+        var usFile = table.CurrentSnapshot.ActiveFiles.Values
+            .Single(f => f.PartitionValues["region"] == "us");
+        Assert.StartsWith("region=us/", usFile.Path);
+        Assert.True(
+            File.Exists(Path.Combine(_tempDir, usFile.Path.Replace('/', Path.DirectorySeparatorChar))),
+            $"rewritten file '{usFile.Path}' should physically exist under the partition directory");
+
+        // Sanity: the update itself is correct.
+        var rows = new List<(long, string)>();
+        await foreach (var b in table.ReadAllAsync())
+        {
+            var id = (Int64Array)b.Column("id");
+            var region = (StringArray)b.Column("region");
+            for (int i = 0; i < b.Length; i++) rows.Add((id.GetValue(i)!.Value, region.GetString(i)));
+        }
+        rows.Sort();
+        Assert.Equal([(2L, "eu"), (101L, "us"), (103L, "us")], rows);
+    }
 }
