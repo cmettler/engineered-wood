@@ -87,4 +87,59 @@ public class StatsCollectorTests
 
         Assert.Null(StatsCollector.Collect(batch));
     }
+
+    [Fact]
+    public void Collect_DateColumn_EmitsIsoStrings()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("d", Date32Type.Default, true))
+            .Build();
+
+        var dates = new Date32Array.Builder()
+            .Append(new DateTime(2021, 6, 1, 0, 0, 0, DateTimeKind.Utc))
+            .Append(new DateTime(2021, 1, 1, 0, 0, 0, DateTimeKind.Utc))
+            .AppendNull()
+            .Append(new DateTime(2021, 12, 31, 0, 0, 0, DateTimeKind.Utc))
+            .Build();
+        var batch = new RecordBatch(schema, [dates], 4);
+
+        string? stats = StatsCollector.Collect(batch);
+        Assert.NotNull(stats);
+
+        var doc = JsonDocument.Parse(stats);
+        var min = doc.RootElement.GetProperty("minValues").GetProperty("d");
+        var max = doc.RootElement.GetProperty("maxValues").GetProperty("d");
+        // Delta stores date bounds as "yyyy-MM-dd" STRINGS (a raw day number is not decodable and never
+        // prunes) — this is the format Spark writes and EW's DeltaLiteralDecoder reads.
+        Assert.Equal(JsonValueKind.String, min.ValueKind);
+        Assert.Equal("2021-01-01", min.GetString());
+        Assert.Equal("2021-12-31", max.GetString());
+        Assert.Equal(1, doc.RootElement.GetProperty("nullCount").GetProperty("d").GetInt64());
+    }
+
+    [Fact]
+    public void Collect_DateColumn_MergesAcrossBatches()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("d", Date32Type.Default, false))
+            .Build();
+
+        RecordBatch Batch(params DateTime[] days)
+        {
+            var b = new Date32Array.Builder();
+            foreach (var d in days) b.Append(DateTime.SpecifyKind(d, DateTimeKind.Utc));
+            return new RecordBatch(schema, [b.Build()], days.Length);
+        }
+
+        string? stats = StatsCollector.Collect(
+        [
+            Batch(new DateTime(2020, 5, 5), new DateTime(2020, 8, 8)),
+            Batch(new DateTime(2019, 1, 1), new DateTime(2021, 3, 3)),
+        ]);
+        Assert.NotNull(stats);
+
+        var doc = JsonDocument.Parse(stats);
+        Assert.Equal("2019-01-01", doc.RootElement.GetProperty("minValues").GetProperty("d").GetString());
+        Assert.Equal("2021-03-03", doc.RootElement.GetProperty("maxValues").GetProperty("d").GetString());
+    }
 }

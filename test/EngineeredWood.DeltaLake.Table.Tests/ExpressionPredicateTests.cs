@@ -293,6 +293,34 @@ public class ExpressionPredicateTests : IDisposable
         Assert.Equal([1L], await ReadIds(table));
     }
 
+    /// <summary>
+    /// End-to-end precision for a DATE predicate, which relies on date file statistics now being emitted as
+    /// decodable "yyyy-MM-dd" strings. A Serializable transaction deletes <c>d &gt;= June</c>; a concurrent
+    /// append of a January row lands first. Its date stats prove it holds nothing at or after June, so it
+    /// does not match the delete's read predicate — no conflict, the delete rebases and lands. Were date
+    /// stats still emitted as a raw (undecodable) number, the checker would treat the append as an unknown
+    /// match and wrongly abort — so this also guards the stats fix.
+    /// </summary>
+    [Fact]
+    public async Task Serializable_ConcurrentDateAppendDisjoint_Lands()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdDateSchema);
+        await table.WriteAsync([DateBatch([1], [new DateTime(2021, 6, 15)])]);
+
+        var tx = table.StartTransaction(IsolationLevel.Serializable);
+        long matched = await tx.DeleteAsync(
+            Ex.GreaterThanOrEqual("d", new DateTimeOffset(2021, 6, 1, 0, 0, 0, TimeSpan.Zero)));
+        Assert.Equal(1, matched);
+
+        // Concurrent append of a January row — provably before June by its date stats.
+        await table.WriteAsync([DateBatch([2], [new DateTime(2021, 1, 10)])]);
+
+        await tx.CommitAsync(); // no conflict — the append cannot satisfy d >= June
+
+        Assert.Equal([2L], await ReadIds(table)); // id 1 (June) deleted, id 2 (January) survives
+    }
+
     private static Apache.Arrow.Schema IdTsSchema { get; } = new Apache.Arrow.Schema.Builder()
         .Field(new Field("id", Int64Type.Default, false))
         .Field(new Field("ts", new TimestampType(TimeUnit.Microsecond, "UTC"), false))

@@ -340,6 +340,44 @@ public class SparkInteropTests : IDisposable
     }
 
     /// <summary>
+    /// DATE column statistics written by EW must let the reference implementation skip files. Delta stores
+    /// date bounds as "yyyy-MM-dd" strings; EW previously emitted a raw day number, which Spark cannot
+    /// decode as a date bound, so it pruned nothing. This writes three single-row files spanning three
+    /// years and asserts Spark skips the out-of-range one under a date predicate — proving EW's date stats
+    /// are in the format a foreign reader actually prunes on.
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_DateStats_SparkSkipsFilesWithoutLosingRows()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("d", Date32Type.Default, false))
+            .Build();
+
+        RecordBatch DateRow(long id, DateTime day)
+        {
+            var ids = new Int64Array.Builder().Append(id).Build();
+            var dates = new Date32Array.Builder()
+                .Append(DateTime.SpecifyKind(day, DateTimeKind.Utc)).Build();
+            return new RecordBatch(schema, [ids, dates], 1);
+        }
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, schema);
+        await table.WriteAsync([DateRow(1, new DateTime(2020, 1, 15))]);  // pruned
+        await table.WriteAsync([DateRow(2, new DateTime(2021, 6, 20))]);
+        await table.WriteAsync([DateRow(3, new DateTime(2022, 12, 31))]);
+
+        var result = Spark.Invoke("scan", new { path = _tempDir, filter = "d >= DATE '2021-06-01'" });
+
+        Assert.Equal(3, result.GetProperty("files_total").GetInt32());
+        Assert.Equal(2, result.GetProperty("files_scanned").GetInt32()); // the 2020 file is skipped
+        Assert.Equal(2, result.GetProperty("row_count").GetInt32());
+    }
+
+    /// <summary>
     /// <para>The same thing one level down. Slice 8 landed nested stats end-to-end
     /// (<c>minValues.payload.score</c> and friends), and nothing external has ever read them — a
     /// round-trip cannot, because EW's own reader does not prune on them.</para>

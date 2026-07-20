@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Globalization;
 using System.Text.Json;
 using Apache.Arrow;
 
@@ -182,6 +183,16 @@ internal static class StatsCollector
                 WriteBoundsObject(writer, nested, isMax);
                 continue;
             }
+            if (value is DateStat date)
+            {
+                // A date bound is written as "yyyy-MM-dd"; an unrepresentable one is omitted (safe).
+                string? iso = date.ToIsoOrNull();
+                if (iso is null)
+                    continue;
+                writer.WritePropertyName(kvp.Key);
+                writer.WriteStringValue(iso);
+                continue;
+            }
             if (value is string str && str.Length > StringStatMaxLength)
             {
                 value = isMax ? (object?)TruncateMaxString(str) : str.Substring(0, StringStatMaxLength);
@@ -273,7 +284,7 @@ internal static class StatsCollector
                 CollectBooleanMinMax(name, bln, minValues, maxValues);
                 break;
             case Date32Array d32:
-                CollectNumericMinMax(name, d32, minValues, maxValues);
+                CollectDateMinMax(name, d32, minValues, maxValues);
                 break;
             case TimestampArray ts:
                 CollectTimestampMinMax(name, ts, minValues, maxValues);
@@ -451,6 +462,67 @@ internal static class StatsCollector
         return tsType.Timezone is not null
             ? dto.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'")
             : dto.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff");
+    }
+
+    private static void CollectDateMinMax(
+        string name, Date32Array array,
+        Dictionary<string, object?> minValues,
+        Dictionary<string, object?> maxValues)
+    {
+        // Date32 is a day count since the Unix epoch; compare on the integer (monotonic with the date) and
+        // format to Spark's "yyyy-MM-dd" only at serialization. Delta stats decode a date bound from that
+        // string, so emitting a raw number (as CollectNumericMinMax would) is not decodable and never prunes.
+        int? min = null;
+        int? max = null;
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (array.IsNull(i)) continue;
+            int day = array.GetValue(i)!.Value;
+            if (min is null || day < min.Value) min = day;
+            if (max is null || day > max.Value) max = day;
+        }
+
+        if (min is not null)
+        {
+            int m = min.Value;
+            if (minValues.TryGetValue(name, out var em) && em is DateStat eMin)
+                m = Math.Min(m, eMin.Days);
+            minValues[name] = new DateStat(m);
+        }
+        if (max is not null)
+        {
+            int m = max.Value;
+            if (maxValues.TryGetValue(name, out var ex) && ex is DateStat eMax)
+                m = Math.Max(m, eMax.Days);
+            maxValues[name] = new DateStat(m);
+        }
+    }
+
+    /// <summary>
+    /// A date column min/max bound, kept as the raw day count so bounds compare and merge as integers;
+    /// rendered to the Delta stats <c>"yyyy-MM-dd"</c> form only when written.
+    /// </summary>
+    private readonly struct DateStat
+    {
+        public DateStat(int days) => Days = days;
+
+        public int Days { get; }
+
+        /// <summary>The bound as <c>"yyyy-MM-dd"</c>, or null when the day count falls outside
+        /// <see cref="DateTime"/>'s representable range (0001-9999) — the caller then omits the bound,
+        /// which is always prune-safe.</summary>
+        public string? ToIsoOrNull()
+        {
+            try
+            {
+                var d = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddDays(Days);
+                return d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return null;
+            }
+        }
     }
 
     private static void WriteStatValue(Utf8JsonWriter writer, object value)
