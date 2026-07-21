@@ -3808,6 +3808,133 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// DELETE by TRANSIENT rowid using DELETION VECTORS (no file rewrite): each affected file's existing DV is
+    /// unioned with the new in-file positions (decoded from <c>rowid &amp; posMask</c>) and a fresh DV written;
+    /// the commit is <c>remove</c>(old file+DV) + <c>add</c>(same file, new DV). The <paramref name="rowIds"/>
+    /// MUST be the ABSOLUTE positions <see cref="ReadAllWithRowIdsAsync"/> emits so repeated DV deletes compose.
+    /// Requires <c>delta.enableDeletionVectors</c>. With <paramref name="rowLevelRetry"/>, a concurrent DV-delete
+    /// of the SAME file re-unions when the touched rows are disjoint (row-level concurrency, via
+    /// <see cref="CommitOccAsync"/>'s row-level path) instead of aborting. Returns the rows newly deleted and the
+    /// committed version. The committing, DV-based sibling of <see cref="ComputeDeletionVectorActionsAsync"/>.
+    /// </summary>
+    public async ValueTask<(long RowsDeleted, long Version)> DeleteByRowIdsViaVectorsAsync(
+        IReadOnlyCollection<long> rowIds,
+        CancellationToken cancellationToken = default,
+        bool rowLevelRetry = false)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        if (rowIds.Count == 0)
+            return (0, snapshot.Version);
+
+        HonorWriterFeatures(snapshot, isAppend: false);
+        if (!DeletionVectors.DeletionVectorConfig.IsEnabled(snapshot.Metadata.Configuration))
+            throw new InvalidOperationException(
+                "DeleteByRowIdsViaVectorsAsync requires deletion vectors — create the table with "
+                + "DeltaTable.CreateAsync(..., enableDeletionVectors: true), or use the copy-on-write "
+                + "DeleteByRowIdsAsync.");
+
+        long posMask = (1L << RowIdPositionBits) - 1;
+        var positionsByFile = new Dictionary<int, HashSet<long>>();
+        foreach (var rid in rowIds)
+        {
+            int ordinal = (int)(rid >> RowIdPositionBits);
+            if (!positionsByFile.TryGetValue(ordinal, out var set))
+                positionsByFile[ordinal] = set = new HashSet<long>();
+            set.Add(rid & posMask);
+        }
+
+        var ordered = OrderedActiveFiles(snapshot);
+        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
+        var actions = new List<DeltaAction>();
+        var removedPaths = new HashSet<string>(StringComparer.Ordinal);
+        var dvEdits = new List<DeleteDvEdit>();
+        long totalDeleted = 0;
+
+        foreach (var kvp in positionsByFile)
+        {
+            int ordinal = kvp.Key;
+            if (ordinal < 0 || ordinal >= ordered.Count)
+                continue;
+            var addFile = ordered[ordinal];
+
+            var allDeleted = addFile.DeletionVector is not null
+                ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
+                    .ConfigureAwait(false))
+                : new HashSet<long>();
+            var newPositions = new List<long>();
+            foreach (long p in kvp.Value)
+                if (allDeleted.Add(p))
+                    newPositions.Add(p);
+            if (newPositions.Count == 0)
+                continue;
+            totalDeleted += newPositions.Count;
+
+            var newDv = await dvWriter.CreateAsync(allDeleted, allDeleted.Count, cancellationToken)
+                .ConfigureAwait(false);
+
+            actions.Add(new RemoveFile
+            {
+                Path = addFile.Path,
+                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = true,
+                DeletionVector = addFile.DeletionVector,
+            });
+            actions.Add(addFile with
+            {
+                DeletionVector = newDv,
+                DataChange = true,
+                Stats = StatsWithLooseBounds(addFile.Stats),
+            });
+            removedPaths.Add(addFile.Path);
+            dvEdits.Add(new DeleteDvEdit(addFile.Path, newPositions));
+
+            // Change Data Feed: a DV delete rewrites no data, so read the newly-deleted rows (matched by
+            // ABSOLUTE position — the file's original DV survivors keep their absolute positions) and emit a
+            // "delete" change file.
+            if (cdfEnabled)
+            {
+                var newSet = new HashSet<long>(newPositions);
+                var absOut = new List<Int64Array?>();
+                int bi = -1;
+                await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
+                                                          strippedAbsPositionsOut: absOut).ConfigureAwait(false))
+                {
+                    bi++;
+                    var absPos = bi < absOut.Count ? absOut[bi] : null;
+                    if (absPos is null)
+                        continue;
+                    var delRows = new List<int>();
+                    for (int i = 0; i < batch.Length; i++)
+                        if (!absPos.IsNull(i) && newSet.Contains(absPos.GetValue(i)!.Value))
+                            delRows.Add(i);
+                    if (delRows.Count > 0)
+                    {
+                        var cdc = await ChangeDataFeed.CdfWriter.WriteAsync(
+                            _fs, TakeRowsFromBatch(batch, delRows), DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                            addFile.PartitionValues, _options.ParquetWriteOptions,
+                            cancellationToken).ConfigureAwait(false);
+                        actions.Add(cdc);
+                    }
+                }
+            }
+        }
+
+        if (actions.Count == 0)
+            return (0, snapshot.Version);
+
+        long version = await CommitOccAsync(
+            snapshot, actions,
+            new Concurrency.ReadSet { Files = removedPaths }, removedPaths,
+            IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: true, cancellationToken,
+            rowLevelDeletes: rowLevelRetry ? dvEdits : null).ConfigureAwait(false);
+        return (totalDeleted, version);
+    }
+
+    /// <summary>
     /// Reads exactly the rows identified by the given transient rowids (<c>(fileOrdinal &lt;&lt; RowIdPositionBits)
     /// | absolutePosition</c> against the snapshot pinned by <paramref name="atVersion"/>) — the read-back step a
     /// buffered UPDATE's post-image is built from. Deletion-vector-excluded rows never match (the read filters
