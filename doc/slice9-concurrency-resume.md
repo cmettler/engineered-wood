@@ -203,6 +203,17 @@ Design facts worth keeping:
    (documented on the method), not introduced here. Validates changeType + requires CDF enabled. 5 tests in
    `CdfWriteSeamTests` (fused-append read-cdc-only, delete-feed round-trip, partitionValues tagging, guards); full
    non-interop suite green (363). **With gaps 1-4 all landed, the entire pr-4 public surface is now on master.**
+
+   **CDF spec-conformance follow-up (`7ee2c97`).** The CDF subsystem previously round-tripped CDC rows VERBATIM,
+   so on a column-mapping table `_change_data` files carried LOGICAL names (not the spec's physical names + field
+   ids) and the feed omitted partition columns — a real cross-engine divergence. FIXED both sides: writer
+   (`CdfWriter.WriteAsync` takes the snapshot + `ToPhysical`; all 4 internal callers + the public helper updated)
+   and reader (`CdfReader` maps physical→logical + re-materializes partition columns via `AddPartitionColumns`, in
+   BOTH the cdc-file and inferred add/remove branches). Non-mapped/non-partitioned output is byte-identical (no-op
+   transforms). **MEASURED:** `SparkInteropTests.EwWritten_ChangeDataFeed_MappedPartitioned_SparkReadsLogicalNamesAndPartition`
+   — Spark 4.0.1 `readChangeFeed` resolves an EW mapped+partitioned feed to logical names + partition value +
+   change types. Full matrix green: 366 non-interop, 25 Spark, 13 delta-rs.
+
    **Deferred (no parked test, follow-up):** the EXPLICIT buffered remap-across-rewrite — `RebaseDvDmlActionsAsync`
    conflicts when a modified file was concurrently rewritten (the AUTO commit path already remaps by stable id).
 
