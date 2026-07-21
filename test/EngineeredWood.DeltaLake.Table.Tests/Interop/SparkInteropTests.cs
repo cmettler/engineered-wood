@@ -356,6 +356,37 @@ public class SparkInteropTests : IDisposable
         Assert.Equal(4L, idToRowId[50]);
     }
 
+    /// <summary>
+    /// A row-tracking append that REBASES past a concurrent append must still assign spec-correct row ids: the
+    /// loser's baseRowId is re-derived from the advanced high-water mark, so Spark reads contiguous, unique ids
+    /// across both files (0,1 from the winner, 2 from the rebased loser). This is the cross-engine proof for
+    /// "limitation 2"'s append half — a wrong re-derivation would surface as a DUPLICATE row id (the loser
+    /// reusing the winner's space) or a gap, which a round-trip through EW alone could not detect.
+    /// </summary>
+    [Fact]
+    public async Task EwConcurrentAppends_RowTracking_Rebased_SparkReadsContiguousIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var setup = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
+        {
+            // create only — the two appends below race from the same base version
+        }
+
+        await using var tableA = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        await using var tableB = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+
+        long vA = await tableA.WriteAsync([IdRegionBatch([10, 20], ["us", "eu"])]); // ids 0, 1
+        long vB = await tableB.WriteAsync([IdRegionBatch([30], ["apac"])]);          // stale -> rebases -> id 2
+        Assert.True(vB > vA);
+
+        var result = Spark.Invoke("read_row_ids", new { path = _tempDir });
+        var rowIds = result.GetProperty("row_ids").EnumerateArray()
+            .Select(e => e.GetInt64()).OrderBy(x => x).ToList();
+        Assert.Equal([0L, 1L, 2L], rowIds); // contiguous + unique -> the rebased file's baseRowId was re-derived
+    }
+
     /// <summary>"delete the row(s) with this id" as the functional predicate DeleteAsync takes.</summary>
     private static Func<RecordBatch, BooleanArray> DeleteId(long target) => batch =>
     {

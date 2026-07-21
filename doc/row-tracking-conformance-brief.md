@@ -226,13 +226,14 @@ validation) that pr-4 lacks.
 
 ## Relationship to Layer 3 (B) — row-level concurrency across rewrites
 
-**DONE for the DELETE side (2026-07-20, Milestone 3):** `DeltaTable.RemapRowLevelDeletesAsync` on master (a
-port of pr-4's `RemapRowsAcrossRewriteAsync`, adapted onto master's M2 read-out-params rather than pr-4's
-transient rowid column), called from `ResolveRowLevelDeletesAsync` when a delete's file was rewritten away. A
-DELETE-only transaction is rebase-safe under RT (`CommitTransactionAsync`). What is NOT done: rebasing a losing
-UPDATE/append (pr-4's `RebaseDvDmlActionsAsync` re-derives the post-image add's baseRowId from the advanced
-high-water mark — the other half of limitation 2). The original brief below describes pr-4's "v2" mechanics the
-DELETE remap implements:
+**DONE (2026-07-20).** DELETE side (Milestone 3): `DeltaTable.RemapRowLevelDeletesAsync` on master (a port of
+pr-4's `RemapRowsAcrossRewriteAsync`, adapted onto master's M2 read-out-params rather than pr-4's transient
+rowid column), called from `ResolveRowLevelDeletesAsync` when a delete's file was rewritten away. UPDATE/append
+side (limitation 2's other half): `DeltaTable.RebaseRowTrackingAddIds` re-derives each rebasing post-image add's
+`baseRowId` from `latestSnapshot.RowIdHighWaterMark` + `defaultRowCommitVersion` from the attempt version and
+rebuilds the HWM domain (a port of pr-4's `RebaseDvDmlActionsAsync` post-image branch); all callers pass
+`rebaseSafe: true`. Both measured on Spark. The original brief below describes pr-4's "v2" mechanics the DELETE
+remap implements:
 
 - **Record row IDs, not just positions.** Master's `DeleteDvEdit` records absolute positions (stable across a
   DV swap — that is what makes (A) work). (B) also needs the **row IDs** so a rewrite that relocates rows can
@@ -241,8 +242,10 @@ DELETE remap implements:
   replaced by successor file(s); relocate each deleted row ID by the successor's materialized column (else
   `baseRowId + position`), and use the row's **commit version** as the concurrent-modification discriminator
   — a relocated-untouched row keeps its version and both land; a concurrently updated/deleted row conflicts.
-- **Relax `rebaseSafe: false` for row-tracking deletes** (retires limitation 2): correct once rewrites
-  preserve ids.
+- **Relax `rebaseSafe: false` for row tracking** (retires limitation 2): DONE. DELETEs rebase via DV
+  union/remap (existing/new files keep their own baseRowId); appends and UPDATE post-image adds rebase via
+  `RebaseRowTrackingAddIds` (baseRowId re-derived from the advanced high-water mark). Only the overwrite family
+  stays single-attempt now, for the unrelated whole-active-set read-set reason.
 
 Un-skips (all `[Fact(Skip = RowLevelConcurrency)]` in `PendingCoverageTests.cs`), once the rewrite-writer
 port (plan step 1) and the remap port (step 5) land: `ConcurrentUpdateAndDelete_DisjointRows_BothLand`,

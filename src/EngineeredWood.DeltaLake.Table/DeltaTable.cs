@@ -1096,36 +1096,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var baseSnapshot = transaction.BaseSnapshot;
 
-        bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-            baseSnapshot.Metadata.Configuration);
-
-        // A rebased append/update needs its new file's baseRowId recomputed against the advanced high-water
-        // mark, which is not implemented — so under row tracking such a transaction still aborts rather than
-        // rebase (limitation 2). A DELETE, by contrast, only edits deletion vectors on EXISTING files (its
-        // re-add keeps that file's own baseRowId) and — when a file was concurrently rewritten — remaps its
-        // rows by STABLE ROW ID onto the new files (Layer 3 B), which likewise keep their baseRowId. So a
-        // DELETE-only transaction is rebase-safe and row-level-resolvable even under row tracking.
-        bool deleteOnly = transaction.Operation == "DELETE";
-        bool rebaseSafe = !rowTracking || deleteOnly;
-
-        // Files = what a staged delete/update rewrote (concurrentDeleteRead). Predicates = the analyzable
-        // read predicates staged on this transaction (empty for functional-predicate or append-only work);
-        // a concurrent add matching one is a concurrentAppend conflict, precise to the isolation level. The
-        // pruner the checker needs is built inside CommitOccAsync from the base snapshot.
+        // Every transactional operation is now rebase-safe under row tracking: a DELETE only edits deletion
+        // vectors on EXISTING files (its re-add keeps that file's own baseRowId), or — when a file was
+        // concurrently rewritten — remaps its rows by STABLE ROW ID onto the new files (Layer 3 B); an append
+        // or an UPDATE's copy-on-write rewrite is a fresh (post-image) add whose baseRowId CommitOccAsync
+        // re-derives against the advanced high-water mark on rebase. Overwrite modes are not stageable on a
+        // transaction, so nothing here reads the whole active-file set (the one remaining non-rebase-safe case).
         var reads = new Concurrency.ReadSet
         {
             Files = transaction.RemovedPaths,
             Predicates = transaction.ReadPredicates,
         };
 
-        // Row-level DELETE/DELETE reconciliation (DV union, or remap across a concurrent rewrite) engages only
-        // when the transaction is a rebase-safe delete; a mixed or non-delete transaction under row tracking
-        // aborts before reaching it.
         return CommitOccAsync(
             baseSnapshot, transaction.DataActions, reads, transaction.RemovedPaths,
-            transaction.IsolationLevel, transaction.Operation, rebaseSafe,
+            transaction.IsolationLevel, transaction.Operation, rebaseSafe: true,
             cancellationToken,
-            rowLevelDeletes: rebaseSafe ? transaction.DvEdits : null);
+            rowLevelDeletes: transaction.DvEdits);
     }
 
     /// <summary>Shared by blind-append commits, which plan no removes.</summary>
@@ -1163,11 +1150,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns);
         bool rowLevel = rowLevelDeletes is { Count: > 0 };
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+            baseSnapshot.Metadata.Configuration);
 
         // The actions actually written this attempt. Starts as the actions computed against the base
-        // snapshot; a row-level rebase replaces it with deletion-vector-union actions computed against the
-        // latest snapshot. Always derived from the original `dataActions`, never from a prior rebase, so
-        // each retry rebases the STABLE row edits onto whatever the newest snapshot holds.
+        // snapshot; a rebase replaces it with actions computed against the latest snapshot — a row-level
+        // delete's deletion-vector-union/remap actions, and/or a re-derivation of row-tracking post-image ids.
+        // Always sourced from the original `dataActions` (or the row-level resolution of them), never from a
+        // prior rebase, so each retry rebases the STABLE staged work onto whatever the newest snapshot holds.
         var currentActions = dataActions;
 
         long attemptVersion = baseSnapshot.Version + 1;
@@ -1186,11 +1176,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
             catch (DeltaConflictException) when (attempt + 1 < maxAttempts)
             {
-                // Row-level DELETE/DELETE reconciliation needs the concurrent files' current deletion
-                // vectors, so build the latest snapshot; the append/update paths only need the version.
+                // Row-level DELETE/DELETE reconciliation needs the concurrent files' current deletion vectors,
+                // and a row-tracking rebase needs the advanced high-water mark, so both build the latest
+                // snapshot; a plain (non-tracking) append/update rebase only needs the version.
                 long latest;
                 Snapshot.Snapshot? latestSnapshot = null;
-                if (rowLevel)
+                if (rowLevel || rowTrackingEnabled)
                 {
                     latestSnapshot = await SnapshotBuilder.UpdateAsync(
                         baseSnapshot, _log, cancellationToken).ConfigureAwait(false);
@@ -1227,6 +1218,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     currentActions = resolution.Value.Actions;
                     resolvedPaths = resolution.Value.ResolvedPaths;
                 }
+                else
+                {
+                    currentActions = dataActions; // stable source; row-tracking ids re-derived below
+                }
 
                 var verdict = Concurrency.ConflictChecker.Check(
                     reads, plannedRemovePaths, pruner, isolationLevel, concurrent, resolvedPaths);
@@ -1236,9 +1231,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (!rebaseSafe)
                 {
                     throw new DeltaConflictException(
-                        "A concurrent commit landed and this operation cannot be safely rebased onto it "
-                        + "(row-tracking baseRowId reassignment is not yet supported); retry the operation.");
+                        "A concurrent commit landed and this operation cannot be safely rebased onto it; "
+                        + "retry the operation.");
                 }
+
+                // Re-derive row-tracking post-image ids against the snapshot we now land on (a concurrent
+                // commit may have consumed row-id space). No-op for the row-level delete's own re-adds — they
+                // keep their existing baseRowId (excluded by resolvedPaths / base-active membership).
+                if (rowTrackingEnabled)
+                    currentActions = RebaseRowTrackingAddIds(
+                        currentActions, baseSnapshot, latestSnapshot!, latest + 1, resolvedPaths);
 
                 attemptVersion = latest + 1; // no conflict — rebase and retry
             }
@@ -1522,6 +1524,71 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return result;
     }
 
+    /// <summary>
+    /// Re-derives the row-tracking ids of a rebasing transaction's POST-IMAGE adds against the snapshot it is
+    /// now landing on. A fresh add (an append, or an UPDATE's copy-on-write rewrite output) reserved its
+    /// <c>baseRowId</c> from the STALE base high-water mark; a concurrent commit that landed in between may
+    /// have consumed row-id space, so committing verbatim would assign an already-used id. This reassigns each
+    /// post-image add's <c>baseRowId</c> from <paramref name="latestSnapshot"/>'s high-water mark and its
+    /// <c>defaultRowCommitVersion</c> to <paramref name="attemptVersion"/>, and rebuilds the
+    /// <c>delta.rowTracking</c> high-water-mark domain to match — mirroring Spark's row-id reassignment on
+    /// conflict resolution and pr-4's <c>RebaseDvDmlActionsAsync</c>.
+    ///
+    /// <para>A post-image add is a data-change <see cref="AddFile"/> carrying a <c>baseRowId</c> whose path is
+    /// NOT active in <paramref name="baseSnapshot"/> and was NOT produced by the row-level DELETE resolution
+    /// (<paramref name="resolvedPaths"/>). Those excluded adds — a DV re-union re-add of an existing file, or a
+    /// remap re-add on a concurrently-rewritten file — already carry the correct (their own) <c>baseRowId</c>
+    /// and must be left untouched.</para>
+    /// </summary>
+    private static List<DeltaAction> RebaseRowTrackingAddIds(
+        IReadOnlyList<DeltaAction> actions,
+        Snapshot.Snapshot baseSnapshot,
+        Snapshot.Snapshot latestSnapshot,
+        long attemptVersion,
+        ISet<string>? resolvedPaths)
+    {
+        var baseActivePaths = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var f in baseSnapshot.ActiveFiles.Values)
+            baseActivePaths.Add(f.Path);
+
+        long nextRowId = latestSnapshot.RowIdHighWaterMark;
+        bool changed = false;
+        var result = new List<DeltaAction>(actions.Count);
+        foreach (var action in actions)
+        {
+            switch (action)
+            {
+                case AddFile add when add.DataChange && add.BaseRowId is not null
+                    && !baseActivePaths.Contains(add.Path)
+                    && (resolvedPaths is null || !resolvedPaths.Contains(add.Path)):
+                    result.Add(add with
+                    {
+                        BaseRowId = nextRowId,
+                        DefaultRowCommitVersion = attemptVersion,
+                    });
+                    nextRowId += ColumnStats.Parse(add.Stats)?.NumRecords ?? 0;
+                    changed = true;
+                    break;
+
+                case DomainMetadata dm when string.Equals(
+                    dm.Domain, DeltaLake.RowTracking.RowTrackingConfig.DomainName, StringComparison.Ordinal):
+                    changed = true; // drop; re-emitted below with the re-derived mark
+                    break;
+
+                default:
+                    result.Add(action);
+                    break;
+            }
+        }
+
+        // Re-emit exactly one high-water-mark domain reflecting the reassigned ids. When nothing was
+        // reassigned (no post-image add) this restores it at the unchanged mark — a harmless idempotent commit.
+        if (changed)
+            result.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
+
+        return result;
+    }
+
     #endregion
 
     #region Delete and Update
@@ -1788,19 +1855,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var plan = await ComputeUpdateActionsAsync(
             snapshot, predicate, updater, cancellationToken, prunePredicate).ConfigureAwait(false);
 
-        bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-            snapshot.Metadata.Configuration);
-
         // An UPDATE reads exactly the files it rewrites, so — like DELETE — the removed paths are both its
         // read-set (concurrentDeleteRead) and its planned removes (delete/delete). The analyzable overload
         // additionally records its read predicate so a concurrent add that matches it conflicts. Route it
         // through the OCC loop so a single-shot UPDATE rebases past a non-conflicting concurrent commit
-        // instead of throwing.
+        // instead of throwing — its copy-on-write post-image add's row-tracking baseRowId is re-derived on
+        // rebase (a conflict on any file it rewrote aborts first, so the survivors' ids stay valid).
         long committed = await CommitOccAsync(
             snapshot, plan.Actions,
             new Concurrency.ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
             plan.RemovedPaths, IsolationLevel.WriteSerializable, "UPDATE",
-            rebaseSafe: !rowTracking, cancellationToken).ConfigureAwait(false);
+            rebaseSafe: true, cancellationToken).ConfigureAwait(false);
 
         return (plan.TotalUpdated, committed);
     }
@@ -2419,7 +2484,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot.Metadata.Configuration);
         long newVersion = snapshot.Version + 1;
         return await CommitWriteAsync(
-            snapshot, actions, mode, dynamicPartitionOverwrite, rowTrackingEnabled, newVersion,
+            snapshot, actions, mode, dynamicPartitionOverwrite, newVersion,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -2758,15 +2823,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// aborting only on a concurrent metadata/protocol change — instead of failing on a version collision.
     /// The overwrite family (full / partition-scoped / dynamic) reads the active-file set to decide what to
     /// remove, so its removes are NOT rebase-safe without partition-predicate plumbing; it keeps the
-    /// single-attempt commit (a collision still throws, as before). Row tracking embeds the attempted
-    /// version in its adds, so it stays single-attempt too (rebaseSafe=false).
+    /// single-attempt commit (a collision still throws, as before). A row-tracking append IS rebase-safe now:
+    /// its fresh file's <c>baseRowId</c> is re-derived against the advanced high-water mark inside the OCC loop.
     /// </summary>
     private async ValueTask<long> CommitWriteAsync(
         Snapshot.Snapshot snapshot,
         IReadOnlyList<DeltaAction> actions,
         DeltaWriteMode mode,
         bool dynamicPartitionOverwrite,
-        bool rowTrackingEnabled,
         long newVersion,
         CancellationToken cancellationToken)
     {
@@ -2776,7 +2840,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             committedVersion = await CommitOccAsync(
                 snapshot, actions, Concurrency.ReadSet.Blind, NoRemovedPaths,
-                IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: !rowTrackingEnabled,
+                IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: true,
                 cancellationToken).ConfigureAwait(false);
         }
         else
