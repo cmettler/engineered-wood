@@ -2613,6 +2613,107 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    // ── Read-side transient row ids ────────────────────────────────────────────────────────────────────
+    //
+    // A read that appends a trailing non-null Int64 _metadata.row_id = (fileOrdinal << RowIdPositionBits) |
+    // ABSOLUTE in-file position (path-sorted active set; the DV-inclusive parquet row index). NOT a stable
+    // Delta row id — valid only within one snapshot. It round-trips to the row-id DML surface
+    // (ComputeDeletionVectorActionsAsync / ReadRowsByRowIdsAsync consume the same (ordinal, absPos)), so a host
+    // (e.g. DuckDB) can read rows, keep the ids, then delete/update exactly those rows — even on a plain table
+    // with no deletion vectors or row-tracking feature, the maximally reader-compatible path.
+
+    /// <summary>
+    /// The active files' <c>baseRowId</c>s in TRANSIENT-ROWID ORDINAL order (the path-sorted active set — the
+    /// same ordering the rowid encoding uses), for the snapshot pinned by <paramref name="atVersion"/>. A host's
+    /// eager UPDATE resolves each matched row's ORIGINAL stable id as <c>baseRowId[ordinal] + position</c>.
+    /// </summary>
+    public async ValueTask<IReadOnlyList<long?>> OrderedActiveBaseRowIdsAsync(
+        long? atVersion = null, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var snapshot = atVersion is { } v && v != CurrentSnapshot.Version
+            ? await GetSnapshotAtVersionAsync(v, cancellationToken).ConfigureAwait(false)
+            : CurrentSnapshot;
+        var ordered = OrderedActiveFiles(snapshot);
+        var ids = new List<long?>(ordered.Count);
+        foreach (var f in ordered)
+            ids.Add(f.BaseRowId);
+        return ids;
+    }
+
+    /// <summary>
+    /// Like <see cref="ReadAllAsync(IReadOnlyList{string}, EngineeredWood.Expressions.Predicate, CancellationToken)"/>
+    /// but appends a trailing non-null Int64 <c>_metadata.row_id</c> = a TRANSIENT rowid
+    /// <c>(fileOrdinal &lt;&lt; RowIdPositionBits) | absolutePosition</c>. NOT a stable Delta row id — it
+    /// round-trips to the row-id DML surface within the SAME snapshot so a host can locate the rows it read
+    /// (a plain copy-on-write DELETE needs no deletion vectors or row tracking).
+    /// </summary>
+    public IAsyncEnumerable<RecordBatch> ReadAllWithRowIdsAsync(
+        IReadOnlyList<string>? columns,
+        EngineeredWood.Expressions.Predicate? filter,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return ReadWithTransientRowIdsAsync(CurrentSnapshot, columns, filter, cancellationToken);
+    }
+
+    /// <summary>
+    /// Time travel WITH the transient rowid column — the version analog of <see cref="ReadAllWithRowIdsAsync"/>.
+    /// Each batch carries the trailing <c>_metadata.row_id</c> over the version's path-sorted active files.
+    /// </summary>
+    public async IAsyncEnumerable<RecordBatch> ReadAtVersionWithRowIdsAsync(
+        long version,
+        IReadOnlyList<string>? columns,
+        EngineeredWood.Expressions.Predicate? filter,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var snapshot = await GetSnapshotAtVersionAsync(version, cancellationToken).ConfigureAwait(false);
+        await foreach (var batch in ReadWithTransientRowIdsAsync(snapshot, columns, filter, cancellationToken)
+                           .ConfigureAwait(false))
+        {
+            yield return batch;
+        }
+    }
+
+    // Shared iterator: path-sorted active files, each emitted batch carrying the trailing _metadata.row_id built
+    // from ReadFileAsync's absolute-position out-param (master surfaces positions as an out-param rather than an
+    // appended column, so the wrapper appends the transient id itself — keeping ReadFileAsync's read path intact).
+    private async IAsyncEnumerable<RecordBatch> ReadWithTransientRowIdsAsync(
+        Snapshot.Snapshot snapshot,
+        IReadOnlyList<string>? columns,
+        EngineeredWood.Expressions.Predicate? filter,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var pruner = filter is null ? null : new DeltaFilePruner(
+            snapshot.Schema, snapshot.Metadata.PartitionColumns);
+        var ordered = OrderedActiveFiles(snapshot);
+        for (int ordinal = 0; ordinal < ordered.Count; ordinal++)
+        {
+            var addFile = ordered[ordinal];
+            if (pruner is not null && !pruner.ShouldInclude(addFile, filter!))
+                continue;
+
+            var absOut = new List<Int64Array?>();
+            int bi = -1;
+            await foreach (var batch in ReadFileAsync(addFile, columns, snapshot, cancellationToken,
+                                                      strippedAbsPositionsOut: absOut).ConfigureAwait(false))
+            {
+                bi++;
+                var absPos = bi < absOut.Count ? absOut[bi] : null;
+                var idb = new Int64Array.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    long absolute = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
+                        ? absPos.GetValue(i)!.Value : i;
+                    idb.Append(((long)ordinal << RowIdPositionBits) | absolute);
+                }
+                yield return RowTracking.RowTrackingWriter.AddRowIdColumn(
+                    batch, idb.Build(), DeltaLake.RowTracking.RowTrackingConfig.VirtualRowIdColumn);
+            }
+        }
+    }
+
     /// <summary>
     /// Writes RecordBatch data as a new commit.
     /// Returns the committed version number.
