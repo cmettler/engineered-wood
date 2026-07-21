@@ -171,15 +171,31 @@ Design facts worth keeping:
      overwrite read-set expressed as a partition predicate.
 4. **Layer 3 — row-level concurrency. DONE.** Sub-problem (A) (step 6), sub-problem (B) remap (step 7 /
    Milestone 3), and the row-tracking append/update rebase (step 8, limitation 2's other half) all landed and
-   are measured on Spark. The only still-parked row-level test,
-   `BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete`, needs the buffered-transaction seam
-   (Compute*/CommitDataFiles), not row-level concurrency. Remaining slice-9 tail is unrelated to row tracking:
-   the overwrite-family rebase (partition-predicate read-set) and the buffered-transaction seam.
+   are measured on Spark.
 
-The parked ledger is `test/EngineeredWood.DeltaLake.Table.Tests/PendingCoverageTests.cs`. The 7
-`LogicalRebase` stubs are retired (now live in `ConflictCheckerTests` + `DeltaTransactionTests`); the 3
-row-level (A) stubs are retired (now live in `RowLevelConcurrencyTests`); the remaining `RowLevelConcurrency`
-stubs (the (B) cases + `BufferedFlow_…`), `BufferedTxn`, `SetSchema`, and `CommitDataFiles` stubs remain.
+5. **Buffered-transaction seam. DONE (2026-07-21).** The multi-statement OptimisticTransaction surface, landed
+   as 6 focused commits: **M-A `d1a7fb0`** external write/commit core — `WriteDataFilesAsync` /
+   `CommitDataFilesAsync` (+ `WrittenDataFile`, the `IsIcebergCompat`/`HasIdentityColumns`/
+   `SupportsExternalDataFileCommit` gates, `StatsWithLooseBounds`); **M-B `efe50a8`** compute-only schema ALTERs
+   — `DeferredSchemaChange` + `ComputeAddColumn/RenameColumn/DropColumn` + `ReconcileBatchToFields` +
+   `SetSchemaAsync`; **M-C `309437b`** identity seam — `GenerateIdentityValues[ForSchema]` +
+   `BuildIdentityMetadataAction`; **M-D1 `61a4efa`** `ComputeDeletionVectorActionsAsync` + `ReadRowsByRowIdsAsync`
+   (adapted to master's `strippedAbsPositionsOut` read path, not pr-4's trailing row-id column) +
+   `OrderedActiveFiles`/`RowIdPositionBits`; **M-D2 `ce44d26`** `RebaseDvDmlActionsAsync` +
+   `CheckLogicalRebaseAsync` + `MetadataEquals`/`ProtocolEquals`; **M-D3 `3729835`** the `txn` round-trip (no new
+   code — master already reconciled `TransactionId`). **MEASURED (`22e79b2`):** Spark 4.0.1 reads a fused
+   ALTER+INSERT+DELETE as one atomic version; delta-rs 1.6.2 reads the DV-free fused ALTER+INSERT. **Deferred
+   (no parked test, follow-ups):** nested `ComputeAddField/DropField` (master lacks `TransformStructAt`/`PathText`);
+   the EXPLICIT buffered remap-across-rewrite — `RebaseDvDmlActionsAsync` conflicts when a modified file was
+   concurrently rewritten (the AUTO commit path already remaps by stable id).
+
+Remaining slice-9 tail (unrelated to row tracking OR the buffered seam): the overwrite-family rebase
+(partition-predicate read-set) and M4 read-side `_metadata.row_id`.
+
+The parked ledger `test/EngineeredWood.DeltaLake.Table.Tests/PendingCoverageTests.cs` is now **FULLY RETIRED**
+— every stub landed in a real suite (the buffered cases in `ExternalDataFileCommitTests`,
+`BufferedSchemaSeamTests`, `IdentityTransactionSeamsTests`, `BufferedTransactionTests`); the file is a
+comments-only audit trail mapping each former stub to its live home.
 
 **Deletion-vector protocol declaration — FIXED (opt-in), and the interop reality measured.** The gap (A)'s
 interop test surfaced — EW wrote DVs without declaring the `deletionVectors` reader feature, so a conformant
