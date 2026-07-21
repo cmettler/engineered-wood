@@ -157,6 +157,171 @@ public class MetadataDmlTests : IDisposable
                 new Dictionary<string, IReadOnlyCollection<long>> { [path] = new long[] { 99 } })));
     }
 
+    private static Func<RecordBatch, RecordBatch> AddToIds(long delta) => batch =>
+    {
+        var ids = (Int64Array)batch.Column(0);
+        var b = new Int64Array.Builder();
+        for (int i = 0; i < batch.Length; i++)
+            b.Append(ids.GetValue(i)!.Value + delta);
+        return new RecordBatch(batch.Schema, [b.Build()], batch.Length);
+    };
+
+    [Fact]
+    public async Task UpdateBySelection_RewritesMatched_KeepsRest_AndAppliesTheDv()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        await table.WriteAsync([IdBatch(10, 20, 30, 40, 50)]);
+        string path = table.CurrentSnapshot.ActiveFiles.Values.Single().Path;
+
+        // DV-delete position 1 (id 20) first, then UPDATE position 3 (id 40 -> 1040) by selection.
+        await table.DeleteAsync(new FileRowSelection(
+            new Dictionary<string, IReadOnlyCollection<long>> { [path] = new long[] { 1 } }));
+        var (rows, _) = await table.UpdateAsync(new FileRowSelection(
+            new Dictionary<string, IReadOnlyCollection<long>> { [path] = new long[] { 3 } }), AddToIds(1000));
+
+        Assert.Equal(1, rows);
+        // Matched row transformed, others kept, DV-deleted row NOT resurrected by the rewrite.
+        Assert.Equal([10L, 30L, 50L, 1040L], await ReadIdsAsync(table));
+        // The rewrite replaced the file: one active file, a new path, no deletion vector.
+        var add = table.CurrentSnapshot.ActiveFiles.Values.Single();
+        Assert.NotEqual(path, add.Path);
+        Assert.Null(add.DeletionVector);
+    }
+
+    [Fact]
+    public async Task UpdateBySelection_DvDeletedPosition_MatchesNothing()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        await table.WriteAsync([IdBatch(1, 2, 3)]);
+        string path = table.CurrentSnapshot.ActiveFiles.Values.Single().Path;
+        await table.DeleteAsync(new FileRowSelection(
+            new Dictionary<string, IReadOnlyCollection<long>> { [path] = new long[] { 1 } }));
+
+        long before = table.CurrentSnapshot.Version;
+        var (rows, version) = await table.UpdateAsync(new FileRowSelection(
+            new Dictionary<string, IReadOnlyCollection<long>> { [path] = new long[] { 1 } }), AddToIds(1000));
+
+        // The concurrently-deleted-row semantics: nothing matched, nothing committed.
+        Assert.Equal(0, rows);
+        Assert.Equal(before, version);
+        Assert.Equal([1L, 3L], await ReadIdsAsync(table));
+    }
+
+    [Fact]
+    public async Task MetadataPredicate_Delete_LowersToSelection_ZeroDataReads()
+    {
+        var setupFs = new LocalTableFileSystem(_tempDir);
+        await using (var setup = await DeltaTable.CreateAsync(setupFs, IdSchema, enableDeletionVectors: true))
+        {
+            await setup.WriteAsync([IdBatch(10, 20, 30, 40, 50)]);
+        }
+
+        var countingFs = new CountingFileSystem(new LocalTableFileSystem(_tempDir));
+        await using var table = await DeltaTable.OpenAsync(countingFs);
+        string path = table.CurrentSnapshot.ActiveFiles.Values.Single().Path;
+
+        // DELETE WHERE _metadata.file_path = <path> AND _metadata.row_index IN (1, 3)
+        var predicate = new Expressions.AndPredicate(
+        [
+            new Expressions.ComparisonPredicate(
+                new Expressions.UnboundReference(MetadataPredicate.FilePathColumn),
+                Expressions.ComparisonOperator.Equal,
+                new Expressions.LiteralExpression(Expressions.LiteralValue.Of(path))),
+            new Expressions.SetPredicate(
+                new Expressions.UnboundReference(MetadataPredicate.RowIndexColumn),
+                [Expressions.LiteralValue.Of(1L), Expressions.LiteralValue.Of(3L)],
+                Expressions.SetOperator.In),
+        ]);
+
+        var (rows, _) = await table.DeleteAsync(predicate);
+
+        Assert.Equal(2, rows);
+        Assert.Equal(0, countingFs.DataParquetOpens); // the lowering engaged — no scan, DV union only
+        Assert.Equal([10L, 30L, 50L], await ReadIdsAsync(table));
+    }
+
+    [Fact]
+    public async Task MetadataPredicate_OrAcrossFiles_LowersAndUnions()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        await table.WriteAsync([IdBatch(10, 20, 30)]); // file A
+        await table.WriteAsync([IdBatch(40, 50)]);     // file B
+        var paths = table.CurrentSnapshot.ActiveFiles.Values
+            .Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
+
+        static Expressions.Predicate ForFile(string p, long idx) => new Expressions.AndPredicate(
+        [
+            new Expressions.ComparisonPredicate(
+                new Expressions.UnboundReference(MetadataPredicate.FilePathColumn),
+                Expressions.ComparisonOperator.Equal,
+                new Expressions.LiteralExpression(Expressions.LiteralValue.Of(p))),
+            new Expressions.ComparisonPredicate(
+                new Expressions.UnboundReference(MetadataPredicate.RowIndexColumn),
+                Expressions.ComparisonOperator.Equal,
+                new Expressions.LiteralExpression(Expressions.LiteralValue.Of(idx))),
+        ]);
+
+        // one position in EACH file, OR-combined
+        var (rows, _) = await table.DeleteAsync(
+            new Expressions.OrPredicate([ForFile(paths[0], 0), ForFile(paths[1], 0)]));
+
+        Assert.Equal(2, rows);
+        Assert.Equal(3, (await ReadIdsAsync(table)).Count);
+    }
+
+    [Fact]
+    public async Task MetadataPredicate_MixedWithDataColumn_IsRejectedLoudly()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        await table.WriteAsync([IdBatch(1, 2)]);
+        string path = table.CurrentSnapshot.ActiveFiles.Values.Single().Path;
+
+        // _metadata.file_path = X AND id = 2 — metadata mixed with a data column must not silently
+        // fall through to the row mask (which cannot bind _metadata columns).
+        var mixed = new Expressions.AndPredicate(
+        [
+            new Expressions.ComparisonPredicate(
+                new Expressions.UnboundReference(MetadataPredicate.FilePathColumn),
+                Expressions.ComparisonOperator.Equal,
+                new Expressions.LiteralExpression(Expressions.LiteralValue.Of(path))),
+            new Expressions.ComparisonPredicate(
+                new Expressions.UnboundReference("id"),
+                Expressions.ComparisonOperator.Equal,
+                new Expressions.LiteralExpression(Expressions.LiteralValue.Of(2L))),
+        ]);
+
+        await Assert.ThrowsAsync<NotSupportedException>(async () => await table.DeleteAsync(mixed));
+    }
+
+    [Fact]
+    public async Task MetadataPredicate_Update_LowersToSelection()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        await table.WriteAsync([IdBatch(10, 20, 30)]);
+        string path = table.CurrentSnapshot.ActiveFiles.Values.Single().Path;
+
+        var predicate = new Expressions.AndPredicate(
+        [
+            new Expressions.ComparisonPredicate(
+                new Expressions.UnboundReference(MetadataPredicate.FilePathColumn),
+                Expressions.ComparisonOperator.Equal,
+                new Expressions.LiteralExpression(Expressions.LiteralValue.Of(path))),
+            new Expressions.ComparisonPredicate(
+                new Expressions.UnboundReference(MetadataPredicate.RowIndexColumn),
+                Expressions.ComparisonOperator.Equal,
+                new Expressions.LiteralExpression(Expressions.LiteralValue.Of(1L))),
+        ]);
+
+        var (rows, _) = await table.UpdateAsync(predicate, AddToIds(1000));
+        Assert.Equal(1, rows);
+        Assert.Equal([10L, 30L, 1020L], await ReadIdsAsync(table));
+    }
+
     [Fact]
     public async Task ReadAllWithMetadata_EmitsFilePath_AndAbsoluteRowIndex_AcrossDvDeletes()
     {

@@ -1350,6 +1350,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        // Symbolic `_metadata` lowering: a pure metadata predicate becomes a FileRowSelection and runs
+        // WITHOUT scanning (file identity selects files; row_index names the positions). A predicate that
+        // references `_metadata` but cannot lower is rejected — the row mask only sees data columns.
+        if (MetadataPredicate.TryLower(predicate, out var loweredSelection))
+            return await DeleteAsync(loweredSelection, cancellationToken).ConfigureAwait(false);
+        MetadataPredicate.ThrowIfReferencesMetadata(predicate, "DELETE");
         var transaction = StartTransaction();
         long rowsDeleted = await transaction.DeleteAsync(predicate, cancellationToken)
             .ConfigureAwait(false);
@@ -1803,6 +1809,152 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Updates exactly the rows named by a <see cref="FileRowSelection"/> — the lowered form of a
+    /// metadata predicate. Only the SELECTED files are read (raw, so the caller's absolute positions land
+    /// on the right rows even under a deletion vector); the <paramref name="updater"/> receives the
+    /// matched rows (logical column names) and returns their replacements, exactly as in the predicate
+    /// overloads; the file is rewritten via the shared UPDATE tail (same commit shape, CDC included).
+    /// A selected position already masked by the file's deletion vector matches nothing (the
+    /// concurrently-deleted row semantics). Returns rows updated and the committed version.
+    /// </summary>
+    public async ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
+        FileRowSelection selection,
+        Func<RecordBatch, RecordBatch> updater,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var transaction = StartTransaction();
+        long rowsUpdated = await transaction.UpdateAsync(selection, updater, cancellationToken)
+            .ConfigureAwait(false);
+        long version = await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return (rowsUpdated, version);
+    }
+
+    /// <summary>
+    /// The position-fronted UPDATE front-end: reads ONLY the selected files (raw, absolute offsets), splits
+    /// each batch into DV-dropped / matched / kept rows by position, applies <paramref name="updater"/> to
+    /// the matched rows, and hands the outputs to the shared <see cref="RewriteUpdatedFileAsync"/> tail.
+    /// </summary>
+    internal async ValueTask<UpdateActions> ComputeUpdateActionsForSelectionAsync(
+        Snapshot.Snapshot snapshot,
+        FileRowSelection selection,
+        Func<RecordBatch, RecordBatch> updater,
+        CancellationToken cancellationToken)
+    {
+        var actions = new List<DeltaAction>();
+        var removedPaths = new HashSet<string>(StringComparer.Ordinal);
+        long totalUpdated = 0;
+        bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
+            snapshot.Metadata.Configuration);
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
+            snapshot.Schema, mappingMode);
+
+        var byPath = new Dictionary<string, AddFile>(StringComparer.Ordinal);
+        foreach (var a in snapshot.ActiveFiles.Values)
+            byPath[a.Path] = a;
+
+        foreach (var kv in selection.RowsByFile)
+        {
+            if (kv.Value.Count == 0)
+                continue;
+            if (!byPath.TryGetValue(kv.Key, out var addFile))
+            {
+                throw new InvalidOperationException(
+                    $"UPDATE by row selection: file '{kv.Key}' is not active in the table snapshot — it "
+                    + "was removed or rewritten since the selection was derived. Re-derive the selection "
+                    + "from a fresh scan and retry.");
+            }
+
+            var rawDeletedRows = addFile.DeletionVector is not null
+                ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
+                    .ConfigureAwait(false)
+                : new HashSet<long>();
+
+            // Positions already DV-masked match nothing (a concurrently deleted row); duplicates collapse.
+            var want = new HashSet<long>();
+            foreach (long pos in kv.Value)
+            {
+                if (pos < 0)
+                {
+                    throw new InvalidOperationException(
+                        $"UPDATE by row selection: negative position {pos} for file '{kv.Key}'.");
+                }
+                if (!rawDeletedRows.Contains(pos))
+                    want.Add(pos);
+            }
+            if (want.Count == 0)
+                continue;
+
+            var outputBatches = new List<RecordBatch>();
+            var preimages = new List<RecordBatch>();
+            var postimages = new List<RecordBatch>();
+            long matched = 0;
+            long rowOffset = 0;
+
+            await using var file = await _fs.OpenReadAsync(
+                EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+                .ConfigureAwait(false);
+            using var reader = new Parquet.ParquetFileReader(
+                file, ownsFile: false, _dataFileReadOptions);
+
+            await foreach (var batch in reader.ReadAllAsync(
+                cancellationToken: cancellationToken).ConfigureAwait(false))
+            {
+                var logicalBatch = ColumnMapping.RenameColumns(batch, physicalToLogical);
+                if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
+                    logicalBatch = ColumnMappingRecursive.ToLogical(logicalBatch, snapshot.Schema, mappingMode);
+
+                var matchRows = new List<int>();
+                var keepRows = new List<int>();
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    long abs = rowOffset + i;
+                    if (rawDeletedRows.Contains(abs))
+                        continue; // the rewrite applies the DV physically — deleted rows are dropped
+                    if (want.Contains(abs))
+                        matchRows.Add(i);
+                    else
+                        keepRows.Add(i);
+                }
+
+                if (matchRows.Count > 0)
+                {
+                    var matchBatch = TakeRowsFromBatch(logicalBatch, matchRows);
+                    var updatedBatch = updater(matchBatch);
+                    outputBatches.Add(updatedBatch);
+                    if (cdfEnabled)
+                    {
+                        preimages.Add(matchBatch);
+                        postimages.Add(updatedBatch);
+                    }
+                    matched += matchRows.Count;
+                }
+                if (keepRows.Count > 0)
+                    outputBatches.Add(TakeRowsFromBatch(logicalBatch, keepRows));
+
+                rowOffset += batch.Length;
+            }
+
+            if (matched != want.Count)
+            {
+                // Un-matched wanted positions can only lie beyond the file's physical row count.
+                throw new InvalidOperationException(
+                    $"UPDATE by row selection: {want.Count - matched} position(s) are out of range for "
+                    + $"file '{kv.Key}' ({rowOffset} physical rows). Positions are absolute parquet row indexes.");
+            }
+
+            totalUpdated += matched;
+
+            await RewriteUpdatedFileAsync(
+                addFile, outputBatches, preimages, postimages, snapshot, mappingMode, cdfEnabled,
+                actions, removedPaths, cancellationToken).ConfigureAwait(false);
+        }
+
+        return new UpdateActions(actions, removedPaths, totalUpdated);
+    }
+
+    /// <summary>
     /// Updates rows matching the predicate. The <paramref name="updater"/> function
     /// receives matching rows and returns modified rows. Non-matching rows are
     /// preserved unchanged. Affected files are rewritten.
@@ -1825,8 +1977,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Expressions.Predicate predicate,
         Func<RecordBatch, RecordBatch> updater,
         CancellationToken cancellationToken = default)
-        => UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
+    {
+        // Symbolic `_metadata` lowering — see DeleteAsync(Expressions.Predicate).
+        if (MetadataPredicate.TryLower(predicate, out var loweredSelection))
+            return UpdateAsync(loweredSelection, updater, cancellationToken);
+        MetadataPredicate.ThrowIfReferencesMetadata(predicate, "UPDATE");
+        return UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
             readPredicates: [predicate], cancellationToken);
+    }
 
     private async ValueTask<(long RowsUpdated, long Version)> UpdateCoreAsync(
         Func<RecordBatch, BooleanArray> predicate,
@@ -1959,6 +2117,29 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (!fileModified)
                 continue;
 
+            await RewriteUpdatedFileAsync(
+                addFile, outputBatches, preimages, postimages, snapshot, mappingMode, cdfEnabled,
+                actions, removedPaths, cancellationToken).ConfigureAwait(false);
+        }
+
+        return new UpdateActions(actions, removedPaths, totalUpdated);
+    }
+
+    // The per-file UPDATE rewrite tail: write the surviving+updated batches as the file's replacement,
+    // emit remove+add (+ CDC pre/post images). Extracted verbatim from ComputeUpdateActionsAsync so the
+    // position-fronted ComputeUpdateActionsForSelectionAsync shares it (identical commit shape).
+    private async ValueTask RewriteUpdatedFileAsync(
+        AddFile addFile,
+        List<RecordBatch> outputBatches,
+        List<RecordBatch> preimages,
+        List<RecordBatch> postimages,
+        Snapshot.Snapshot snapshot,
+        ColumnMappingMode mappingMode,
+        bool cdfEnabled,
+        List<DeltaAction> actions,
+        HashSet<string> removedPaths,
+        CancellationToken cancellationToken)
+    {
             // Write new file with all output batches. The rewritten file joins its source's partition
             // directory (a partitioned table's data must live under its Hive dir, matching the append path);
             // reuse the source path's ENCODED prefix verbatim for the add — never re-encode, which would
@@ -2058,9 +2239,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     actions.Add(cdcAction);
                 }
             }
-        }
-
-        return new UpdateActions(actions, removedPaths, totalUpdated);
     }
 
     private static int CountTrue(BooleanArray mask)

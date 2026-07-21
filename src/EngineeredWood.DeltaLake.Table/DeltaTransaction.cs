@@ -212,6 +212,30 @@ public sealed class DeltaTransaction
     }
 
     /// <summary>
+    /// Stages an update of exactly the rows named by a <see cref="FileRowSelection"/> — the lowered form
+    /// of a metadata predicate. Reads ONLY the selected files; a selected position already masked by the
+    /// file's deletion vector matches nothing. Returns the rows updated.
+    /// </summary>
+    public async ValueTask<long> UpdateAsync(
+        FileRowSelection selection,
+        Func<RecordBatch, RecordBatch> updater,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureNotCommitted();
+        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+
+        var plan = await _table.ComputeUpdateActionsForSelectionAsync(
+            _baseSnapshot, selection, updater, cancellationToken).ConfigureAwait(false);
+
+        _dataActions.AddRange(plan.Actions);
+        foreach (string path in plan.RemovedPaths)
+            _removedPaths.Add(path);
+        _operations.Add("UPDATE");
+
+        return plan.TotalUpdated;
+    }
+
+    /// <summary>
     /// Stages an update of the rows matching an analyzable <see cref="Expressions.Predicate"/> via
     /// <paramref name="updater"/>. Like the analyzable delete, the predicate is recorded as a read
     /// dependency (concurrentAppend precision) and files that cannot match are skipped. Returns the rows
