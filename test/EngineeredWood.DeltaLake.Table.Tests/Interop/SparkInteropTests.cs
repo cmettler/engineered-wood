@@ -358,6 +358,53 @@ public class SparkInteropTests : IDisposable
     }
 
     /// <summary>
+    /// The copy-on-write DELETE-by-row-id (gap 2): a host reads rows with their transient rowids and deletes one
+    /// by rewriting its file WITHOUT deletion vectors — the maximally reader-compatible path. On a row-tracking
+    /// table the rewrite must still PRESERVE the survivors' stable ids (materialized column). EW writes ids 0,1,2,
+    /// deletes the middle row (id 20) by its rowid, and Spark reads the survivors' <c>_metadata.row_id</c>.
+    ///
+    /// <para>Measured cross-engine: the result is a plain remove+add (no DV artifact), so Spark reads exactly the
+    /// two survivors, and their ORIGINAL ids (0 and 2) come back — proving the rewrite carried the materialized
+    /// id column even on the position-addressed delete path, not just the predicate UPDATE.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwDeletedByRowId_CopyOnWrite_RowTracking_SparkReadsSurvivorsWithPreservedIds()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableRowTracking: true))
+        {
+            await table.WriteAsync([IdRegionBatch([10, 20, 30], ["us", "eu", "apac"])]); // ids 0,1,2
+
+            // the transient rowid of the id-20 row, then a copy-on-write delete of exactly it
+            long rid20 = -1;
+            await foreach (var b in table.ReadAllWithRowIdsAsync(null, null))
+            {
+                var id = (Int64Array)b.Column("id");
+                var rowId = (Int64Array)b.Column("_metadata.row_id");
+                for (int i = 0; i < b.Length; i++)
+                    if (id.GetValue(i) == 20) rid20 = rowId.GetValue(i)!.Value;
+            }
+            Assert.True(rid20 >= 0);
+            var (deleted, _) = await table.DeleteByRowIdsAsync([rid20]);
+            Assert.Equal(1, deleted);
+        }
+
+        var result = Spark.Invoke("read_row_ids", new { path = _tempDir });
+        var idToRowId = result.GetProperty("rows").EnumerateArray()
+            .ToDictionary(r => r.GetProperty("id").GetInt64(), r => r.GetProperty("row_id").GetInt64());
+
+        Assert.Equal([10L, 30L], idToRowId.Keys.OrderBy(k => k).ToArray()); // id 20 gone
+        Assert.Equal(0L, idToRowId[10]); // survivors keep their ORIGINAL ids through the copy-on-write rewrite
+        Assert.Equal(2L, idToRowId[30]);
+
+        // No deletion vector was written — the point of the copy-on-write path.
+        await using var check = await DeltaTable.OpenAsync(fs);
+        Assert.DoesNotContain(check.CurrentSnapshot.ActiveFiles.Values, a => a.DeletionVector is not null);
+    }
+
+    /// <summary>
     /// Milestone 2: compaction (OPTIMIZE) must preserve each row's stable id. EW writes three single-row files
     /// (ids 0,1,2), compacts them into one, and Spark reads each row's <c>_metadata.row_id</c>. Because rows
     /// from several source files mix into one compacted file, a single <c>baseRowId</c> cannot represent them —

@@ -3935,6 +3935,375 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Deletes the rows addressed by the TRANSIENT rowids in <paramref name="rowIds"/> (each =
+    /// <c>(fileOrdinal &lt;&lt; RowIdPositionBits) | absolutePosition</c>, from <see cref="ReadAllWithRowIdsAsync"/>
+    /// over the SAME snapshot) using <b>copy-on-write</b>: each affected file is rewritten without the deleted
+    /// rows and committed as plain <c>remove</c>/<c>add</c> — NO deletion vectors, NO row-tracking feature needed,
+    /// so the result is maximally reader-compatible (Fabric OneLake, Spark, delta-kernel). Row tracking, when
+    /// enabled, is preserved (survivors keep their materialized id + commit version). CDF and IcebergCompat are
+    /// not yet supported on this path (use <see cref="DeleteByRowIdsViaVectorsAsync"/> for a CDF table). Returns
+    /// the rows deleted and the committed version.
+    /// </summary>
+    public async ValueTask<(long RowsDeleted, long Version)> DeleteByRowIdsAsync(
+        IReadOnlyCollection<long> rowIds,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        if (rowIds.Count == 0)
+            return (0, snapshot.Version);
+
+        HonorWriterFeatures(snapshot, isAppend: false);
+        RejectCopyOnWriteRowIdUnsupported(snapshot, "copy-on-write DELETE");
+
+        var positionsByFile = DecodeRowIdPositions(rowIds);
+        var ordered = OrderedActiveFiles(snapshot);
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+            snapshot.Metadata.Configuration);
+        var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
+        bool materializeIds = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
+        long newVersion = snapshot.Version + 1;
+        long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+
+        var actions = new List<DeltaAction>();
+        var removedPaths = new HashSet<string>(StringComparer.Ordinal);
+        long totalDeleted = 0;
+
+        foreach (var kvp in positionsByFile)
+        {
+            int ordinal = kvp.Key;
+            if (ordinal < 0 || ordinal >= ordered.Count)
+                continue;
+            var addFile = ordered[ordinal];
+            var targets = kvp.Value;
+
+            // Read the file (logical), keeping only rows whose ABSOLUTE position is NOT targeted; materialize
+            // each survivor's original id + version so the rewrite preserves row identity.
+            var srcIds = materializeIds ? new List<Int64Array?>() : null;
+            var srcVers = materializeIds ? new List<Int64Array?>() : null;
+            var absOut = new List<Int64Array?>();
+            var outputBatches = new List<RecordBatch>();
+            var outTracking = materializeIds ? new List<(Int64Array Ids, Int64Array Vers)?>() : null;
+            long deletedHere = 0;
+            int bi = -1;
+            await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
+                                                      srcIds, srcVers, absOut).ConfigureAwait(false))
+            {
+                bi++;
+                var absPos = bi < absOut.Count ? absOut[bi] : null;
+                var keepRows = new List<int>();
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
+                        ? absPos.GetValue(i)!.Value : i;
+                    if (targets.Contains(abs))
+                        deletedHere++;
+                    else
+                        keepRows.Add(i);
+                }
+                if (keepRows.Count == 0)
+                    continue;
+
+                var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
+                var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
+                if (keepRows.Count == batch.Length)
+                {
+                    outputBatches.Add(batch);
+                    outTracking?.Add(batchIds is not null && batchVers is not null
+                        ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null);
+                }
+                else
+                {
+                    outputBatches.Add(TakeRowsFromBatch(batch, keepRows));
+                    outTracking?.Add(batchIds is not null && batchVers is not null
+                        ? (TakeIds(batchIds, keepRows), TakeIds(batchVers, keepRows))
+                        : ((Int64Array, Int64Array)?)null);
+                }
+            }
+
+            if (deletedHere == 0)
+                continue;
+            totalDeleted += deletedHere;
+
+            var (remove, add, addedRows) = await RewriteRowsToNewFileAsync(
+                snapshot, addFile, mappingMode, outputBatches, outTracking, materializeIds,
+                matRowIdName, matRowVerName, rowTrackingEnabled, nextRowId, newVersion,
+                cancellationToken).ConfigureAwait(false);
+            actions.Add(remove);
+            removedPaths.Add(addFile.Path);
+            if (add is not null)
+            {
+                actions.Add(add);
+                if (rowTrackingEnabled)
+                    nextRowId += addedRows;
+            }
+        }
+
+        if (actions.Count == 0)
+            return (0, snapshot.Version);
+
+        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+            actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
+
+        // A copy-on-write DELETE reads exactly the files it rewrites (removedPaths = its read-set), so it
+        // rebases past a non-conflicting concurrent commit and aborts only on a real conflict — but a rewrite's
+        // fresh add is NOT verbatim-rebase-safe (its baseRowId embeds the attempted version's HWM), so
+        // single-attempt (rebaseSafe:false) as the overwrite family does.
+        long version = await CommitOccAsync(
+            snapshot, actions,
+            new Concurrency.ReadSet { Files = removedPaths }, removedPaths,
+            IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: false, cancellationToken)
+            .ConfigureAwait(false);
+        return (totalDeleted, version);
+    }
+
+    // Decodes transient rowids into absolute in-file positions per path-sorted file ordinal.
+    private static Dictionary<int, HashSet<long>> DecodeRowIdPositions(IReadOnlyCollection<long> rowIds)
+    {
+        long posMask = (1L << RowIdPositionBits) - 1;
+        var positionsByFile = new Dictionary<int, HashSet<long>>();
+        foreach (var rid in rowIds)
+        {
+            int ordinal = (int)(rid >> RowIdPositionBits);
+            if (!positionsByFile.TryGetValue(ordinal, out var set))
+                positionsByFile[ordinal] = set = new HashSet<long>();
+            set.Add(rid & posMask);
+        }
+        return positionsByFile;
+    }
+
+    // The corners the copy-on-write row-id DML path does not yet cover (each needs write-time work tied to the
+    // commit that the position-addressed rewrite skips). CDF callers use the DV path; IcebergCompat needs the
+    // committing writer.
+    private void RejectCopyOnWriteRowIdUnsupported(Snapshot.Snapshot snapshot, string op)
+    {
+        if (DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration))
+            throw new NotSupportedException(
+                $"{op} by row id does not yet support Change Data Feed — use DeleteByRowIdsViaVectorsAsync "
+                + "(deletion-vector DELETE emits the change feed) or the predicate-based UpdateAsync.");
+        if (IsIcebergCompat)
+            throw new NotSupportedException($"{op} by row id is not supported on IcebergCompat tables.");
+    }
+
+    // Physical-writes the rewritten output batches for one file and returns the remove(old)+add(new) pair (Add is
+    // null when every row was deleted → whole-file remove). Mirrors ComputeUpdateActionsAsync's write block;
+    // shared by DeleteByRowIdsAsync + UpdateByRowIdsAsync.
+    private async ValueTask<(RemoveFile Remove, AddFile? Add, long AddedRows)> RewriteRowsToNewFileAsync(
+        Snapshot.Snapshot snapshot, Actions.AddFile source, ColumnMappingMode mappingMode,
+        IReadOnlyList<RecordBatch> outputBatches,
+        IReadOnlyList<(Int64Array Ids, Int64Array Vers)?>? outTracking,
+        bool materializeIds, string? matRowIdName, string? matRowVerName,
+        bool rowTrackingEnabled, long baseRowId, long newVersion,
+        CancellationToken cancellationToken)
+    {
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var remove = new RemoveFile
+        {
+            Path = source.Path,
+            DeletionTimestamp = now,
+            DataChange = true,
+            ExtendedFileMetadata = true,
+            PartitionValues = source.PartitionValues,
+            Size = source.Size,
+            DeletionVector = source.DeletionVector, // rewritten file has the DV's deletions applied
+        };
+
+        long addedRows = 0;
+        foreach (var b in outputBatches)
+            addedRows += b.Length;
+        if (addedRows == 0)
+            return (remove, null, 0); // every row deleted — drop the file outright
+
+        // Reuse the source path's ENCODED prefix verbatim (partition dir) for the add; DECODED for the write.
+        string encodedDir = "";
+        int dirSlash = source.Path.LastIndexOf('/');
+        if (dirSlash >= 0)
+            encodedDir = source.Path.Substring(0, dirSlash + 1);
+        string baseName = $"{Guid.NewGuid():N}.parquet";
+        string newFileName = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir) + baseName;
+
+        var writeBatches = new List<RecordBatch>(outputBatches.Count);
+        for (int k = 0; k < outputBatches.Count; k++)
+        {
+            var physicalBatch = ColumnMappingRecursive.ToPhysical(outputBatches[k], snapshot.Schema, mappingMode);
+            if (!_options.EmitVariantLogicalType)
+                physicalBatch = VariantColumnCoercion.StripAnnotation(physicalBatch);
+            if (materializeIds && outTracking is not null && outTracking[k] is { } trk)
+            {
+                physicalBatch = RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
+                    physicalBatch, trk.Ids, trk.Vers, matRowIdName!, matRowVerName!, nullable: true);
+            }
+            writeBatches.Add(physicalBatch);
+        }
+
+        long fileSize;
+        if (_options.DataFileWriter is { } rewriteWriter)
+        {
+            fileSize = await rewriteWriter.WriteAsync(
+                writeBatches.ToAsyncEnumerable(), newFileName, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await using var file = await _fs.CreateAsync(
+                newFileName, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await using var writer = new Parquet.ParquetFileWriter(
+                file, ownsFile: false, _options.ParquetWriteOptions);
+            foreach (var batch in writeBatches)
+                await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+            await writer.DisposeAsync().ConfigureAwait(false);
+            fileSize = file.Position;
+        }
+
+        var add = new AddFile
+        {
+            Path = encodedDir + baseName,
+            PartitionValues = source.PartitionValues,
+            Size = fileSize,
+            ModificationTime = now,
+            DataChange = true,
+            Stats = Stats.StatsCollector.Collect(outputBatches),
+            BaseRowId = rowTrackingEnabled ? baseRowId : null,
+            DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
+        };
+        return (remove, add, addedRows);
+    }
+
+    /// <summary>
+    /// Per-file copy-on-write UPDATE by TRANSIENT rowid (the companion to <see cref="DeleteByRowIdsAsync"/>).
+    /// <paramref name="rowIds"/> = <c>(fileOrdinal &lt;&lt; RowIdPositionBits) | absolutePosition</c> (same
+    /// encoding as <see cref="ReadAllWithRowIdsAsync"/>). Only files containing a target row are rewritten: each
+    /// such file's user batches are read (DV-filtered, in position order) and handed to
+    /// <paramref name="rewriteFile"/> — which returns the SAME rows with the SET columns modified on the matched
+    /// positions (the caller owns that typed logic; it MUST return one batch per source batch with identical row
+    /// counts) — then re-written as plain <c>remove</c>+<c>add</c>. Row tracking is preserved (an UPDATED row's
+    /// commit version advances to this commit; untouched rows keep theirs). CDF / IcebergCompat not yet supported
+    /// on this path. Returns the committed version (or the current version if nothing matched).
+    /// </summary>
+    public async ValueTask<long> UpdateByRowIdsAsync(
+        IReadOnlyCollection<long> rowIds,
+        Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        if (rowIds.Count == 0)
+            return snapshot.Version;
+
+        HonorWriterFeatures(snapshot, isAppend: false);
+        RejectCopyOnWriteRowIdUnsupported(snapshot, "copy-on-write UPDATE");
+
+        var positionsByFile = DecodeRowIdPositions(rowIds);
+        var ordered = OrderedActiveFiles(snapshot);
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+            snapshot.Metadata.Configuration);
+        var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
+        bool materializeIds = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
+        long newVersion = snapshot.Version + 1;
+        long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+
+        var actions = new List<DeltaAction>();
+        var removedPaths = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var kvp in positionsByFile)
+        {
+            int ordinal = kvp.Key;
+            if (ordinal < 0 || ordinal >= ordered.Count)
+                continue;
+            var addFile = ordered[ordinal];
+            var targets = kvp.Value;
+
+            var srcIds = materializeIds ? new List<Int64Array?>() : null;
+            var srcVers = materializeIds ? new List<Int64Array?>() : null;
+            var absOut = new List<Int64Array?>();
+            var userBatches = new List<RecordBatch>();
+            await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
+                                                      srcIds, srcVers, absOut).ConfigureAwait(false))
+            {
+                userBatches.Add(batch);
+            }
+            if (userBatches.Count == 0)
+                continue;
+
+            // The caller rebuilds each batch's rows with the SET columns modified on the matched positions.
+            var rewritten = rewriteFile(ordinal, userBatches);
+            if (rewritten.Count != userBatches.Count)
+                throw new InvalidOperationException(
+                    "UpdateByRowIdsAsync: rewriteFile must return one batch per source batch.");
+
+            // Build the materialized id/version arrays (an UPDATED row's version advances to this commit) and
+            // count the rows actually matched in this file.
+            var outTracking = materializeIds ? new List<(Int64Array Ids, Int64Array Vers)?>() : null;
+            long updatedHere = 0;
+            for (int bi = 0; bi < userBatches.Count; bi++)
+            {
+                var src = userBatches[bi];
+                if (rewritten[bi].Length != src.Length)
+                    throw new InvalidOperationException(
+                        "UpdateByRowIdsAsync: rewriteFile must preserve each batch's row count.");
+                var absPos = bi < absOut.Count ? absOut[bi] : null;
+                var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
+                var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
+                Int64Array.Builder? idb = materializeIds ? new Int64Array.Builder() : null;
+                Int64Array.Builder? vdb = materializeIds ? new Int64Array.Builder() : null;
+                for (int i = 0; i < src.Length; i++)
+                {
+                    long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
+                        ? absPos.GetValue(i)!.Value : i;
+                    bool updated = targets.Contains(abs);
+                    if (updated)
+                        updatedHere++;
+                    if (materializeIds)
+                    {
+                        long? id = batchIds is not null && !batchIds.IsNull(i) ? batchIds.GetValue(i) : null;
+                        if (id is { } iv) idb!.Append(iv); else idb!.AppendNull();
+                        long? ver = updated
+                            ? newVersion
+                            : (batchVers is not null && !batchVers.IsNull(i) ? batchVers.GetValue(i) : (long?)null);
+                        if (ver is { } vv) vdb!.Append(vv); else vdb!.AppendNull();
+                    }
+                }
+                outTracking?.Add(materializeIds ? (idb!.Build(), vdb!.Build()) : ((Int64Array, Int64Array)?)null);
+            }
+
+            if (updatedHere == 0)
+                continue; // no target row actually present in this file — leave it untouched
+
+            var (remove, add, addedRows) = await RewriteRowsToNewFileAsync(
+                snapshot, addFile, mappingMode, rewritten, outTracking, materializeIds,
+                matRowIdName, matRowVerName, rowTrackingEnabled, nextRowId, newVersion,
+                cancellationToken).ConfigureAwait(false);
+            actions.Add(remove);
+            removedPaths.Add(addFile.Path);
+            if (add is not null)
+            {
+                actions.Add(add);
+                if (rowTrackingEnabled)
+                    nextRowId += addedRows;
+            }
+        }
+
+        if (actions.Count == 0)
+            return snapshot.Version;
+
+        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+            actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
+
+        return await CommitOccAsync(
+            snapshot, actions,
+            new Concurrency.ReadSet { Files = removedPaths }, removedPaths,
+            IsolationLevel.WriteSerializable, "UPDATE", rebaseSafe: false, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Reads exactly the rows identified by the given transient rowids (<c>(fileOrdinal &lt;&lt; RowIdPositionBits)
     /// | absolutePosition</c> against the snapshot pinned by <paramref name="atVersion"/>) — the read-back step a
     /// buffered UPDATE's post-image is built from. Deletion-vector-excluded rows never match (the read filters

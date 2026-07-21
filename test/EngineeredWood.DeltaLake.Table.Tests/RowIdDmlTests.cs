@@ -134,4 +134,143 @@ public class RowIdDmlTests : IDisposable
         Assert.Equal(0, deleted);
         Assert.Equal(before, version);
     }
+
+    // ── copy-on-write DELETE by row id (no deletion vectors) ──
+
+    [Fact]
+    public async Task DeleteByRowIds_CopyOnWrite_DeletesRows_OnPlainTable()
+    {
+        // No DVs enabled — the copy-on-write path rewrites the file without the rows.
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
+        await table.WriteAsync([Batch(1, 6)]); // ids 1..6, one file
+
+        var ids = await RowIdsOf(table, 3, 4);
+        var (deleted, _) = await table.DeleteByRowIdsAsync(ids);
+        Assert.Equal(2, deleted);
+
+        Assert.Equal(new long[] { 1, 2, 5, 6 }, await ReadIdsFresh());
+        // No deletionVectors feature was declared (plain copy-on-write, maximally reader-compatible).
+        await using var check = await OpenAsync();
+        Assert.DoesNotContain(check.CurrentSnapshot.ActiveFiles.Values, a => a.DeletionVector is not null);
+    }
+
+    [Fact]
+    public async Task DeleteByRowIds_CopyOnWrite_WholeFile_DropsFile()
+    {
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
+        await table.WriteAsync([Batch(1, 2)]); // file A
+        await table.WriteAsync([Batch(100, 3)]); // file B
+
+        // delete every row of file A (whichever ordinal it sorts to)
+        var idsA = await RowIdsOf(table, 1, 2);
+        await table.DeleteByRowIdsAsync(idsA);
+
+        Assert.Equal(new long[] { 100, 101, 102 }, await ReadIdsFresh());
+        await using var check = await OpenAsync();
+        Assert.Single(check.CurrentSnapshot.ActiveFiles); // file A dropped outright, one file remains
+    }
+
+    [Fact]
+    public async Task DeleteByRowIds_CopyOnWrite_RowTrackingTable_RewritesAndReads()
+    {
+        // A row-tracking table: the copy-on-write rewrite materializes survivors' ids (M2 path).
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdSchema, enableRowTracking: true);
+        await table.WriteAsync([Batch(1, 5)]); // ids 1..5, baseRowId 0
+
+        var ids = await RowIdsOf(table, 2);
+        var (deleted, _) = await table.DeleteByRowIdsAsync(ids);
+        Assert.Equal(1, deleted);
+        Assert.Equal(new long[] { 1, 3, 4, 5 }, await ReadIdsFresh());
+    }
+
+    [Fact]
+    public async Task DeleteByRowIds_CopyOnWrite_CdfTable_Throws()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new EngineeredWood.DeltaLake.Log.TransactionLog(fs);
+        await log.WriteCommitAsync(0, new List<EngineeredWood.DeltaLake.Actions.DeltaAction>
+        {
+            new EngineeredWood.DeltaLake.Actions.ProtocolAction
+            {
+                MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["changeDataFeed"],
+            },
+            new EngineeredWood.DeltaLake.Actions.MetadataAction
+            {
+                Id = "cdf", Format = EngineeredWood.DeltaLake.Actions.Format.Parquet,
+                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
+                PartitionColumns = [],
+                Configuration = new Dictionary<string, string>
+                {
+                    { EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.EnableKey, "true" },
+                },
+            },
+        });
+        await using var table = await DeltaTable.OpenAsync(fs);
+        await table.WriteAsync([Batch(1, 3)]);
+        var ids = await RowIdsOf(table, 2);
+        await Assert.ThrowsAsync<NotSupportedException>(async () =>
+            await table.DeleteByRowIdsAsync(ids));
+    }
+
+    // ── copy-on-write UPDATE by row id ──
+
+    // A rewriteFile callback that adds `delta` to the id of the rows whose id is in `targetIds`.
+    private static Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> AddToIds(
+        long delta, params long[] targetIds)
+    {
+        var wanted = new HashSet<long>(targetIds);
+        return (_, batches) =>
+        {
+            var outp = new List<RecordBatch>(batches.Count);
+            foreach (var b in batches)
+            {
+                var id = (Int64Array)b.Column("id");
+                var nb = new Int64Array.Builder();
+                for (int i = 0; i < b.Length; i++)
+                {
+                    long v = id.GetValue(i)!.Value;
+                    nb.Append(wanted.Contains(v) ? v + delta : v);
+                }
+                outp.Add(new RecordBatch(IdSchema, [nb.Build()], b.Length));
+            }
+            return outp;
+        };
+    }
+
+    [Fact]
+    public async Task UpdateByRowIds_CopyOnWrite_ModifiesTargetedRows()
+    {
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
+        await table.WriteAsync([Batch(1, 5)]); // ids 1..5
+
+        var ids = await RowIdsOf(table, 2, 4);
+        long version = await table.UpdateByRowIdsAsync(ids, AddToIds(1000, 2, 4));
+        Assert.Equal(2, version);
+
+        Assert.Equal(new long[] { 1, 3, 5, 1002, 1004 }, await ReadIdsFresh());
+    }
+
+    [Fact]
+    public async Task UpdateByRowIds_CopyOnWrite_RowTrackingTable_RewritesAndReads()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdSchema, enableRowTracking: true);
+        await table.WriteAsync([Batch(1, 4)]); // ids 1..4
+
+        var ids = await RowIdsOf(table, 3);
+        await table.UpdateByRowIdsAsync(ids, AddToIds(100, 3));
+
+        Assert.Equal(new long[] { 1, 2, 4, 103 }, await ReadIdsFresh());
+    }
+
+    [Fact]
+    public async Task UpdateByRowIds_EmptyIds_NoOp()
+    {
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
+        await table.WriteAsync([Batch(1, 3)]);
+        long before = table.CurrentSnapshot.Version;
+        long version = await table.UpdateByRowIdsAsync([], AddToIds(1, 1));
+        Assert.Equal(before, version);
+    }
 }
