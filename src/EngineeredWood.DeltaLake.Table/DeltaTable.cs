@@ -3623,6 +3623,174 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    // ── Buffered-transaction DML seam ──────────────────────────────────────────────────────────────────
+    //
+    // The deferred half of a deletion-vector DELETE + the exact-row read-back an UPDATE post-image is built
+    // from. Positions and transient rowids are addressed by a file's PATH-SORTED ordinal in the snapshot's
+    // active set (OrderedActiveFiles) — stable within one snapshot, which is why a buffered transaction pins the
+    // version its ordinals were captured against (atVersion / resolveAgainst) and re-validates before committing.
+
+    // The transient rowid packs (path-sorted file ordinal &lt;&lt; RowIdPositionBits) | absolute-in-file position.
+    private const int RowIdPositionBits = 40;
+
+    private static List<Actions.AddFile> OrderedActiveFiles(Snapshot.Snapshot snapshot)
+    {
+        var files = new List<Actions.AddFile>(snapshot.ActiveFiles.Values);
+        files.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
+        return files;
+    }
+
+    /// <summary>
+    /// Computes the deletion-vector actions for the given deleted positions WITHOUT committing — the deferred
+    /// half of a DV DELETE, for a buffered (multi-statement) transaction that fuses its DML + appends into one
+    /// commit via <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>. Positions are keyed by the
+    /// path-sorted file ordinal and are ABSOLUTE in-file row positions; each touched file's existing DV is
+    /// unioned with the new positions and the result is a <c>remove</c>(old path+DV) + <c>add</c>(same path, new
+    /// DV) pair. Change Data Feed is NOT captured here (the caller must gate CDF tables to the committing path).
+    /// Returns the actions + the count of NEWLY deleted rows.
+    /// </summary>
+    /// <param name="resolveAgainst">Rebase support: the ordinals + old DVs were captured against the
+    /// transaction's PINNED snapshot — resolve there, not against a possibly-advanced current snapshot (whose
+    /// path-sorted ordering may differ after concurrent appends). The caller runs
+    /// <see cref="CheckLogicalRebaseAsync"/> before committing the result on a newer snapshot.</param>
+    public async ValueTask<(IReadOnlyList<DeltaAction> Actions, long RowsDeleted)> ComputeDeletionVectorActionsAsync(
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal,
+        CancellationToken cancellationToken = default,
+        Snapshot.Snapshot? resolveAgainst = null)
+    {
+        ThrowIfDisposed();
+        var snapshot = resolveAgainst ?? CurrentSnapshot;
+        var ordered = OrderedActiveFiles(snapshot);
+        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var actions = new List<DeltaAction>();
+        long totalDeleted = 0;
+
+        foreach (var kvp in positionsByOrdinal)
+        {
+            int ordinal = kvp.Key;
+            if (ordinal < 0 || ordinal >= ordered.Count)
+                continue;
+            var addFile = ordered[ordinal];
+
+            var allDeleted = addFile.DeletionVector is not null
+                ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
+                    .ConfigureAwait(false))
+                : new HashSet<long>();
+
+            long newlyDeleted = 0;
+            foreach (long p in kvp.Value)
+                if (allDeleted.Add(p))
+                    newlyDeleted++;
+            if (newlyDeleted == 0)
+                continue;
+            totalDeleted += newlyDeleted;
+
+            var newDv = await dvWriter.CreateAsync(allDeleted, allDeleted.Count, cancellationToken)
+                .ConfigureAwait(false);
+
+            actions.Add(new RemoveFile
+            {
+                Path = addFile.Path,
+                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = true,
+                DeletionVector = addFile.DeletionVector,
+            });
+            actions.Add(addFile with
+            {
+                DeletionVector = newDv,
+                DataChange = true,
+                Stats = StatsWithLooseBounds(addFile.Stats),
+            });
+        }
+
+        return (actions, totalDeleted);
+    }
+
+    /// <summary>
+    /// Reads exactly the rows identified by the given transient rowids (<c>(fileOrdinal &lt;&lt; RowIdPositionBits)
+    /// | absolutePosition</c> against the snapshot pinned by <paramref name="atVersion"/>) — the read-back step a
+    /// buffered UPDATE's post-image is built from. Deletion-vector-excluded rows never match (the read filters
+    /// them), and files without a requested position are not read.
+    /// </summary>
+    /// <param name="atVersion">The snapshot the rowids were SCANNED against (a buffered transaction's pinned
+    /// version). Ordinals are path-sort positions in THAT snapshot's active set — resolving them against a moved
+    /// CurrentSnapshot would read the wrong files after a concurrent commuting append shifts the ordering.</param>
+    /// <param name="sourceRowTrackingOut">When non-null, one entry per YIELDED batch (row-aligned): each matched
+    /// row's ORIGINAL stable id (the source file's materialized value where present — a rewritten file — else
+    /// <c>baseRowId + absolute position</c>) and commit version. Plain value arrays — no Arrow buffer lifetime to
+    /// manage.</param>
+    public async IAsyncEnumerable<RecordBatch> ReadRowsByRowIdsAsync(
+        IReadOnlyCollection<long> rowIds,
+        long? atVersion = null,
+        List<(long?[] Ids, long?[] Versions)>? sourceRowTrackingOut = null,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var snapshot = atVersion is { } v && v != CurrentSnapshot.Version
+            ? await GetSnapshotAtVersionAsync(v, cancellationToken).ConfigureAwait(false)
+            : CurrentSnapshot;
+        long posMask = (1L << RowIdPositionBits) - 1;
+        var positionsByFile = new Dictionary<int, HashSet<long>>();
+        foreach (var rid in rowIds)
+        {
+            int ordinal = (int)(rid >> RowIdPositionBits);
+            if (!positionsByFile.TryGetValue(ordinal, out var set))
+            {
+                set = new HashSet<long>();
+                positionsByFile[ordinal] = set;
+            }
+            set.Add(rid & posMask);
+        }
+
+        var ordered = OrderedActiveFiles(snapshot);
+        foreach (var kvp in positionsByFile.OrderBy(k => k.Key))
+        {
+            if (kvp.Key < 0 || kvp.Key >= ordered.Count)
+                continue;
+            var addFile = ordered[kvp.Key];
+
+            // Master's read path surfaces each surviving row's ABSOLUTE in-file position (DV-inclusive) and its
+            // RESOLVED stable id/version via out-params (materialized ids stripped from the emitted user batch),
+            // instead of appending a trailing row-id column — so match on the absolute position out-param.
+            var absOut = new List<Int64Array?>();
+            var idsOut = sourceRowTrackingOut is not null ? new List<Int64Array?>() : null;
+            var versOut = sourceRowTrackingOut is not null ? new List<Int64Array?>() : null;
+            int bi = -1;
+            await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
+                                                      strippedRowIdsOut: idsOut,
+                                                      strippedVersionsOut: versOut,
+                                                      strippedAbsPositionsOut: absOut).ConfigureAwait(false))
+            {
+                bi++;
+                var absPos = bi < absOut.Count ? absOut[bi] : null;
+                if (absPos is null)
+                    continue;
+                var rows = new List<int>();
+                for (int i = 0; i < batch.Length; i++)
+                    if (!absPos.IsNull(i) && kvp.Value.Contains(absPos.GetValue(i)!.Value))
+                        rows.Add(i);
+                if (rows.Count == 0)
+                    continue;
+
+                if (sourceRowTrackingOut is not null)
+                {
+                    var matI = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
+                    var matV = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
+                    var ids = new long?[rows.Count];
+                    var vers = new long?[rows.Count];
+                    for (int k = 0; k < rows.Count; k++)
+                    {
+                        int i = rows[k];
+                        ids[k] = matI is not null && !matI.IsNull(i) ? matI.GetValue(i) : null;
+                        vers[k] = matV is not null && !matV.IsNull(i) ? matV.GetValue(i) : null;
+                    }
+                    sourceRowTrackingOut.Add((ids, vers));
+                }
+                yield return TakeRowsFromBatch(batch, rows);
+            }
+        }
+    }
+
     /// <summary>
     /// Writes a stream of RecordBatch data as a new commit.
     /// </summary>

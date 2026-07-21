@@ -26,23 +26,18 @@ public class PendingCoverageTests
         "Compute* family / ReadRowsByRowIdsAsync / ReconcileBatchToFields) — PR #4 slice 9.";
 
     // ── Buffered (multi-statement) transactions — pr-4 BufferedTransactionTests ──
-
-    /// <summary>An ALTER + INSERT + DELETE buffered together must commit as ONE atomic Delta version —
-    /// the fused metaData + protocol + add + DV-remove commit shape delta-kernel validates.</summary>
-    [Fact(Skip = BufferedTxn)]
-    public void FusedCommit_AlterInsertDelete_IsOneAtomicVersion() { }
-
+    //
+    // UN-PARKED (FusedCommit_AlterInsertDelete_IsOneAtomicVersion + ReadRowsByRowIds_AtVersion_ExactReadBack):
+    // the full fused ALTER+INSERT+DELETE commit (ComputeAddColumn + WriteDataFilesAsync + the deferred
+    // ComputeDeletionVectorActionsAsync + CommitDataFilesAsync(extraActions:, expectedVersion:)) and the
+    // exact-row read-back are live in BufferedTransactionTests.
+    //
     // UN-PARKED (ChainedComputes_SecondAddComposesOnPendingSchema + ReconcileBatchToFields_BackfillsPendingColumn):
     // the compute-only schema-ALTER family (ComputeAddColumn chaining on a pending base) and the public
     // ReconcileBatchToFields overlay are live in BufferedSchemaSeamTests.
     //
     // UN-PARKED (ExpectedVersion_ConcurrentWriter_ConflictAborts): the CommitDataFilesAsync(expectedVersion:)
     // conflict-abort is live in ExternalDataFileCommitTests, against the Milestone-A external-commit seam.
-
-    /// <summary>ReadRowsByRowIdsAsync(atVersion:) must read back exactly the addressed rows — the
-    /// mechanism an UPDATE post-image is built from.</summary>
-    [Fact(Skip = BufferedTxn)]
-    public void ReadRowsByRowIds_AtVersion_ExactReadBack() { }
 
     /// <summary>A txn (application transaction id) action must round-trip through a fused commit.</summary>
     [Fact(Skip = BufferedTxn)]
