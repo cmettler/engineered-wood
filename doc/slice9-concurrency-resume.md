@@ -193,6 +193,16 @@ Design facts worth keeping:
    each get ids (dropped pr-4's inconsistent struct rejection — matches `AddColumnAsync`); rename/drop require
    column mapping and refuse to empty a struct. 12 tests in `NestedFieldEvolutionTests` (two-level add, chained
    compute-adds distinct ids, mapped rename/drop reconcile old files, guards); full non-interop suite green (358).
+   **Gap 4 — CDF-write helper. DONE (2026-07-21).** Public `WriteChangeDataFileAsync(rows, changeType,
+   partitionValues?, ct)` writes a `_change_data` file WITHOUT committing and returns the `CdcFile` action a
+   buffered transaction fuses into `CommitDataFilesAsync`' extraActions (a version carrying cdc actions is read
+   cdc-only). A thin wrapper over master's `CdfWriter.WriteAsync` — deliberately NOT pr-4's `WriteSplitAsync`/
+   `ToPhysical` variant: master's whole CDF subsystem (reader + auto DELETE/UPDATE writers) round-trips CDC rows
+   VERBATIM (logical names, no column-mapping physical rename, no partition-column re-add), so matching that keeps
+   the EW round-trip correct; cross-engine CDF on a column-mapping table is a STANDING master limitation
+   (documented on the method), not introduced here. Validates changeType + requires CDF enabled. 5 tests in
+   `CdfWriteSeamTests` (fused-append read-cdc-only, delete-feed round-trip, partitionValues tagging, guards); full
+   non-interop suite green (363). **With gaps 1-4 all landed, the entire pr-4 public surface is now on master.**
    **Deferred (no parked test, follow-up):** the EXPLICIT buffered remap-across-rewrite — `RebaseDvDmlActionsAsync`
    conflicts when a modified file was concurrently rewritten (the AUTO commit path already remaps by stable id).
 

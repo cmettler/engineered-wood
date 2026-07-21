@@ -2907,6 +2907,59 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Writes a Change Data Feed <c>_change_data</c> parquet file for <paramref name="rows"/> WITHOUT committing —
+    /// the write counterpart of <see cref="ReadChangesAsync"/>, and the CDC half of the buffered-transaction seam.
+    /// The returned <see cref="CdcFile"/> action is the caller's to fuse into a later commit via
+    /// <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>, so a multi-statement transaction that captures its
+    /// change rows eagerly (they are in hand at statement time) lands them in the SAME atomic version as its data
+    /// files. <paramref name="changeType"/> must be one of <c>insert</c> / <c>delete</c> / <c>update_preimage</c> /
+    /// <c>update_postimage</c> (see <see cref="ChangeDataFeed.CdfConfig"/>); the <c>_change_type</c> column is
+    /// added for you. <paramref name="rows"/> carry the feed's user columns (a partitioned table's partition
+    /// values ride on <paramref name="partitionValues"/>, physical-keyed like a data file). Requires the table to
+    /// have Change Data Feed enabled — a CDC file on a non-CDF table would be dead weight no reader consults.
+    /// </summary>
+    /// <remarks>
+    /// Follows engineered-wood's CDF on-disk convention exactly (the same one the auto DELETE/UPDATE paths write
+    /// and <see cref="ReadChangesAsync"/> reads back): the row bytes are written verbatim, so on a column-mapping
+    /// table they carry LOGICAL names, not physical — matching this reader. That round-trips within
+    /// engineered-wood but is not the Spark physical-name CDC layout; cross-engine CDF on a column-mapping table
+    /// is a standing limitation of the CDF subsystem, not specific to this helper.
+    /// </remarks>
+    public async ValueTask<CdcFile> WriteChangeDataFileAsync(
+        RecordBatch rows, string changeType,
+        IReadOnlyDictionary<string, string>? partitionValues = null,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        if (rows is null)
+            throw new ArgumentNullException(nameof(rows));
+        if (changeType is not (DeltaLake.ChangeDataFeed.CdfConfig.Insert
+            or DeltaLake.ChangeDataFeed.CdfConfig.Delete
+            or DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage
+            or DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage))
+        {
+            throw new ArgumentException(
+                $"changeType must be one of 'insert', 'delete', 'update_preimage', 'update_postimage' "
+                + $"(got '{changeType}').", nameof(changeType));
+        }
+        if (!DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(CurrentSnapshot.Metadata.Configuration))
+        {
+            throw new InvalidOperationException(
+                "Change Data Feed is not enabled on this table — a _change_data file would never be read. "
+                + "Create the table with the 'delta.enableChangeDataFeed' property set to 'true'.");
+        }
+
+        return await ChangeDataFeed.CdfWriter.WriteAsync(
+            _fs, rows, changeType,
+            partitionValues ?? EmptyPartitionValues,
+            _options.ParquetWriteOptions, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static readonly IReadOnlyDictionary<string, string> EmptyPartitionValues =
+        new Dictionary<string, string>();
+
+    /// <summary>
     /// Creates a log compaction file for a range of commits.
     /// Compacted files aggregate reconciled actions, allowing readers to
     /// skip individual commit files for faster snapshot construction.
