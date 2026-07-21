@@ -1523,6 +1523,286 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Deletes exactly the rows named by a <see cref="FileRowSelection"/> — the lowered form of a
+    /// metadata predicate (<c>_metadata.file_path</c> + <c>_metadata.row_index</c>). Unlike the
+    /// mask overloads this needs NO DATA READS on a non-CDF table: the positions are already known, so
+    /// the work is deletion-vector union + commit (a CDF table reads ONLY the selected files, to capture
+    /// the deleted rows' content for the change feed). Routed through the same optimistic-concurrency
+    /// loop as the predicate overloads. Returns the number of rows deleted and the committed version.
+    /// </summary>
+    public async ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
+        FileRowSelection selection, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var transaction = StartTransaction();
+        long rowsDeleted = await transaction.DeleteAsync(selection, cancellationToken)
+            .ConfigureAwait(false);
+        long version = await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return (rowsDeleted, version);
+    }
+
+    /// <summary>
+    /// The position-fronted tail of the DELETE machinery: the same union → whole-file check → DV write →
+    /// remove+add → <c>DeleteDvEdit</c> pipeline as <see cref="ComputeDeleteActionsAsync"/>, but fed
+    /// EXACT per-file positions instead of a row mask — so no file is read at all (CDF content capture
+    /// excepted). Positions already masked by the file's current deletion vector are skipped (union
+    /// semantics — never double-counted), matching the mask path's <c>rawDeletedRows</c> skip.
+    /// </summary>
+    internal async ValueTask<DeleteActions> ComputeDeleteActionsForSelectionAsync(
+        Snapshot.Snapshot snapshot,
+        FileRowSelection selection,
+        CancellationToken cancellationToken)
+    {
+        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var actions = new List<DeltaAction>();
+        var removedPaths = new HashSet<string>(StringComparer.Ordinal);
+        var dvEdits = new List<DeleteDvEdit>();
+        long totalDeleted = 0;
+        bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
+            snapshot.Metadata.Configuration);
+        bool deletionVectorsEnabled = DeletionVectors.DeletionVectorConfig.IsEnabled(
+            snapshot.Metadata.Configuration);
+
+        // ActiveFiles is keyed by ReconciliationKey (path|dv), so resolve the selection's paths through
+        // a path-keyed view (the active set has exactly one entry per path).
+        var byPath = new Dictionary<string, AddFile>(StringComparer.Ordinal);
+        foreach (var a in snapshot.ActiveFiles.Values)
+            byPath[a.Path] = a;
+
+        foreach (var kv in selection.RowsByFile)
+        {
+            if (kv.Value.Count == 0)
+                continue;
+            if (!byPath.TryGetValue(kv.Key, out var addFile))
+            {
+                throw new InvalidOperationException(
+                    $"DELETE by row selection: file '{kv.Key}' is not active in the table snapshot — it "
+                    + "was removed or rewritten since the selection was derived. Re-derive the selection "
+                    + "from a fresh scan and retry.");
+            }
+
+            var rawDeletedRows = addFile.DeletionVector is not null
+                ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
+                    .ConfigureAwait(false)
+                : new HashSet<long>();
+
+            // Stats-known physical row count (0/absent = unknown): bounds-checks the positions and
+            // detects the whole-file case without reading the file.
+            long numRecords = Actions.ColumnStats.Parse(addFile.Stats)?.NumRecords ?? 0;
+
+            var newDeletedIndices = new List<long>(kv.Value.Count);
+            var requested = new HashSet<long>();
+            foreach (long pos in kv.Value)
+            {
+                if (pos < 0 || (numRecords > 0 && pos >= numRecords))
+                {
+                    throw new InvalidOperationException(
+                        $"DELETE by row selection: position {pos} is out of range for file '{kv.Key}' "
+                        + $"({numRecords} physical rows). Positions are absolute parquet row indexes.");
+                }
+                if (!requested.Add(pos) || rawDeletedRows.Contains(pos))
+                    continue; // duplicate in the request, or already deleted — union semantics
+                newDeletedIndices.Add(pos);
+            }
+
+            if (newDeletedIndices.Count == 0)
+                continue;
+
+            // CDF: the ONE case that needs bytes — read the selected file (raw, absolute offsets) to
+            // capture the deleted rows' content for the change feed. Mirrors the mask path's capture.
+            var deletedRowBatches = new List<RecordBatch>();
+            if (cdfEnabled)
+            {
+                var want = new HashSet<long>(newDeletedIndices);
+                long rowOffset = 0;
+                var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+                var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
+                    snapshot.Schema, mappingMode);
+                await using var file = await _fs.OpenReadAsync(
+                    EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+                    .ConfigureAwait(false);
+                using var reader = new Parquet.ParquetFileReader(
+                    file, ownsFile: false, _dataFileReadOptions);
+                await foreach (var batch in reader.ReadAllAsync(
+                    cancellationToken: cancellationToken).ConfigureAwait(false))
+                {
+                    var logicalBatch = ColumnMapping.RenameColumns(batch, physicalToLogical);
+                    if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
+                        logicalBatch = ColumnMappingRecursive.ToLogical(logicalBatch, snapshot.Schema, mappingMode);
+                    var matchRows = new List<int>();
+                    for (int i = 0; i < batch.Length; i++)
+                    {
+                        if (want.Contains(rowOffset + i))
+                            matchRows.Add(i);
+                    }
+                    if (matchRows.Count > 0)
+                        deletedRowBatches.Add(TakeRowsFromBatch(logicalBatch, matchRows));
+                    rowOffset += batch.Length;
+                }
+                numRecords = rowOffset; // the read gave the authoritative physical count
+            }
+
+            var allDeleted = new HashSet<long>(rawDeletedRows);
+            foreach (long idx in newDeletedIndices)
+                allDeleted.Add(idx);
+
+            totalDeleted += newDeletedIndices.Count;
+
+            bool wholeFile = numRecords > 0 && allDeleted.Count == numRecords;
+
+            if (!wholeFile && !deletionVectorsEnabled)
+            {
+                throw new InvalidOperationException(
+                    "DELETE would soft-delete part of a data file, which requires deletion vectors. Create "
+                    + "the table with DeltaTable.CreateAsync(..., enableDeletionVectors: true), or restrict "
+                    + "the selection so it removes whole files/partitions (which needs no deletion vector).");
+            }
+
+            actions.Add(new RemoveFile
+            {
+                Path = addFile.Path,
+                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = true,
+                DeletionVector = addFile.DeletionVector,
+            });
+            removedPaths.Add(addFile.Path);
+
+            if (!wholeFile)
+            {
+                var newDv = await dvWriter.CreateAsync(
+                    allDeleted, allDeleted.Count, cancellationToken).ConfigureAwait(false);
+
+                actions.Add(addFile with
+                {
+                    DeletionVector = newDv,
+                    DataChange = true,
+                });
+
+                dvEdits.Add(new DeleteDvEdit(addFile.Path, newDeletedIndices));
+            }
+
+            if (cdfEnabled)
+            {
+                foreach (var deletedBatch in deletedRowBatches)
+                {
+                    var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
+                        _fs, deletedBatch, DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                        addFile.PartitionValues, _options.ParquetWriteOptions,
+                        cancellationToken).ConfigureAwait(false);
+                    actions.Add(cdcAction);
+                }
+            }
+        }
+
+        return new DeleteActions(actions, removedPaths, totalDeleted, dvEdits);
+    }
+
+    /// <summary>
+    /// Reads the whole table with a trailing <c>_metadata</c> STRUCT column (<c>file_path</c> = the log
+    /// <c>add.path</c>, URL-encoded; <c>row_index</c> = the row's ABSOLUTE physical position in its file —
+    /// parquet row index, counting rows masked by the file's deletion vector, so surviving rows keep
+    /// their physical index across DV deletes). The Spark <c>_metadata</c> convention; the values round-trip
+    /// into a <see cref="FileRowSelection"/> for <see cref="DeleteAsync(FileRowSelection, CancellationToken)"/>.
+    /// PROTOTYPE scope: full data schema only (no projection), partition columns not re-added.
+    /// </summary>
+    public async IAsyncEnumerable<RecordBatch> ReadAllWithMetadataAsync(
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var snapshot = CurrentSnapshot;
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
+            snapshot.Schema, mappingMode);
+
+        foreach (var addFile in snapshot.ActiveFiles.Values)
+        {
+            HashSet<long>? deleted = addFile.DeletionVector is not null
+                ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
+                    .ConfigureAwait(false)
+                : null;
+
+            long rowOffset = 0;
+            await using var file = await _fs.OpenReadAsync(
+                EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+                .ConfigureAwait(false);
+            using var reader = new Parquet.ParquetFileReader(
+                file, ownsFile: false, _dataFileReadOptions);
+
+            await foreach (var batch in reader.ReadAllAsync(
+                cancellationToken: cancellationToken).ConfigureAwait(false))
+            {
+                var logicalBatch = ColumnMapping.RenameColumns(batch, physicalToLogical);
+                if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
+                    logicalBatch = ColumnMappingRecursive.ToLogical(logicalBatch, snapshot.Schema, mappingMode);
+
+                // Survivors + their ABSOLUTE positions (physical index; DV-deleted rows excluded from the
+                // output but still counted in the index — Spark's _metadata.row_index).
+                var absIdx = new List<long>(batch.Length);
+                List<int>? keep = null;
+                if (deleted is not null)
+                {
+                    keep = new List<int>(batch.Length);
+                    for (int i = 0; i < batch.Length; i++)
+                    {
+                        long abs = rowOffset + i;
+                        if (!deleted.Contains(abs))
+                        {
+                            keep.Add(i);
+                            absIdx.Add(abs);
+                        }
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < batch.Length; i++)
+                        absIdx.Add(rowOffset + i);
+                }
+                rowOffset += batch.Length;
+
+                var dataBatch = keep is null ? logicalBatch : TakeRowsFromBatch(logicalBatch, keep);
+                if (dataBatch.Length == 0)
+                    continue;
+
+                yield return AppendMetadataColumn(dataBatch, addFile.Path, absIdx);
+            }
+        }
+    }
+
+    // Appends the trailing `_metadata` struct(file_path, row_index) column; absIdx is row-aligned with batch.
+    private static RecordBatch AppendMetadataColumn(RecordBatch batch, string filePath, List<long> absIdx)
+    {
+        var pathBuilder = new StringArray.Builder();
+        var idxBuilder = new Int64Array.Builder();
+        for (int i = 0; i < batch.Length; i++)
+        {
+            pathBuilder.Append(filePath);
+            idxBuilder.Append(absIdx[i]);
+        }
+
+        var structType = new Apache.Arrow.Types.StructType(new List<Field>
+        {
+            new Field("file_path", Apache.Arrow.Types.StringType.Default, false),
+            new Field("row_index", Apache.Arrow.Types.Int64Type.Default, false),
+        });
+        var metadata = new StructArray(
+            structType, batch.Length,
+            new IArrowArray[] { pathBuilder.Build(), idxBuilder.Build() },
+            ArrowBuffer.Empty, 0);
+
+        var schemaBuilder = new Apache.Arrow.Schema.Builder();
+        foreach (var f in batch.Schema.FieldsList)
+            schemaBuilder.Field(f);
+        schemaBuilder.Field(new Field("_metadata", structType, false));
+
+        var arrays = new List<IArrowArray>(batch.ColumnCount + 1);
+        for (int c = 0; c < batch.ColumnCount; c++)
+            arrays.Add(batch.Column(c));
+        arrays.Add(metadata);
+
+        return new RecordBatch(schemaBuilder.Build(), arrays, batch.Length);
+    }
+
+    /// <summary>
     /// Updates rows matching the predicate. The <paramref name="updater"/> function
     /// receives matching rows and returns modified rows. Non-matching rows are
     /// preserved unchanged. Affected files are rewritten.

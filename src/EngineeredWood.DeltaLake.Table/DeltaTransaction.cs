@@ -134,6 +134,31 @@ public sealed class DeltaTransaction
     }
 
     /// <summary>
+    /// Stages a delete of exactly the rows named by a <see cref="FileRowSelection"/> — the lowered form
+    /// of a metadata predicate (<c>_metadata.file_path</c> + <c>_metadata.row_index</c>). Needs no data
+    /// reads on a non-CDF table (deletion-vector union only). The selected files become the operation's
+    /// removed-file read-set, so a concurrent commit that removed one is the conflict that aborts this
+    /// transaction. Returns the rows deleted.
+    /// </summary>
+    public async ValueTask<long> DeleteAsync(
+        FileRowSelection selection, CancellationToken cancellationToken = default)
+    {
+        EnsureNotCommitted();
+        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+
+        var plan = await _table.ComputeDeleteActionsForSelectionAsync(
+            _baseSnapshot, selection, cancellationToken).ConfigureAwait(false);
+
+        _dataActions.AddRange(plan.DataActions);
+        foreach (string path in plan.RemovedPaths)
+            _removedPaths.Add(path);
+        _dvEdits.AddRange(plan.DvEdits);
+        _operations.Add("DELETE");
+
+        return plan.TotalDeleted;
+    }
+
+    /// <summary>
     /// Stages a delete of the rows matching an analyzable <see cref="Expressions.Predicate"/>. Beyond the
     /// functional overload the predicate is recorded as a read dependency: a concurrent commit that adds a
     /// file matching it aborts this transaction (concurrentAppend), precise to the isolation level. Files
