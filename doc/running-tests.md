@@ -90,18 +90,22 @@ reads the VARIANT logical-type annotation; 4.0.x writes it unannotated and its
 reader throws an NPE on an annotated group (which is why the writer has
 `DeltaTableOptions.EmitVariantLogicalType`). `VariantInteropTests` is
 version-aware — it writes whichever layout the running Spark reads — so the
-tier stays green under either. To run the tier against a Spark 4.1 build
-without disturbing the 4.0.x install the rest of tier 3 is pinned to, put 4.1
-in its own venv (`pyspark` bundles its JARs, so two versions cannot share one
-environment) and point the tier at it:
+tier stays green under either. It also covers **nested** variant (a variant
+inside a struct); those cases require GA variant and self-skip on 4.0.x. To run
+the GA + nested cases against a Spark 4.1 build without disturbing the 4.0.x
+install the rest of tier 3 is pinned to, put 4.1 in its own venv (`pyspark`
+bundles its JARs, so two versions cannot share one environment) and point the
+tier at it:
 
 ```
-python -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.1 delta-spark==4.1.0
+python -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.3 delta-spark==4.1.0
 $env:EW_SPARK_PYTHON = "…\spark41\Scripts\python.exe"   # tier 3 uses this interpreter; unset -> PATH
 ```
 
-delta-rs (tier 1) reads both layouts regardless, so the compat-mode writer is
-covered in every run even without a second Spark.
+The GA annotated path and the nested-variant cases have been validated against
+`pyspark` 4.1.3 / `delta-spark` 4.1.0; the unannotated path against 4.0.1 /
+4.0.0. delta-rs (tier 1) reads both layouts regardless, so the compat-mode
+writer is covered in every run even without a second Spark.
 
 **Tier 3 on Windows** additionally needs Hadoop's `winutils.exe` +
 `hadoop.dll` (Apache does not publish them; community builds exist for each

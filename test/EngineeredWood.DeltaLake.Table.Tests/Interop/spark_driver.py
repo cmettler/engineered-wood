@@ -303,6 +303,31 @@ def cmd_write_variant(args):
     return {"spark": spark.version, "written": len(values)}
 
 
+def cmd_write_nested_variant(args):
+    """Write a table whose VARIANT is NESTED inside a struct: `s STRUCT<v: VARIANT, tag: STRING>`.
+
+    The Spark 4.1 (GA) reference for the nested EW-read direction: Spark GA both annotates the nested
+    variant group in parquet and writes its own child order, so EW's parquet VariantNestedWrapper +
+    schema-driven coercion must reconcile a real reference file, not just its own output. `rows` is a
+    list of {id, json, tag}; json null -> the nested variant is SQL-NULL.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    spark.sql(
+        f"CREATE OR REPLACE TABLE delta.`{path}` "
+        f"(id BIGINT, s STRUCT<v: VARIANT, tag: STRING>) USING delta")
+    values = []
+    for r in args["rows"]:
+        tag = "NULL" if r.get("tag") is None else "'" + r["tag"].replace("'", "''") + "'"
+        if r.get("json") is None:
+            v = "NULL"
+        else:
+            v = "parse_json('" + r["json"].replace("'", "''") + "')"
+        values.append(f"({r['id']}, named_struct('v', {v}, 'tag', {tag}))")
+    spark.sql(f"INSERT INTO delta.`{path}` VALUES {', '.join(values)}")
+    return {"spark": spark.version, "written": len(values)}
+
+
 COMMANDS = {
     "probe": cmd_probe,
     "read": cmd_read,
@@ -310,6 +335,7 @@ COMMANDS = {
     "read_changes": cmd_read_changes,
     "read_variant": cmd_read_variant,
     "write_variant": cmd_write_variant,
+    "write_nested_variant": cmd_write_nested_variant,
     "write": cmd_write,
     "sql": cmd_sql,
     "scan": cmd_scan,

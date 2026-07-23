@@ -15,6 +15,12 @@ namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 /// EW's reader keyed off the parquet annotation rather than the Delta schema (so an unannotated
 /// Spark-4.0 table read as a bare struct), and Spark 4.0.x's parquet reader NPEs on the annotation EW
 /// emits by default (the reason for <see cref="DeltaTableOptions.EmitVariantLogicalType"/>).
+///
+/// <para>Validated against BOTH Spark lines: the unannotated path on pyspark 4.0.1 / delta-spark 4.0.0
+/// (the pinned tier-3 base) and the GA annotated path — plus the nested-variant cases below — on
+/// pyspark 4.1.3 / delta-spark 4.1.0 (an isolated venv pointed at via <c>EW_SPARK_PYTHON</c>). The GA
+/// and nested cases self-skip on 4.0.x via <see cref="SparkHasGaVariant"/>, so the suite stays green on
+/// whichever Spark is on hand.</para>
 /// </summary>
 public class VariantInteropTests : IDisposable
 {
@@ -58,6 +64,37 @@ public class VariantInteropTests : IDisposable
         vb.Append(EmptyMetadata, Int8_42);
         vb.AppendNull();
         await table.WriteAsync([new RecordBatch(VariantSchema(), [ids, vb.Build(allocator: null)], 3)]);
+    }
+
+    private static readonly StructType NestedInner = new(
+    [
+        new Field("v", VariantType.Default, true),
+        new Field("tag", StringType.Default, true),
+    ]);
+
+    private static Apache.Arrow.Schema NestedVariantSchema() =>
+        new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("s", NestedInner, true))
+            .Build();
+
+    /// <summary>Writes a table whose variant is NESTED inside a struct (<c>s: struct&lt;v: variant, tag&gt;</c>).
+    /// EW annotates the nested variant group regardless of <see cref="DeltaTableOptions.EmitVariantLogicalType"/>
+    /// — <c>StripAnnotation</c> is top-level only — so the reader must be GA variant (Spark >= 4.1).</summary>
+    private async Task WriteNestedVariantTable()
+    {
+        var schema = NestedVariantSchema();
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, schema);
+
+        var ids = new Int64Array.Builder().Append(1).Append(2).Append(3).Build();
+        var vb = new VariantArray.Builder();
+        vb.Append(EmptyMetadata, True);
+        vb.Append(EmptyMetadata, Int8_42);
+        vb.AppendNull();
+        var tags = new StringArray.Builder().Append("a").Append("b").Append("c").Build();
+        var s = new StructArray(NestedInner, 3, [vb.Build(allocator: null), tags], ArrowBuffer.Empty, 0);
+        await table.WriteAsync([new RecordBatch(schema, [ids, s], 3)]);
     }
 
     // ── Tier 1: delta-rs reads BOTH physical layouts (it ignores the annotation, keys off the schema). ──
@@ -154,5 +191,70 @@ public class VariantInteropTests : IDisposable
         Assert.Equal(3, col.Count);
         Assert.Contains(col, x => x is null);                 // the SQL-NULL row
         Assert.Equal(2, col.Count(x => x is not null));       // the two real variants round-tripped
+    }
+
+    // ── Tier 3, NESTED variant (variant inside a struct). GA-only. ──
+    //
+    // EW's parquet layer wraps a nested variant (VariantNestedWrapper) and annotates it on write at
+    // every depth; the Delta layer round-trips it (NestedVariant_InsideStruct_RoundTrips). What only a
+    // reference reader/writer can prove is that the NESTED physical group — annotation + child order —
+    // matches the spec. Both directions require GA variant (Spark >= 4.1): EW always annotates the
+    // nested group (StripAnnotation is top-level only) and Spark 4.0.x's reader NPEs on the annotation.
+    // On a 4.0.x Spark these silently no-op — a version gate, not a missing toolchain.
+
+    [Fact]
+    public async Task EwWrittenNestedVariant_SparkReadsVariant()
+    {
+        if (!Spark.EnsureAvailable()) return;
+        if (!SparkHasGaVariant(out _)) return;
+
+        await WriteNestedVariantTable();
+
+        // to_json(s.v) forces Spark to DECODE the nested variant; wrong bytes -> MALFORMED_VARIANT.
+        var result = Spark.Invoke("read_variant", new { path = _tempDir, col = "s.v", id_col = "id" });
+        var rows = result.GetProperty("rows").EnumerateArray().ToList();
+
+        Assert.Equal("true", rows[0].GetProperty("vjson").GetString());
+        Assert.Equal("42", rows[1].GetProperty("vjson").GetString());
+        Assert.True(rows[2].GetProperty("vjson").ValueKind == System.Text.Json.JsonValueKind.Null
+            || rows[2].GetProperty("vjson").GetString() is null);
+    }
+
+    [Fact]
+    public async Task SparkWrittenNestedVariant_EwReadsVariant()
+    {
+        if (!Spark.EnsureAvailable()) return;
+        if (!SparkHasGaVariant(out _)) return;
+
+        Spark.Invoke("write_nested_variant", new
+        {
+            path = _tempDir,
+            rows = new object[]
+            {
+                new { id = 1L, json = "{\"a\":1,\"b\":\"x\"}", tag = "a" },
+                new { id = 2L, json = "[1,2,3]", tag = "b" },
+                new { id = 3L, json = (string?)null, tag = "c" },
+            },
+        });
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.OpenAsync(fs);
+
+        var batches = new List<RecordBatch>();
+        await foreach (var b in table.ReadAllAsync())
+            batches.Add(b);
+
+        // The nested column must present as struct<v: VariantArray, tag> — EW must reconcile Spark's
+        // annotated nested group and its (value, metadata) child order against the schema's VariantType.
+        var values = batches.SelectMany(b =>
+        {
+            var s = Assert.IsType<StructArray>(b.Column(b.Schema.GetFieldIndex("s")));
+            var v = Assert.IsType<VariantArray>(s.Fields[0]);
+            return Enumerable.Range(0, v.Length).Select(i => v.IsNull(i) ? null : v.GetValueBytes(i).ToArray());
+        }).ToList();
+
+        Assert.Equal(3, values.Count);
+        Assert.Contains(values, x => x is null);              // the SQL-NULL nested variant
+        Assert.Equal(2, values.Count(x => x is not null));    // the two real nested variants round-tripped
     }
 }
