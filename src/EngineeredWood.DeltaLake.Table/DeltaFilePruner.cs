@@ -12,12 +12,11 @@ namespace EngineeredWood.DeltaLake.Table;
 /// using both partition values and per-file column statistics. Skips files
 /// that the evaluator proves cannot contain matching rows.
 ///
-/// <para>Public so a host that assembles its own file list (e.g. an <see cref="IDataFileReader"/>-style
-/// native scan that reads the active set through its own parquet reader) can apply the SAME
-/// superset-safe prune verdict the library's read paths use — a pruned file is provably matchless,
-/// an unresolvable reference keeps the file.</para>
+/// <para>Internal: callers outside the library reach this verdict through
+/// <see cref="DeltaTable.PlanFiles(Predicate, Snapshot.Snapshot, StructType)"/>, which pairs it with the
+/// path-sorted ordinal the row-id contract depends on — the two have to be applied together.</para>
 /// </summary>
-public sealed class DeltaFilePruner
+internal sealed class DeltaFilePruner
 {
     private readonly DeltaFileStatsAccessor _accessor;
 

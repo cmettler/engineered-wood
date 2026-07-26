@@ -3092,6 +3092,60 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Plans a scan: the snapshot's active files in PATH-SORTED order, each carrying its ordinal, with
+    /// the files that <paramref name="filter"/> proves matchless removed. The Delta counterpart of
+    /// Iceberg's <c>TableScan.PlanFiles</c>.
+    ///
+    /// <para>The point of returning the ordinal is that the ordinal and the pruning belong together.
+    /// The path-sorted position is what the transient row id encodes
+    /// (<c>(ordinal &lt;&lt; 40) | absolute-in-file position</c>) and what
+    /// <see cref="ComputeDeletionVectorActionsAsync"/> / <see cref="ReadRowsByRowIdsAsync"/> decode; a
+    /// caller that reads the active set through its own reader (an <see cref="IDataFileReader"/>-style
+    /// integration, a native scan) must produce the SAME ordinals or the ids it hands back address the
+    /// wrong rows. Handing out the pair removes the chance of disagreeing.</para>
+    ///
+    /// <para>Pruning is superset-safe in one direction only: a file is dropped only when the predicate
+    /// is provably false over its partition values and statistics, and any unresolvable reference keeps
+    /// the file. Rows are NOT filtered — the caller must still apply the predicate per row.</para>
+    ///
+    /// <para>Deliberately synchronous and deliberately not deletion-vector-aware: everything it needs is
+    /// already in the snapshot, and resolving DVs would mean I/O. Read those via
+    /// <see cref="DeletionVectors.DeletionVectorReader"/> from each returned <c>add</c>.</para>
+    /// </summary>
+    /// <param name="filter">Prune predicate. Null (or <c>TruePredicate</c>) keeps every active file.</param>
+    /// <param name="snapshot">Snapshot to plan against; defaults to <see cref="CurrentSnapshot"/>. Pass one
+    /// explicitly to plan against the same snapshot a later commit pins as its <c>expectedVersion</c>, so a
+    /// writer landing between two opens cannot manufacture a conflict.</param>
+    /// <param name="pruneSchema">Schema to resolve the predicate's column references against; defaults to the
+    /// snapshot's. Pass one to plan against a schema the snapshot does not carry yet — a buffered
+    /// transaction's PENDING schema. Correctness does not depend on it (an unresolvable reference keeps the
+    /// file), but without it a predicate on a pending RENAME's new name prunes nothing.</param>
+    public IReadOnlyList<PlannedFile> PlanFiles(
+        EngineeredWood.Expressions.Predicate? filter = null,
+        Snapshot.Snapshot? snapshot = null,
+        Schema.StructType? pruneSchema = null)
+    {
+        ThrowIfDisposed();
+        var snap = snapshot ?? CurrentSnapshot;
+        var ordered = OrderedActiveFiles(snap);
+        var pruner = filter is null or EngineeredWood.Expressions.TruePredicate
+            ? null
+            : new DeltaFilePruner(pruneSchema ?? snap.Schema, snap.Metadata.PartitionColumns);
+
+        var planned = new List<PlannedFile>(ordered.Count);
+        for (int ordinal = 0; ordinal < ordered.Count; ordinal++)
+        {
+            var addFile = ordered[ordinal];
+            // The ordinal advances over PRUNED files too — it addresses a position in the active set,
+            // not in this list. See PlannedFile.Ordinal.
+            if (pruner is not null && !pruner.ShouldInclude(addFile, filter!))
+                continue;
+            planned.Add(new PlannedFile(addFile, ordinal));
+        }
+        return planned;
+    }
+
+    /// <summary>
     /// Reads all data from the current snapshot as a stream of RecordBatches.
     /// </summary>
     public IAsyncEnumerable<RecordBatch> ReadAllAsync(
@@ -3240,15 +3294,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         EngineeredWood.Expressions.Predicate? filter,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var pruner = filter is null ? null : new DeltaFilePruner(
-            snapshot.Schema, snapshot.Metadata.PartitionColumns);
-        var ordered = OrderedActiveFiles(snapshot);
-        for (int ordinal = 0; ordinal < ordered.Count; ordinal++)
+        foreach (var (addFile, ordinal) in PlanFiles(filter, snapshot))
         {
-            var addFile = ordered[ordinal];
-            if (pruner is not null && !pruner.ShouldInclude(addFile, filter!))
-                continue;
-
             var absOut = new List<Int64Array?>();
             int bi = -1;
             await foreach (var batch in ReadFileAsync(addFile, columns, snapshot, cancellationToken,
