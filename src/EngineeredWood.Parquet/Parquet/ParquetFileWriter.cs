@@ -59,6 +59,13 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
         cancellationToken.ThrowIfCancellationRequested();
 
+        // A SLICED column (Arrow's zero-copy sub-range view: Data.Offset != 0) must be compacted before
+        // anything reads its buffers. The encoders below index the raw value buffer from slot 0, so a view
+        // starting at row N silently writes rows 0..len instead of N..N+len — and the def levels, which come
+        // from the offset-aware IsNull, stay correct, so the file is well-formed and merely holds the wrong
+        // rows. Only paid when a column actually carries an offset.
+        batch = CompactSlicedColumns(batch);
+
         // First call: write header and convert schema
         if (!_headerWritten)
         {
@@ -210,6 +217,50 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Materializes any column that is an offset-based VIEW onto a larger array, so every column's row 0 is
+    /// its buffer's slot 0 — the layout the whole write path assumes.
+    ///
+    /// <para>Returns the batch unchanged when no column carries an offset, which is the common case: arrays
+    /// built by a builder, read back by the parquet reader, or gathered by <c>ArrowCompute.Take</c> all start
+    /// at 0. Only a caller that sliced its own data pays for the copy.</para>
+    ///
+    /// <para><c>Take</c> with the identity selection is the compaction: it applies the source's offset in
+    /// every one of its per-type gathers, so the result is a genuine copy of the rows the view designates.
+    /// A type it cannot gather raises <see cref="NotSupportedException"/> from there rather than being
+    /// written wrong.</para>
+    /// </summary>
+    private static RecordBatch CompactSlicedColumns(RecordBatch batch)
+    {
+        bool anySliced = false;
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            if (batch.Column(i).Data.Offset != 0)
+            {
+                anySliced = true;
+                break;
+            }
+        }
+
+        if (!anySliced)
+            return batch;
+
+        var identity = new int[batch.Length];
+        for (int i = 0; i < identity.Length; i++)
+            identity[i] = i;
+
+        var columns = new IArrowArray[batch.ColumnCount];
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var column = batch.Column(i);
+            columns[i] = column.Data.Offset == 0
+                ? column
+                : EngineeredWood.Arrow.ArrowCompute.Take(column, identity);
+        }
+
+        return new RecordBatch(batch.Schema, columns, batch.Length);
+    }
+
+    /// <summary>
     /// Creates a zero-offset copy of a batch slice.
     /// Arrow's <c>Array.Slice</c> creates offset-based views, but the write path
     /// reads value buffers from index 0 — so we must materialize each slice.
@@ -224,6 +275,26 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
     private static IArrowArray MaterializeSlice(IArrowArray array, int offset, int length)
     {
+        // A NESTED column is gathered rather than sliced, and — unlike the flat cases below — it is gathered
+        // even at offset zero.
+        //
+        // A nested column has no flat value buffer for CopyArray to slice: a struct's children are separate
+        // arrays that are not sliced along with their parent, and a list-shaped column reaches its child
+        // through its offsets buffer. But taking Arrow's zero-copy VIEW is not enough either, which is why
+        // the offset-zero shortcut below cannot cover this. A view narrows the PARENT's row range and leaves
+        // the children whole, so the first row group of a split list column still hands the leaf every row in
+        // the batch while the def levels describe only this group's — measured as an IndexOutOfRangeException
+        // out of StatisticsCollector. Take rebuilds the children down to exactly the selected rows, which is
+        // what the write path assumes throughout. (MapArray derives from ListArray, so a map is covered by
+        // the list pattern here.)
+        if (array is StructArray or ListArray or LargeListArray or FixedSizeListArray)
+        {
+            var indices = new int[length];
+            for (int i = 0; i < length; i++)
+                indices[i] = offset + i;
+            return EngineeredWood.Arrow.ArrowCompute.Take(array, indices);
+        }
+
         // Use Arrow's builder pattern to create a zero-offset copy of the slice
         var sliced = ((Apache.Arrow.Array)array).Slice(offset, length);
         var slicedData = sliced.Data;

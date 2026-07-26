@@ -1156,4 +1156,231 @@ public class SparkInteropTests : IDisposable
         Assert.Contains(rows, t => t.Ct == "update_preimage" && t.Id == 1 && t.Value == "a");
         Assert.Contains(rows, t => t.Ct == "update_postimage" && t.Id == 1 && t.Value == "z");
     }
+
+    // ── CDF inference over a deletion-vector-carrying file ──
+
+    // Creates an unmapped table with BOTH deletion vectors and CDF. CreateAsync has no CDF switch, so the
+    // property and the writer feature are patched into the generated metadata/protocol as a follow-up commit.
+    private async Task<DeltaTable> CreateCdfDvTableAsync()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        long next;
+        MetadataAction meta;
+        ProtocolAction proto;
+        await using (var created = await DeltaTable.CreateAsync(
+            fs, IdRegionSchema, enableDeletionVectors: true))
+        {
+            meta = created.CurrentSnapshot.Metadata;
+            proto = created.CurrentSnapshot.Protocol;
+            next = created.CurrentSnapshot.Version + 1;
+        }
+
+        var cfg = meta.Configuration!.ToDictionary(kv => kv.Key, kv => kv.Value);
+        cfg[CdfConfig.EnableKey] = "true";
+        var writerFeatures = (proto.WriterFeatures ?? []).ToList();
+        if (!writerFeatures.Contains("changeDataFeed"))
+            writerFeatures.Add("changeDataFeed");
+
+        await new TransactionLog(fs).WriteCommitAsync(next, new List<DeltaAction>
+        {
+            proto with { WriterFeatures = writerFeatures },
+            meta with { Configuration = cfg },
+        });
+        return await DeltaTable.OpenAsync(fs);
+    }
+
+    /// <summary>
+    /// <para>A commit that carries no <c>cdc</c> action is read by INFERENCE — the removed files' rows become
+    /// deletes, the added files' rows become inserts. When the removed file carries a DELETION VECTOR, the rows
+    /// it marks are NOT part of that change: they were reported as deletes when the DV itself committed. This
+    /// pins EW's inference against the reference implementation's.</para>
+    ///
+    /// <para>The scenario: append five rows, DV-delete <c>id=2</c> (a soft delete, so v3 writes a
+    /// <c>_change_data</c> file and reports that one delete), then OVERWRITE — which removes the DV-carrying
+    /// file and emits no cdc action, so v4 is inferred. Spark must report only the four SURVIVORS as deletes;
+    /// re-reporting <c>id=2</c> would count one row's deletion twice across the history.</para>
+    ///
+    /// <para>Spark is a true oracle here: it reads the on-disk log and data files, which are identical whether
+    /// or not EW's own reader honors the DV. Measured against Spark 4.0 — before the DV-aware inference fix EW
+    /// reported five deletes at v4 where Spark reported four.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwWritten_CdfInference_OverDeletionVector_MatchesSparkFeed()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        long appendVersion, deleteVersion, overwriteVersion;
+        await using (var table = await CreateCdfDvTableAsync())
+        {
+            appendVersion = table.CurrentSnapshot.Version + 1;
+            await table.WriteAsync([IdRegionBatch([1, 2, 3, 4, 5], ["emea", "emea", "emea", "emea", "emea"])]);
+
+            deleteVersion = table.CurrentSnapshot.Version + 1;
+            await table.DeleteAsync(b =>
+            {
+                var id = (Int64Array)b.Column("id");
+                var mask = new BooleanArray.Builder();
+                for (int i = 0; i < b.Length; i++) mask.Append(id.GetValue(i) == 2);
+                return mask.Build();
+            });
+
+            // The scenario is only meaningful if the DELETE actually soft-deleted via a DV rather than
+            // rewriting the file — otherwise the removed file below carries nothing to double-count.
+            Assert.Contains(table.CurrentSnapshot.ActiveFiles.Values, a => a.DeletionVector is not null);
+
+            overwriteVersion = table.CurrentSnapshot.Version + 1;
+            await table.WriteAsync([IdRegionBatch([9], ["emea"])], DeltaWriteMode.Overwrite);
+        }
+
+        // The inferred version, as each engine sees it.
+        var sparkInferred = SparkChanges(overwriteVersion, overwriteVersion);
+        var ewInferred = await EwChangesAsync(overwriteVersion, overwriteVersion);
+
+        // id=2 was already reported deleted at the DV commit; only the four survivors are deleted here.
+        var expected = new List<(string, long)>
+        {
+            ("delete", 1), ("delete", 3), ("delete", 4), ("delete", 5), ("insert", 9),
+        };
+        Assert.Equal(expected, sparkInferred);
+        Assert.Equal(expected, ewInferred);
+        Assert.Equal(sparkInferred, ewInferred);
+
+        // Across the whole history the deletion of id=2 is reported EXACTLY once — at the DV commit, not
+        // again at the overwrite. This is the property the double-count broke.
+        var sparkAll = SparkChanges(appendVersion, overwriteVersion);
+        var ewAll = await EwChangesAsync(appendVersion, overwriteVersion);
+        Assert.Equal(sparkAll, ewAll);
+        Assert.Single(sparkAll.Where(t => t is { Ct: "delete", Id: 2 }));
+    }
+
+    /// <summary>
+    /// <para>EW compacts a table whose live files span ADD/DROP/RENAME COLUMN vintages, and Spark reads the
+    /// result. ADD and DROP are metadata-only commits, so the files being merged carry DIFFERENT column sets;
+    /// compaction has to reconcile each to the current schema before they can share an output file, and pair
+    /// their columns BY NAME, since position no longer means the same thing across vintages.</para>
+    ///
+    /// <para>This is the case where being wrong is silent. A positional pairing lands one column's values
+    /// under another column's name; when the types happen to be compatible nothing raises, and the table
+    /// simply holds different data than it did before the OPTIMIZE. An EW-only round-trip cannot rule that
+    /// out — it would read its own mislabeled output back through the same mapping and agree with itself.
+    /// Spark resolves the compacted file through the table's column mapping independently, so it is the check
+    /// that the physical names, field ids and values still line up.</para>
+    ///
+    /// <para>Compaction is a pure reorganization (<c>dataChange: false</c>), so Spark must see exactly the
+    /// rows it saw before — asserted here against the same query run on both sides of the compaction.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwCompacted_SchemaEvolvedMappedTable_SparkReadsSameRows()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        var v1Schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("amount", Int64Type.Default, true))
+            .Build();
+
+        await using (var table = await DeltaTable.CreateAsync(
+            fs, v1Schema, columnMappingMode: ColumnMappingMode.Name))
+        {
+            // Vintage 1: (id, amount).
+            await table.WriteAsync([new RecordBatch(v1Schema,
+                [
+                    new Int64Array.Builder().AppendRange([1L, 2L]).Build(),
+                    new Int64Array.Builder().AppendRange([10L, 20L]).Build(),
+                ], 2)]);
+
+            await table.RenameColumnAsync("amount", "total");
+            await table.AddColumnAsync(new Field("note", StringType.Default, true));
+
+            // Vintage 2: (id, total, note) — renamed column plus one the first file has never heard of.
+            await table.WriteAsync([new RecordBatch(
+                new Apache.Arrow.Schema.Builder()
+                    .Field(new Field("id", Int64Type.Default, true))
+                    .Field(new Field("total", Int64Type.Default, true))
+                    .Field(new Field("note", StringType.Default, true))
+                    .Build(),
+                [
+                    new Int64Array.Builder().Append(3L).Build(),
+                    new Int64Array.Builder().Append(30L).Build(),
+                    new StringArray.Builder().Append("n3").Build(),
+                ], 1)]);
+
+            await table.DropColumnAsync("total");
+
+            // Vintage 3: (id, note) — and now the first two files carry a column the schema has dropped.
+            await table.WriteAsync([new RecordBatch(
+                new Apache.Arrow.Schema.Builder()
+                    .Field(new Field("id", Int64Type.Default, true))
+                    .Field(new Field("note", StringType.Default, true))
+                    .Build(),
+                [
+                    new Int64Array.Builder().Append(4L).Build(),
+                    new StringArray.Builder().Append("n4").Build(),
+                ], 1)]);
+
+            Assert.Equal(3, table.CurrentSnapshot.ActiveFiles.Count);
+        }
+
+        var before = SparkIdNoteRows();
+        Assert.Equal(
+            [(1L, null), (2L, null), (3L, "n3"), (4L, "n4")],
+            before);
+
+        await using (var table = await DeltaTable.OpenAsync(fs))
+        {
+            var version = await table.CompactAsync(
+                new CompactionOptions { MinFileSize = long.MaxValue, TargetFileSize = long.MaxValue });
+            Assert.NotNull(version);
+            Assert.Single(table.CurrentSnapshot.ActiveFiles);
+        }
+
+        // The reference implementation reads the merged file: same rows, and the dropped column does not
+        // reappear in the schema it resolves.
+        Assert.Equal(before, SparkIdNoteRows());
+
+        var columns = Spark.Invoke("read", new { path = _tempDir })
+            .GetProperty("columns").EnumerateArray().Select(e => e.GetString()!).ToList();
+        Assert.Equal(["id", "note"], columns);
+    }
+
+    private List<(long Id, string? Note)> SparkIdNoteRows()
+    {
+        var result = Spark.Invoke("read", new { path = _tempDir });
+        var rows = result.GetProperty("rows").EnumerateArray()
+            .Select(r => (
+                r.GetProperty("id").GetInt64(),
+                r.GetProperty("note").ValueKind == JsonValueKind.Null
+                    ? null
+                    : r.GetProperty("note").GetString()))
+            .ToList();
+        rows.Sort();
+        return rows;
+    }
+
+    private List<(string Ct, long Id)> SparkChanges(long start, long end)
+    {
+        var result = Spark.Invoke("read_changes", new { path = _tempDir, start, end });
+        return result.GetProperty("rows").EnumerateArray()
+            .Select(r => (r.GetProperty(CdfConfig.ChangeTypeColumn).GetString()!,
+                          r.GetProperty("id").GetInt64()))
+            .OrderBy(t => t.Item1, StringComparer.Ordinal).ThenBy(t => t.Item2)
+            .ToList();
+    }
+
+    private async Task<List<(string Ct, long Id)>> EwChangesAsync(long start, long end)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.OpenAsync(fs);
+        var rows = new List<(string, long)>();
+        await foreach (var b in table.ReadChangesAsync(start, end))
+        {
+            var ids = (Int64Array)b.Column("id");
+            var ct = (StringArray)b.Column(b.Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn));
+            for (int i = 0; i < b.Length; i++)
+                rows.Add((ct.GetString(i), ids.GetValue(i)!.Value));
+        }
+
+        return rows.OrderBy(t => t.Item1, StringComparer.Ordinal).ThenBy(t => t.Item2).ToList();
+    }
 }

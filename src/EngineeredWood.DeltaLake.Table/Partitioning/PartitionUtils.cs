@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 
 namespace EngineeredWood.DeltaLake.Table.Partitioning;
 
@@ -223,202 +224,10 @@ internal static class PartitionUtils
             if (partSet.Contains(col))
                 continue;
 
-            columns.Add(TakeRows(source.Column(col), rows));
+            columns.Add(ArrowCompute.Take(source.Column(col), rows));
         }
 
         return new RecordBatch(dataSchema, columns, rows.Count);
-    }
-
-    /// <summary>
-    /// Creates a new array containing only the specified rows from the source.
-    /// </summary>
-    private static IArrowArray TakeRows(IArrowArray source, List<int> rows)
-    {
-        switch (source)
-        {
-            // Extension arrays (VARIANT) filter through their STORAGE and are re-wrapped. Without
-            // this a partitioned write of ANY table containing a variant column would throw, even
-            // when variant is not the partition column — BuildFilteredBatch takes rows from every
-            // non-partition column. Must precede the storage-shaped cases below.
-            case ExtensionArray ext:
-            {
-                var filteredStorage = TakeRows(ext.Storage, rows);
-                return ((ExtensionType)ext.Data.DataType).CreateArray(filteredStorage);
-            }
-            case Int64Array int64:
-            {
-                var b = new Int64Array.Builder();
-                foreach (int r in rows) { if (int64.IsNull(r)) b.AppendNull(); else b.Append(int64.GetValue(r)!.Value); }
-                return b.Build();
-            }
-            case Int32Array int32:
-            {
-                var b = new Int32Array.Builder();
-                foreach (int r in rows) { if (int32.IsNull(r)) b.AppendNull(); else b.Append(int32.GetValue(r)!.Value); }
-                return b.Build();
-            }
-            case Int16Array int16:
-            {
-                var b = new Int16Array.Builder();
-                foreach (int r in rows) { if (int16.IsNull(r)) b.AppendNull(); else b.Append(int16.GetValue(r)!.Value); }
-                return b.Build();
-            }
-            case Int8Array int8:
-            {
-                var b = new Int8Array.Builder();
-                foreach (int r in rows) { if (int8.IsNull(r)) b.AppendNull(); else b.Append(int8.GetValue(r)!.Value); }
-                return b.Build();
-            }
-            case DoubleArray dbl:
-            {
-                var b = new DoubleArray.Builder();
-                foreach (int r in rows) { if (dbl.IsNull(r)) b.AppendNull(); else b.Append(dbl.GetValue(r)!.Value); }
-                return b.Build();
-            }
-            case FloatArray flt:
-            {
-                var b = new FloatArray.Builder();
-                foreach (int r in rows) { if (flt.IsNull(r)) b.AppendNull(); else b.Append(flt.GetValue(r)!.Value); }
-                return b.Build();
-            }
-            case Date32Array d32:
-            {
-                var b = new Date32Array.Builder();
-                foreach (int r in rows)
-                {
-                    if (d32.IsNull(r)) b.AppendNull();
-                    else
-                    {
-                        var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-                        b.Append(epoch.AddDays(d32.GetValue(r)!.Value));
-                    }
-                }
-                return b.Build();
-            }
-            case StringArray str:
-            {
-                var b = new StringArray.Builder();
-                foreach (int r in rows) { if (str.IsNull(r)) b.AppendNull(); else b.Append(str.GetString(r)); }
-                return b.Build();
-            }
-            case LargeStringArray lstr:
-            {
-                var b = new StringArray.Builder();
-                foreach (int r in rows) { if (lstr.IsNull(r)) b.AppendNull(); else b.Append(lstr.GetString(r)); }
-                return b.Build();
-            }
-            case BooleanArray bln:
-            {
-                var b = new BooleanArray.Builder();
-                foreach (int r in rows) { if (bln.IsNull(r)) b.AppendNull(); else b.Append(bln.GetValue(r)!.Value); }
-                return b.Build();
-            }
-            case TimestampArray ts:
-            {
-                var tsType = (TimestampType)ts.Data.DataType;
-                var b = new TimestampArray.Builder(tsType);
-                foreach (int r in rows)
-                {
-                    if (ts.IsNull(r))
-                        b.AppendNull();
-                    else
-                    {
-                        long micros = ts.GetValue(r)!.Value;
-                        b.Append(DateTimeOffset.FromUnixTimeMilliseconds(micros / 1000));
-                    }
-                }
-                return b.Build();
-            }
-            case BinaryArray bin:
-            {
-                var b = new BinaryArray.Builder();
-                foreach (int r in rows) { if (bin.IsNull(r)) b.AppendNull(); else b.Append(bin.GetBytes(r)); }
-                return b.Build();
-            }
-            case StructArray st:
-            {
-                // A struct's children are aligned with the parent rows but do NOT incorporate the parent's
-                // logical offset (StructArray.Fields wraps Data.Children directly), so child rows are indexed
-                // at parentOffset + r. Each child is taken recursively; the struct's own validity is rebuilt.
-                int off = st.Data.Offset;
-                var childRows = off == 0 ? rows : rows.ConvertAll(r => r + off);
-                var childData = new ArrayData[st.Data.Children.Length];
-                for (int c = 0; c < st.Data.Children.Length; c++)
-                {
-                    childData[c] = TakeRows(ArrowArrayFactory.BuildArray(st.Data.Children[c]), childRows).Data;
-                }
-                var validity = new ArrowBuffer.BitmapBuilder(rows.Count);
-                int nullCount = 0;
-                foreach (int r in rows)
-                {
-                    bool isNull = st.IsNull(r);
-                    validity.Append(!isNull);
-                    if (isNull)
-                        nullCount++;
-                }
-                var data = new ArrayData(st.Data.DataType, rows.Count, nullCount, 0,
-                                         new[] { validity.Build() }, childData);
-                return ArrowArrayFactory.BuildArray(data);
-            }
-            default:
-            {
-                // Every other fixed-width type (unsigned ints, decimals, Time/Duration, HalfFloat,
-                // FixedSizeBinary, ...) is filtered by copying its raw value-slot bytes — preserving the exact
-                // type and avoiding per-type builders. A type we cannot slice (nested list/struct/map/...) must
-                // THROW, never fall through unfiltered: an unfiltered column has the wrong length and silently
-                // corrupts the partitioned write (mispaired rows in the written partition file).
-                int? width = FixedWidthBytes(source.Data.DataType);
-                if (width is int byteWidth)
-                    return TakeFixedWidth(source, rows, byteWidth);
-                throw new NotSupportedException(
-                    $"PartitionUtils.TakeRows cannot filter column type {source.Data.DataType.TypeId} — "
-                    + "partitioned writes do not support this column type.");
-            }
-        }
-    }
-
-    /// <summary>
-    /// Byte width of a fixed-width Arrow type (Boolean is bit-packed → excluded, handled by its own builder
-    /// case), or null for variable-width / nested types.
-    /// </summary>
-    private static int? FixedWidthBytes(IArrowType type) => type switch
-    {
-        Int8Type or UInt8Type => 1,
-        Int16Type or UInt16Type or HalfFloatType => 2,
-        Int32Type or UInt32Type or FloatType or Date32Type or Time32Type => 4,
-        Int64Type or UInt64Type or DoubleType or Date64Type or Time64Type or TimestampType or DurationType => 8,
-        // Decimal128Type / Decimal256Type derive from FixedSizeBinaryType, so ByteWidth (16 / 32) is exact.
-        FixedSizeBinaryType fsb => fsb.ByteWidth,
-        _ => null,
-    };
-
-    /// <summary>
-    /// Takes specific rows from a fixed-width array by copying the raw value-slot bytes (accounting for the
-    /// source array's logical offset) and rebuilding the validity bitmap. Type-agnostic and lossless.
-    /// </summary>
-    private static IArrowArray TakeFixedWidth(IArrowArray source, List<int> rows, int byteWidth)
-    {
-        ReadOnlySpan<byte> srcValues = source.Data.Buffers[1].Span;
-        int srcOffset = source.Data.Offset;
-        var valueBytes = new byte[rows.Count * byteWidth];
-        var validity = new ArrowBuffer.BitmapBuilder(rows.Count);
-        int nullCount = 0;
-        int i = 0;
-        foreach (int r in rows)
-        {
-            bool isNull = source.IsNull(r);
-            validity.Append(!isNull);
-            if (isNull)
-                nullCount++;
-            else
-                srcValues.Slice((srcOffset + r) * byteWidth, byteWidth)
-                         .CopyTo(valueBytes.AsSpan(i * byteWidth, byteWidth));
-            i++;
-        }
-
-        var buffers = new[] { validity.Build(), new ArrowBuffer(valueBytes) };
-        var data = new ArrayData(source.Data.DataType, rows.Count, nullCount, 0, buffers);
-        return ArrowArrayFactory.BuildArray(data);
     }
 
     /// <summary>
@@ -457,135 +266,159 @@ internal static class PartitionUtils
     /// Used to materialize partition columns on read. A null <paramref name="value"/>, the
     /// <c>__HIVE_DEFAULT_PARTITION__</c> directory sentinel (some writers put it into
     /// <c>partitionValues</c>), or an empty string for a non-string type all decode as SQL NULL.
+    ///
+    /// <para>The value is decoded ONCE into its raw Arrow encoding and then tiled across the column, rather
+    /// than appended per row through a typed builder. Besides being the read path's hottest loop — it runs
+    /// per partition column, per batch, per file of every partitioned scan — that is what makes it lossless:
+    /// a builder round-trips each value through its .NET surface type, which for <c>decimal</c> silently
+    /// rounds away anything past ~28 significant digits.</para>
     /// </summary>
     private static IArrowArray BuildConstantArray(IArrowType type, string? value, int length)
     {
-        var inv = System.Globalization.CultureInfo.InvariantCulture;
         bool isNull = value is null
             || value == "__HIVE_DEFAULT_PARTITION__"
             || (value.Length == 0 && type is not StringType);
 
+        if (isNull)
+            return ArrowCompute.MakeNullArray(type, length);
+
+        // The two shapes are inverses and each gets its own path: an all-null column needs an allocated,
+        // all-zero validity bitmap, while a constant column needs no validity buffer at all.
+        return ArrowCompute.Repeat(type, EncodePartitionValue(type, value!), length);
+    }
+
+    /// <summary>
+    /// Decodes one partition value string into the raw little-endian Arrow encoding of a single value slot
+    /// (or, for a string column, the UTF-8 bytes).
+    /// </summary>
+    private static byte[] EncodePartitionValue(IArrowType type, string value)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+
         switch (type)
         {
             case StringType:
-            {
-                var builder = new StringArray.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(value);
-                }
-                return builder.Build();
-            }
+                return System.Text.Encoding.UTF8.GetBytes(value);
+
             case Int64Type:
-            {
-                long v = isNull ? 0 : long.Parse(value!, inv);
-                var builder = new Int64Array.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return Le(BitConverter.GetBytes(long.Parse(value, inv)));
             case Int32Type:
-            {
-                int v = isNull ? 0 : int.Parse(value!, inv);
-                var builder = new Int32Array.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return Le(BitConverter.GetBytes(int.Parse(value, inv)));
             case Int16Type:
-            {
-                short v = isNull ? (short)0 : short.Parse(value!, inv);
-                var builder = new Int16Array.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return Le(BitConverter.GetBytes(short.Parse(value, inv)));
             case Int8Type:
-            {
-                sbyte v = isNull ? (sbyte)0 : sbyte.Parse(value!, inv);
-                var builder = new Int8Array.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return [unchecked((byte)sbyte.Parse(value, inv))];
+
             case DoubleType:
-            {
-                double v = isNull ? 0 : double.Parse(value!, inv);
-                var builder = new DoubleArray.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return Le(BitConverter.GetBytes(double.Parse(value, inv)));
             case FloatType:
-            {
-                float v = isNull ? 0 : float.Parse(value!, inv);
-                var builder = new FloatArray.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return Le(BitConverter.GetBytes(float.Parse(value, inv)));
+
+            case BooleanType:
+                return [bool.Parse(value) ? (byte)1 : (byte)0];
+
             case Decimal128Type decType:
-            {
-                decimal v = isNull ? 0m : decimal.Parse(value!, System.Globalization.NumberStyles.Number, inv);
-                var builder = new Decimal128Array.Builder(decType);
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+                return EncodeDecimal128(decType, value);
+
             case Date32Type:
             {
-                // "yyyy-MM-dd"
-                var dt = isNull ? default : DateTime.Parse(value!, inv,
-                    System.Globalization.DateTimeStyles.None);
-                var builder = new Date32Array.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(dt);
-                }
-                return builder.Build();
+                // "yyyy-MM-dd", stored as a day count from the epoch.
+                var dt = DateTime.Parse(value, inv, System.Globalization.DateTimeStyles.None);
+                int days = (dt.Date - new DateTime(1970, 1, 1)).Days;
+                return Le(BitConverter.GetBytes(days));
             }
-            case BooleanType:
-            {
-                bool v = !isNull && bool.Parse(value!);
-                var builder = new BooleanArray.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (isNull) builder.AppendNull(); else builder.Append(v);
-                }
-                return builder.Build();
-            }
+
             case TimestampType tsType:
             {
                 // "yyyy-MM-dd HH:mm:ss[.ffffff]" — no zone suffix; timestamps are stored UTC-normalized.
-                var dto = isNull ? default : DateTimeOffset.Parse(value!, inv,
+                var dto = DateTimeOffset.Parse(value, inv,
                     System.Globalization.DateTimeStyles.AssumeUniversal);
-                var builder = new TimestampArray.Builder(tsType);
-                for (int i = 0; i < length; i++)
+                long micros = (dto.UtcTicks - EpochUtcTicks) / TicksPerMicrosecond;
+
+                // The inverse of FormatTimestampPartitionValue, and it accepts exactly the units that one
+                // emits. Anything else would need the stored value scaled by a factor that discards digits,
+                // and a partition value is an exact identity rather than a bound.
+                long stored = tsType.Unit switch
                 {
-                    if (isNull) builder.AppendNull(); else builder.Append(dto);
-                }
-                return builder.Build();
+                    TimeUnit.Microsecond => micros,
+                    TimeUnit.Millisecond => micros / 1_000,
+                    _ => throw new NotSupportedException(
+                        $"Timestamp partition columns with {tsType.Unit} precision are not supported; "
+                        + "the column must be millisecond or microsecond precision."),
+                };
+                return Le(BitConverter.GetBytes(stored));
             }
+
             default:
                 // Falling back to a string column would mismatch the table schema downstream — throw.
                 throw new NotSupportedException(
                     $"Partition columns of Arrow type {type.TypeId} are not supported on read.");
         }
     }
+
+    private const long TicksPerMicrosecond = 10L;
+    private static readonly long EpochUtcTicks =
+        new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+
+    /// <summary>
+    /// Arrow value buffers are little-endian; <see cref="BitConverter"/> follows the host, so flip on a
+    /// big-endian one rather than writing the wrong bytes there.
+    /// </summary>
+    private static byte[] Le(byte[] hostOrder)
+    {
+        // Qualified: `Array` alone is ambiguous here, since Apache.Arrow declares one too.
+        if (!BitConverter.IsLittleEndian)
+            System.Array.Reverse(hostOrder);
+        return hostOrder;
+    }
+
+    /// <summary>
+    /// Encodes a decimal partition value as Decimal128's 16-byte little-endian two's complement.
+    ///
+    /// <para>Parsed through <see cref="DeltaLake.Schema.DecimalText"/> rather than
+    /// <see cref="decimal"/>: <c>decimal.Parse</c> silently rounds a value carrying more than ~28
+    /// significant digits and throws on anything wider still, and Delta's <c>decimal(38,s)</c> range is
+    /// wider than that in both directions. Measured before the change: a <c>decimal(38,10)</c> partition
+    /// value of <c>1234567890123456789012345678.1234567890</c> materialized as
+    /// <c>1234567890123456789012345678.1000000000</c> for every row of the partition, and a
+    /// <c>decimal(38,0)</c> value above <see cref="decimal.MaxValue"/> failed the read outright.</para>
+    /// </summary>
+    private static byte[] EncodeDecimal128(Decimal128Type decType, string value)
+    {
+        if (!DeltaLake.Schema.DecimalText.TryParse(value, out var unscaled, out int scale))
+        {
+            throw new FormatException(
+                $"Partition value '{value}' is not a valid decimal for a "
+                + $"decimal({decType.Precision},{decType.Scale}) column.");
+        }
+
+        if (!DeltaLake.Schema.DecimalText.TryRescale(unscaled, scale, decType.Scale, out var scaled))
+        {
+            throw new FormatException(
+                $"Partition value '{value}' carries more fractional digits than its column's scale of "
+                + $"{decType.Scale} can hold, so restating it would change the value.");
+        }
+
+        var bytes = new byte[16];
+        // Sign-extend first, so a negative value's high bytes are 0xFF rather than 0x00.
+        if (scaled.Sign < 0)
+            bytes.AsSpan().Fill(0xFF);
+
+#if NET6_0_OR_GREATER
+        if (!scaled.TryWriteBytes(bytes, out _, isUnsigned: false, isBigEndian: false))
+            throw new OverflowException(DecimalRangeMessage(value, decType));
+#else
+        var le = scaled.ToByteArray(); // little-endian, signed, minimal representation
+        if (le.Length > 16)
+            throw new OverflowException(DecimalRangeMessage(value, decType));
+        le.CopyTo(bytes, 0);
+#endif
+        return bytes;
+    }
+
+    private static string DecimalRangeMessage(string value, Decimal128Type decType) =>
+        $"Partition value '{value}' does not fit a decimal({decType.Precision},{decType.Scale}) column's "
+        + "128-bit storage.";
 
     private static string FormatTimestampPartitionValue(TimestampArray ts, int row)
     {

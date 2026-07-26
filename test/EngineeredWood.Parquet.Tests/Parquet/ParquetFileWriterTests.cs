@@ -136,6 +136,390 @@ public class ParquetFileWriterTests : IDisposable
         });
     }
 
+    // Int8/UInt8/Int16/UInt16 are all written as the 4-byte Int32 PHYSICAL type, but every downstream
+    // value extraction (dictionary encoder, PLAIN, the V2 encoders, statistics) reinterprets the Arrow
+    // value buffer AT THE PHYSICAL WIDTH — so a 1-byte buffer read as int packs four rows into one value,
+    // which the buffer's 64-byte padding hides instead of faulting. Pinned at the type boundaries, over
+    // both the dictionary and the plain path.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RoundTrip_NarrowIntegerColumns(bool dictionaryEnabled)
+    {
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            DictionaryEnabled = dictionaryEnabled,
+        };
+
+        async Task Check<TArray, T>(string name, IArrowType type, T?[] expected, IArrowArray array)
+            where TArray : IArrowArray, IReadOnlyList<T?>
+            where T : struct
+        {
+            await WriteAndVerify(
+                TempPath($"{name}_{dictionaryEnabled}.parquet"),
+                MakeBatch(new Field("v", type, nullable: true), array),
+                readBatch =>
+                {
+                    var col = Assert.IsType<TArray>(readBatch.Column(0));
+                    Assert.Equal(expected, col);
+                },
+                options);
+        }
+
+        var int8 = new sbyte?[] { 1, -2, sbyte.MinValue, sbyte.MaxValue, null, 0 };
+        var int8Builder = new Int8Array.Builder();
+        foreach (var v in int8) { if (v is null) int8Builder.AppendNull(); else int8Builder.Append(v.Value); }
+        await Check<Int8Array, sbyte>("int8", Int8Type.Default, int8, int8Builder.Build());
+
+        var uint8 = new byte?[] { 1, 200, byte.MaxValue, null, 0 };
+        var uint8Builder = new UInt8Array.Builder();
+        foreach (var v in uint8) { if (v is null) uint8Builder.AppendNull(); else uint8Builder.Append(v.Value); }
+        await Check<UInt8Array, byte>("uint8", UInt8Type.Default, uint8, uint8Builder.Build());
+
+        var int16 = new short?[] { 1, -2, short.MinValue, short.MaxValue, null, 0 };
+        var int16Builder = new Int16Array.Builder();
+        foreach (var v in int16) { if (v is null) int16Builder.AppendNull(); else int16Builder.Append(v.Value); }
+        await Check<Int16Array, short>("int16", Int16Type.Default, int16, int16Builder.Build());
+
+        var uint16 = new ushort?[] { 1, 40000, ushort.MaxValue, null, 0 };
+        var uint16Builder = new UInt16Array.Builder();
+        foreach (var v in uint16) { if (v is null) uint16Builder.AppendNull(); else uint16Builder.Append(v.Value); }
+        await Check<UInt16Array, ushort>("uint16", UInt16Type.Default, uint16, uint16Builder.Build());
+    }
+
+    // A required (no def levels) narrow column takes the direct buffer-copy path rather than the
+    // per-row extraction — the same width assumption, a different branch.
+    [Fact]
+    public async Task RoundTrip_NarrowIntegerColumn_Required()
+    {
+        string path = TempPath("int8_required.parquet");
+        var values = new sbyte[] { 1, 2, 3, 4, 5, sbyte.MinValue, sbyte.MaxValue };
+        var batch = MakeBatch(
+            new Field("v", Int8Type.Default, nullable: false),
+            new Int8Array.Builder().AppendRange(values).Build());
+
+        await WriteAndVerify(path, batch, readBatch =>
+        {
+            var col = Assert.IsType<Int8Array>(readBatch.Column(0));
+            Assert.Equal(values.Length, col.Length);
+            for (int i = 0; i < values.Length; i++)
+                Assert.Equal(values[i], col.GetValue(i));
+        });
+    }
+
+    // A SLICED array — Arrow's zero-copy view onto a sub-range (Data.Offset != 0), which is the idiomatic way
+    // to take part of a column. Every encoder here indexes the raw value buffer from slot 0, so an
+    // unnormalized view writes rows 0..len where the caller meant N..N+len. Nothing raises: the def levels
+    // come from the offset-aware IsNull, so a nullable column comes back with its nulls in the RIGHT places
+    // and its values from the WRONG rows. Pinned per type, since each takes a different encoder.
+    [Fact]
+    public async Task RoundTrip_SlicedColumns_WriteTheSlicedRows()
+    {
+        var options = new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed };
+
+        async Task Check(string name, Field field, IArrowArray sliced, Action<IArrowArray> verify)
+        {
+            Assert.NotEqual(0, sliced.Data.Offset); // the test is meaningless if the slice was materialized
+            await WriteAndVerify(
+                TempPath($"sliced_{name}.parquet"),
+                MakeBatch(field, sliced),
+                readBatch => verify(readBatch.Column(0)),
+                options);
+        }
+
+        // Fixed-width, required.
+        var i32 = new Int32Array.Builder()
+            .AppendRange(Enumerable.Range(0, 10).Select(i => i * 100)).Build();
+        await Check("int32", new Field("v", Int32Type.Default, false), i32.Slice(3, 4), col =>
+        {
+            var a = Assert.IsType<Int32Array>(col);
+            Assert.Equal([300, 400, 500, 600], Enumerable.Range(0, a.Length).Select(i => a.GetValue(i)!.Value));
+        });
+
+        // Fixed-width, NULLABLE — validity is offset-aware while the values were not, so this is the case
+        // that produced a plausible-looking batch with the wrong values under the right nulls.
+        var nb = new Int32Array.Builder();
+        for (int i = 0; i < 10; i++) { if (i % 3 == 0) nb.AppendNull(); else nb.Append(i * 100); }
+        await Check("int32_null", new Field("v", Int32Type.Default, true), nb.Build().Slice(3, 4), col =>
+        {
+            var a = Assert.IsType<Int32Array>(col);
+            Assert.Equal([null, 400, 500, null],
+                Enumerable.Range(0, a.Length).Select(i => a.IsNull(i) ? (int?)null : a.GetValue(i)!.Value));
+        });
+
+        // Byte array — the offsets buffer is the indirection.
+        var sb = new StringArray.Builder();
+        foreach (var s in new[] { "a0", "b1", "c2", "d3", "e4", "f5", "g6", "h7" }) sb.Append(s);
+        await Check("string", new Field("v", StringType.Default, false), sb.Build().Slice(3, 4), col =>
+        {
+            var a = Assert.IsType<StringArray>(col);
+            Assert.Equal(["d3", "e4", "f5", "g6"], Enumerable.Range(0, a.Length).Select(i => a.GetString(i)));
+        });
+
+        // Bit-packed, where the offset is a BIT offset. This path was already correct (it reads through
+        // GetValue rather than the raw buffer); it is here so a future rewrite cannot regress it silently.
+        var bb = new BooleanArray.Builder();
+        for (int i = 0; i < 12; i++) bb.Append(i % 2 == 0);
+        await Check("bool", new Field("v", BooleanType.Default, false), bb.Build().Slice(3, 4), col =>
+        {
+            var a = Assert.IsType<BooleanArray>(col);
+            Assert.Equal([false, true, false, true],
+                Enumerable.Range(0, a.Length).Select(i => a.GetValue(i)!.Value));
+        });
+
+        // 8-byte width, to show this is not specific to the 4-byte physical type.
+        var i64 = new Int64Array.Builder()
+            .AppendRange(Enumerable.Range(0, 10).Select(i => (long)i * 1000)).Build();
+        await Check("int64", new Field("v", Int64Type.Default, false), i64.Slice(3, 4), col =>
+        {
+            var a = Assert.IsType<Int64Array>(col);
+            Assert.Equal([3000L, 4000L, 5000L, 6000L],
+                Enumerable.Range(0, a.Length).Select(i => a.GetValue(i)!.Value));
+        });
+    }
+
+    // A sliced NESTED column decomposes through a different path (NestedLevelWriter), and was wrong in the
+    // same way — struct children are not sliced with their parent, so the parent's offset is what selects
+    // the child's rows.
+    [Fact]
+    public async Task RoundTrip_SlicedStructColumn_WritesTheSlicedRows()
+    {
+        var inner = new Int32Array.Builder()
+            .AppendRange(Enumerable.Range(0, 10).Select(i => i * 100)).Build();
+        var structType = new Apache.Arrow.Types.StructType([new Field("n", Int32Type.Default, false)]);
+        var full = new StructArray(structType, 10, [inner], ArrowBuffer.Empty, nullCount: 0);
+        var sliced = (StructArray)((Apache.Arrow.Array)full).Slice(3, 4);
+        Assert.NotEqual(0, sliced.Data.Offset);
+
+        await WriteAndVerify(
+            TempPath("sliced_struct.parquet"),
+            MakeBatch(new Field("s", structType, false), sliced),
+            readBatch =>
+            {
+                var st = Assert.IsType<StructArray>(readBatch.Column(0));
+                var n = Assert.IsType<Int32Array>(st.Fields[0]);
+                Assert.Equal([300, 400, 500, 600],
+                    Enumerable.Range(0, n.Length).Select(i => n.GetValue(i)!.Value));
+            },
+            new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed });
+    }
+
+    // Auto-split slices the batch per row group, and a STRUCT has no flat value buffer for the slice copy to
+    // work from — its children are separate arrays that are not sliced with the parent. That used to refuse
+    // the write outright ("Auto-split does not support column type struct"), so ANY batch with a nested
+    // column above RowGroupMaxRows failed. Each row group must now carry its own rows, in order.
+    [Fact]
+    public async Task RoundTrip_NestedColumn_AutoSplitAcrossRowGroups()
+    {
+        const int rows = 10;
+        var inner = new Int32Array.Builder()
+            .AppendRange(Enumerable.Range(0, rows).Select(i => i * 100)).Build();
+        var structType = new Apache.Arrow.Types.StructType([new Field("n", Int32Type.Default, false)]);
+        var st = new StructArray(structType, rows, [inner], ArrowBuffer.Empty, nullCount: 0);
+
+        string path = TempPath("nested_autosplit.parquet");
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("s", structType, false)).Build();
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            RowGroupMaxRows = 4, // forces 4 + 4 + 2
+        };
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(new RecordBatch(schema, [st], rows));
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        Assert.Equal(3, metadata.RowGroups.Count);
+        Assert.Equal(rows, metadata.NumRows);
+
+        // Read every group back in order — the values must be the original sequence, not group 0 repeated.
+        var seen = new List<int>();
+        for (int g = 0; g < metadata.RowGroups.Count; g++)
+        {
+            var batch = await reader.ReadRowGroupAsync(g);
+            var s = Assert.IsType<StructArray>(batch.Column(0));
+            var n = Assert.IsType<Int32Array>(s.Fields[0]);
+            for (int i = 0; i < batch.Length; i++)
+                seen.Add(n.GetValue(i)!.Value);
+        }
+
+        Assert.Equal(Enumerable.Range(0, rows).Select(i => i * 100), seen);
+    }
+
+    /// <summary>Rows 0..n of a list column as flat int arrays, for comparing what came back.</summary>
+    private static int[][] ListRows(ListArray list) =>
+        Enumerable.Range(0, list.Length)
+            .Select(i =>
+            {
+                var slice = (Int32Array)list.GetSlicedValues(i)!;
+                return Enumerable.Range(0, slice.Length).Select(j => slice.GetValue(j)!.Value).ToArray();
+            })
+            .ToArray();
+
+    private static ListArray BuildListColumn(int rows, ListType type)
+    {
+        // Row i is [i*10, i*10+1, ... ] of length (i % 3) + 1, so lengths vary and the offsets buffer is the
+        // only thing that says where a row's values start.
+        var values = new Int32Array.Builder();
+        var offsets = new int[rows + 1];
+        int total = 0;
+        for (int i = 0; i < rows; i++)
+        {
+            offsets[i] = total;
+            int len = (i % 3) + 1;
+            for (int k = 0; k < len; k++) values.Append(i * 10 + k);
+            total += len;
+        }
+        offsets[rows] = total;
+
+        var offsetBytes = new byte[offsets.Length * 4];
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(offsets.AsSpan()).CopyTo(offsetBytes);
+        return new ListArray(
+            type, rows, new ArrowBuffer(offsetBytes), values.Build(), ArrowBuffer.Empty, nullCount: 0);
+    }
+
+    private static MapArray BuildMapColumn(int rows, MapType type)
+    {
+        // Row i is {"k<i>": i * 100} — one entry each, so a mis-slotted gather shows up as the wrong key.
+        var keys = new StringArray.Builder();
+        var vals = new Int32Array.Builder();
+        var offsets = new int[rows + 1];
+        for (int i = 0; i < rows; i++)
+        {
+            offsets[i] = i;
+            keys.Append($"k{i}");
+            vals.Append(i * 100);
+        }
+        offsets[rows] = rows;
+
+        var offsetBytes = new byte[offsets.Length * 4];
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(offsets.AsSpan()).CopyTo(offsetBytes);
+
+        var entries = new StructArray(
+            type.KeyValueType, rows, [keys.Build(), vals.Build()], ArrowBuffer.Empty, nullCount: 0);
+        return new MapArray(
+            type, rows, new ArrowBuffer(offsetBytes), entries, ArrowBuffer.Empty, nullCount: 0);
+    }
+
+    // A sliced LIST or MAP column used to be the one shape CompactSlicedColumns could not normalize —
+    // ArrowCompute.Take had no arm for it, so the write refused outright. A list reaches its child through
+    // its offsets buffer rather than by being sliced with its parent, so the parent's offset is what picks
+    // which offset PAIR a row uses; ignoring it writes rows 0..len where the caller meant N..N+len.
+    [Fact]
+    public async Task RoundTrip_SlicedListAndMapColumns_WriteTheSlicedRows()
+    {
+        var options = new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed };
+
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: false));
+        var slicedList = (ListArray)((Apache.Arrow.Array)BuildListColumn(10, listType)).Slice(3, 4);
+        Assert.NotEqual(0, slicedList.Data.Offset); // meaningless if the slice was materialized
+
+        await WriteAndVerify(
+            TempPath("sliced_list.parquet"),
+            MakeBatch(new Field("numbers", listType, nullable: false), slicedList),
+            readBatch =>
+            {
+                var list = Assert.IsType<ListArray>(readBatch.Column(0));
+                Assert.Equal(4, list.Length);
+                // Rows 3..6, whose lengths are 1, 2, 3, 1 — not rows 0..3.
+                Assert.Equal(
+                    [[30], [40, 41], [50, 51, 52], [60]],
+                    ListRows(list));
+            },
+            options);
+
+        var mapType = new MapType(
+            new Field("key", StringType.Default, nullable: false),
+            new Field("value", Int32Type.Default, nullable: true));
+        var slicedMap = (MapArray)((Apache.Arrow.Array)BuildMapColumn(10, mapType)).Slice(3, 4);
+        Assert.NotEqual(0, slicedMap.Data.Offset);
+
+        await WriteAndVerify(
+            TempPath("sliced_map.parquet"),
+            MakeBatch(new Field("m", mapType, nullable: false), slicedMap),
+            readBatch =>
+            {
+                var map = Assert.IsType<MapArray>(readBatch.Column(0));
+                Assert.Equal(4, map.Length);
+
+                var keys = Assert.IsType<StringArray>(map.Keys);
+                var vals = Assert.IsType<Int32Array>(map.Values);
+                Assert.Equal(
+                    ["k3", "k4", "k5", "k6"],
+                    Enumerable.Range(0, keys.Length).Select(i => keys.GetString(i)));
+                Assert.Equal(
+                    [300, 400, 500, 600],
+                    Enumerable.Range(0, vals.Length).Select(i => vals.GetValue(i)!.Value));
+            },
+            options);
+    }
+
+    // The other half of the same gap: auto-split slices the batch per row group, and a LIST or MAP column
+    // used to hit CopyArray's refusal ("Auto-split does not support column type list"), so ANY batch with a
+    // list or map column above RowGroupMaxRows could not be written at all. Each row group must now carry
+    // its own rows, in order.
+    [Fact]
+    public async Task RoundTrip_ListAndMapColumns_AutoSplitAcrossRowGroups()
+    {
+        const int rows = 10;
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: false));
+        var mapType = new MapType(
+            new Field("key", StringType.Default, nullable: false),
+            new Field("value", Int32Type.Default, nullable: true));
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("numbers", listType, nullable: false))
+            .Field(new Field("m", mapType, nullable: false))
+            .Build();
+
+        string path = TempPath("list_map_autosplit.parquet");
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            RowGroupMaxRows = 4, // forces 4 + 4 + 2
+        };
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(new RecordBatch(
+                schema, [BuildListColumn(rows, listType), BuildMapColumn(rows, mapType)], rows));
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        Assert.Equal(3, metadata.RowGroups.Count);
+        Assert.Equal(rows, metadata.NumRows);
+
+        // Read every group back in order — the rows must be the original sequence, not group 0 repeated.
+        var seenLists = new List<int[]>();
+        var seenKeys = new List<string>();
+        for (int g = 0; g < metadata.RowGroups.Count; g++)
+        {
+            var batch = await reader.ReadRowGroupAsync(g);
+            seenLists.AddRange(ListRows(Assert.IsType<ListArray>(batch.Column(0))));
+
+            var map = Assert.IsType<MapArray>(batch.Column(1));
+            var keys = Assert.IsType<StringArray>(map.Keys);
+            for (int i = 0; i < keys.Length; i++)
+                seenKeys.Add(keys.GetString(i));
+        }
+
+        var expectedLists = ListRows(BuildListColumn(rows, listType));
+        Assert.Equal(expectedLists, seenLists);
+        Assert.Equal(Enumerable.Range(0, rows).Select(i => $"k{i}"), seenKeys);
+    }
+
     [Fact]
     public async Task RoundTrip_Int64Column()
     {
@@ -1138,6 +1522,32 @@ public class ParquetFileWriterTests : IDisposable
             Assert.Equal(2L, stats.NullCount);
             Assert.Equal(BitConverter.GetBytes(3), stats.MinValue);
             Assert.Equal(BitConverter.GetBytes(10), stats.MaxValue);
+        });
+    }
+
+    // Statistics read the same value buffer at the physical width, so a narrow column's min/max is
+    // corrupt in exactly the way the values are — and a wrong min/max prunes real rows away at read.
+    [Fact]
+    public async Task Statistics_Int8_MinMaxAtPhysicalWidth()
+    {
+        string path = TempPath("stats_int8.parquet");
+        var builder = new Int8Array.Builder();
+        builder.Append((sbyte)7);
+        builder.AppendNull();
+        builder.Append((sbyte)-3);
+        builder.Append((sbyte)9);
+
+        var batch = MakeBatch(
+            new Field("x", Int8Type.Default, nullable: true),
+            builder.Build());
+
+        await WriteAndVerifyStats(path, batch, stats =>
+        {
+            Assert.NotNull(stats);
+            Assert.Equal(1L, stats.NullCount);
+            // Int32 physical type → the bound is the 4-byte encoding of the logical value.
+            Assert.Equal(BitConverter.GetBytes(-3), stats.MinValue);
+            Assert.Equal(BitConverter.GetBytes(9), stats.MaxValue);
         });
     }
 

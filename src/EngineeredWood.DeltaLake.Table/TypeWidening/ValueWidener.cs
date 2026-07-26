@@ -5,6 +5,7 @@ using System.Buffers.Binary;
 using System.Numerics;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Schema;
 
 namespace EngineeredWood.DeltaLake.Table.TypeWidening;
@@ -16,17 +17,21 @@ namespace EngineeredWood.DeltaLake.Table.TypeWidening;
 internal static class ValueWidener
 {
     /// <summary>
-    /// Widens a RecordBatch to match the target schema.
-    /// Columns whose types differ are converted; matching columns are passed through.
+    /// Widens a RecordBatch's values to the target schema's types, matching columns BY NAME. Columns whose
+    /// types differ are converted; every other column passes through untouched, keeping its own field.
+    ///
+    /// <para>This only WIDENS. Reconciling the batch's column SET to the current schema — backfilling a column
+    /// ADDed after the file was written, dropping one DROPped since — belongs to
+    /// <see cref="SchemaEvolution.BackfillMissingColumns"/>, which every caller runs afterwards.</para>
     /// </summary>
     public static RecordBatch WidenBatch(
         RecordBatch batch, Apache.Arrow.Schema targetSchema)
     {
-        // Match target fields BY NAME, never by position: a schema-EVOLVED file's column set differs from
-        // the current schema (a column ADDed after the file was written is absent; a DROPped one is still
-        // present), so positional pairing relabels one column's data as another's — silent corruption.
-        // Columns without a same-named target field pass through unchanged (schema-evolution reconcile
-        // downstream adds/drops columns); this method only WIDENS values.
+        // BY NAME, never by position: a schema-EVOLVED file's column set differs from the current schema (a
+        // column ADDed after the file was written is absent from it, a DROPped one is still present), so
+        // pairing the two positionally lines one column's data up against another column's type — which
+        // either throws deep in an encoder or, when the types happen to be compatible, silently writes the
+        // values under the wrong name.
         var targetByName = new Dictionary<string, IArrowType>(StringComparer.Ordinal);
         foreach (var f in targetSchema.FieldsList)
             targetByName[f.Name] = f.DataType;
@@ -50,27 +55,28 @@ internal static class ValueWidener
         for (int i = 0; i < batch.ColumnCount; i++)
         {
             var f = batch.Schema.FieldsList[i];
+            var source = batch.Column(i);
+
             if (targetByName.TryGetValue(f.Name, out var targetType)
                 && !TypesMatch(f.DataType, targetType))
             {
-                var widened = WidenArray(batch.Column(i), targetType);
+                var widened = WidenArray(source, targetType);
                 columns[i] = widened;
-                // Relabel with the target type ONLY when the array was actually converted: WidenArray
-                // passes an unsupported pair through unchanged (e.g. a host-transport variant blob vs
-                // the canonical extension type), and labeling untouched data with the target type lies
-                // about its representation — a downstream schema export then mis-describes the column.
-                fields.Add(ReferenceEquals(widened, batch.Column(i))
+                // Take the target's TYPE only when the array was actually converted: WidenArray returns the
+                // source unchanged for a pair it does not support, and relabeling untouched data with a type
+                // it does not have is the same lie the positional pairing told. The name is the batch's own.
+                fields.Add(ReferenceEquals(widened, source)
                     ? f
                     : new Field(f.Name, targetType, f.IsNullable, f.Metadata));
             }
             else
             {
-                columns[i] = batch.Column(i);
+                columns[i] = source;
                 fields.Add(f);
             }
         }
 
-        return new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
+        return new RecordBatch(new Apache.Arrow.Schema(fields, null), columns, batch.Length);
     }
 
     /// <summary>
@@ -78,27 +84,30 @@ internal static class ValueWidener
     /// </summary>
     public static IArrowArray WidenArray(IArrowArray source, IArrowType targetType)
     {
+        // The arms below are the POLICY — which widenings Delta permits — while ArrowCompute.Widen is the
+        // mechanism. They stay enumerated pair by pair rather than collapsed into coarser patterns, because a
+        // coarser pattern would also match narrowings (Int32Array to Int16Type) and claim they were legal.
         return (source, targetType) switch
         {
             // Integer widening: byte → short → int → long
-            (Int8Array a, Int16Type) => WidenInt8ToInt16(a),
-            (Int8Array a, Int32Type) => WidenInt8ToInt32(a),
-            (Int8Array a, Int64Type) => WidenInt8ToInt64(a),
-            (Int16Array a, Int32Type) => WidenInt16ToInt32(a),
-            (Int16Array a, Int64Type) => WidenInt16ToInt64(a),
-            (Int32Array a, Int64Type) => WidenInt32ToInt64(a),
+            (Int8Array, Int16Type) => ArrowCompute.Widen(source, targetType),
+            (Int8Array, Int32Type) => ArrowCompute.Widen(source, targetType),
+            (Int8Array, Int64Type) => ArrowCompute.Widen(source, targetType),
+            (Int16Array, Int32Type) => ArrowCompute.Widen(source, targetType),
+            (Int16Array, Int64Type) => ArrowCompute.Widen(source, targetType),
+            (Int32Array, Int64Type) => ArrowCompute.Widen(source, targetType),
 
             // Float → Double
-            (FloatArray a, DoubleType) => WidenFloatToDouble(a),
+            (FloatArray, DoubleType) => ArrowCompute.Widen(source, targetType),
 
             // Integer → Double
-            (Int8Array a, DoubleType) => WidenInt8ToDouble(a),
-            (Int16Array a, DoubleType) => WidenInt16ToDouble(a),
-            (Int32Array a, DoubleType) => WidenInt32ToDouble(a),
+            (Int8Array, DoubleType) => ArrowCompute.Widen(source, targetType),
+            (Int16Array, DoubleType) => ArrowCompute.Widen(source, targetType),
+            (Int32Array, DoubleType) => ArrowCompute.Widen(source, targetType),
 
             // Date → Timestamp_ntz
-            (Date32Array a, TimestampType ts) when ts.Timezone is null =>
-                WidenDate32ToTimestamp(a, ts),
+            (Date32Array, TimestampType ts) when ts.Timezone is null =>
+                ArrowCompute.Widen(source, targetType),
 
             // Decimal widening (precision and/or scale change)
             (Decimal128Array a, Decimal128Type dt) => WidenDecimal128(a, dt),
@@ -112,146 +121,6 @@ internal static class ValueWidener
             _ => source, // No widening needed or unsupported
         };
     }
-
-    #region Integer Widening
-
-    private static Int16Array WidenInt8ToInt16(Int8Array source)
-    {
-        var b = new Int16Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static Int32Array WidenInt8ToInt32(Int8Array source)
-    {
-        var b = new Int32Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static Int64Array WidenInt8ToInt64(Int8Array source)
-    {
-        var b = new Int64Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static Int32Array WidenInt16ToInt32(Int16Array source)
-    {
-        var b = new Int32Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static Int64Array WidenInt16ToInt64(Int16Array source)
-    {
-        var b = new Int64Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static Int64Array WidenInt32ToInt64(Int32Array source)
-    {
-        var b = new Int64Array.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    #endregion
-
-    #region Float Widening
-
-    private static DoubleArray WidenFloatToDouble(FloatArray source)
-    {
-        var b = new DoubleArray.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static DoubleArray WidenInt8ToDouble(Int8Array source)
-    {
-        var b = new DoubleArray.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static DoubleArray WidenInt16ToDouble(Int16Array source)
-    {
-        var b = new DoubleArray.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    private static DoubleArray WidenInt32ToDouble(Int32Array source)
-    {
-        var b = new DoubleArray.Builder();
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i)) b.AppendNull();
-            else b.Append(source.GetValue(i)!.Value);
-        }
-        return b.Build();
-    }
-
-    #endregion
-
-    #region Date → Timestamp Widening
-
-    private static TimestampArray WidenDate32ToTimestamp(Date32Array source, TimestampType tsType)
-    {
-        var b = new TimestampArray.Builder(tsType);
-        var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i))
-                b.AppendNull();
-            else
-            {
-                int days = source.GetValue(i)!.Value;
-                b.Append(new DateTimeOffset(epoch.AddDays(days), TimeSpan.Zero));
-            }
-        }
-        return b.Build();
-    }
-
-    #endregion
 
     #region Decimal Widening
 
@@ -431,44 +300,6 @@ internal static class ValueWidener
             _ => true,
         };
     }
-
-    private static IArrowArray BuildNullArray(IArrowType type, int length)
-    {
-        return type switch
-        {
-            Int64Type => BuildNullInt64(length),
-            Int32Type => BuildNullInt32(length),
-            Int16Type => BuildNullInt16(length),
-            Int8Type => BuildNullInt8(length),
-            DoubleType => BuildNullDouble(length),
-            FloatType => BuildNullFloat(length),
-            BooleanType => BuildNullBoolean(length),
-            // An extension column (VARIANT) must keep its type: the string fallback below would put a
-            // StringArray into a batch declaring the extension type — a silent schema/array mismatch
-            // rather than a failure. Delegate to the schema-evolution builder, which handles the
-            // storage type and re-wraps.
-            ExtensionType ext => ext.CreateArray(
-                SchemaEvolution.MakeNullArrayPublic(ext.StorageType, length)),
-            _ => BuildNullString(length),
-        };
-    }
-
-    private static Int64Array BuildNullInt64(int length)
-    { var b = new Int64Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static Int32Array BuildNullInt32(int length)
-    { var b = new Int32Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static Int16Array BuildNullInt16(int length)
-    { var b = new Int16Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static Int8Array BuildNullInt8(int length)
-    { var b = new Int8Array.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static DoubleArray BuildNullDouble(int length)
-    { var b = new DoubleArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static FloatArray BuildNullFloat(int length)
-    { var b = new FloatArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static BooleanArray BuildNullBoolean(int length)
-    { var b = new BooleanArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
-    private static StringArray BuildNullString(int length)
-    { var b = new StringArray.Builder(); for (int i = 0; i < length; i++) b.AppendNull(); return b.Build(); }
 
     #endregion
 }
