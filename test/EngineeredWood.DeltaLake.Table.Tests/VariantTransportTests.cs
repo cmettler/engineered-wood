@@ -187,7 +187,15 @@ public class VariantTransportTests : IDisposable
         // form) — assert the VALUE half byte-exactly, splitting each blob at its self-delimiting
         // metadata length; the SQL NULL survives as a null row.
         Assert.Equal(3, values.Count);
-        byte[] ValueHalf(byte[] blob) => blob[VariantTransport.MetadataLength(blob)..];
+        // Array.Copy rather than a `blob[start..]` range indexer: the range form lowers to
+        // RuntimeHelpers.GetSubArray, which net472 does not have (CS0656) — and this project targets it.
+        static byte[] ValueHalf(byte[] blob)
+        {
+            int start = VariantTransport.MetadataLength(blob);
+            var value = new byte[blob.Length - start];
+            System.Array.Copy(blob, start, value, 0, value.Length);   // System.: `Array` is Apache.Arrow.Array here
+            return value;
+        }
         Assert.Equal(Int8(1), ValueHalf(values[0]!));
         Assert.Null(values[1]);
         Assert.Equal(Int8(2), ValueHalf(values[2]!));
