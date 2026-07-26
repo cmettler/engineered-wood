@@ -3452,6 +3452,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? repartitionTo,
         CancellationToken cancellationToken)
     {
+        // Nanosecond and second Arrow timestamps have no faithful Delta/Parquet encoding. Creation and
+        // schema evolution reject them via SchemaConverter, but a write into an EXISTING table converts no
+        // schema, so check the incoming batches here — the shared chokepoint for both the auto-committing
+        // path and a transaction's append.
+        foreach (var b in batches)
+            SchemaConverter.ThrowIfUnsupportedTimestampUnit(b.Schema);
+
         // Repartition-on-overwrite: changing partitionColumns is protocol-legal ONLY when every active file
         // is removed in the same commit — i.e. a FULL overwrite (a partition-scoped or dynamic overwrite
         // keeps files that would no longer conform to the new partition schema).
@@ -3980,6 +3987,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        // Same timestamp-unit rule as the committing write path; this entry point bypasses it.
+        foreach (var b in batches)
+            SchemaConverter.ThrowIfUnsupportedTimestampUnit(b.Schema);
         if (IsIcebergCompat)
             throw new NotSupportedException(
                 "WriteDataFilesAsync: IcebergCompat tables require the committing write path.");

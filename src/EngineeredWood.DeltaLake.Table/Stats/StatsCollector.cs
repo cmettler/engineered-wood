@@ -203,7 +203,7 @@ internal static class StatsCollector
             }
             if (value is string str && str.Length > StringStatMaxLength)
             {
-                value = isMax ? (object?)TruncateMaxString(str) : str.Substring(0, StringStatMaxLength);
+                value = isMax ? (object?)TruncateMaxString(str) : TruncateMinString(str);
             }
             if (value is not null)
             {
@@ -237,6 +237,22 @@ internal static class StatsCollector
     private const int StringStatMaxLength = 32;
 
     /// <summary>
+    /// Truncates a min-side string stat to a lower bound of at most <see cref="StringStatMaxLength"/>
+    /// characters. A prefix always sorts at or below the full string, so the only requirement is that
+    /// the cut land on a code point boundary: splitting a surrogate pair orphans its high half, and
+    /// <see cref="Utf8JsonWriter"/> silently rewrites a lone surrogate to U+FFFD — which sorts ABOVE
+    /// the supplementary character it replaced, turning the bound into one GREATER than a value in the
+    /// file. Backing off by one char keeps a valid (merely looser) lower bound.
+    /// </summary>
+    private static string TruncateMinString(string value)
+    {
+        int length = StringStatMaxLength;
+        if (char.IsHighSurrogate(value[length - 1]))
+            length--;
+        return value.Substring(0, length);
+    }
+
+    /// <summary>
     /// Truncates a max-side string stat to an upper bound of at most <see cref="StringStatMaxLength"/>
     /// characters: the prefix with its last incrementable char bumped by one (skipping chars whose
     /// increment would create a lone surrogate). Returns null when no char can be incremented — the
@@ -248,6 +264,13 @@ internal static class StatsCollector
         {
             char c = value[i];
             if (c == char.MaxValue)
+                continue;
+            // Replacing a LOW surrogate orphans the high half that precedes it. The increment guard
+            // below does not catch this: U+DFFF + 1 is U+E000, which is outside the surrogate range,
+            // so the cut would look legal while leaving invalid UTF-16 behind. The JSON writer then
+            // rewrites the orphan to U+FFFD, which sorts BELOW the supplementary character it
+            // replaced — no longer an upper bound. Step back to the char before the pair instead.
+            if (char.IsLowSurrogate(c))
                 continue;
             char next = (char)(c + 1);
             if (next is >= '\ud800' and <= '\udfff')
@@ -463,21 +486,29 @@ internal static class StatsCollector
         if (min.HasValue)
         {
             var tsType = (Apache.Arrow.Types.TimestampType)array.Data.DataType;
-            string minStr = FormatTimestamp(min.Value, tsType);
-            string maxStr = FormatTimestamp(max!.Value, tsType);
+            string minStr = FormatTimestamp(min.Value, tsType, isMax: false);
+            string maxStr = FormatTimestamp(max!.Value, tsType, isMax: true);
             MergeStringMinMax(name, minStr, maxStr, minValues, maxValues);
         }
     }
 
-    private static string FormatTimestamp(long value, Apache.Arrow.Types.TimestampType tsType)
+    private static string FormatTimestamp(
+        long value, Apache.Arrow.Types.TimestampType tsType, bool isMax)
     {
-        // Convert to microseconds
+        // Convert to microseconds. Second/millisecond sources scale up exactly, but a NANOSECOND
+        // source has precision the microsecond ISO-8601 form below cannot carry, so it must round
+        // OUTWARD — min down, max up — to stay a valid bound. Plain integer division truncates
+        // toward ZERO, which rounds the max down for positive timestamps and the min up for negative
+        // ones; either way the bound excludes a value actually present in the file, and the file is
+        // skipped for a predicate that matches it.
         long micros = tsType.Unit switch
         {
             Apache.Arrow.Types.TimeUnit.Second => value * 1_000_000,
             Apache.Arrow.Types.TimeUnit.Millisecond => value * 1_000,
             Apache.Arrow.Types.TimeUnit.Microsecond => value,
-            Apache.Arrow.Types.TimeUnit.Nanosecond => value / 1_000,
+            Apache.Arrow.Types.TimeUnit.Nanosecond => isMax
+                ? DivCeil(value, 1_000)
+                : DivFloor(value, 1_000),
             _ => value,
         };
 
@@ -488,6 +519,14 @@ internal static class StatsCollector
             ? dto.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'")
             : dto.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff");
     }
+
+    /// <summary>Integer division rounding toward negative infinity. <paramref name="divisor"/> must be positive.</summary>
+    private static long DivFloor(long value, long divisor) =>
+        value / divisor - (value % divisor < 0 ? 1 : 0);
+
+    /// <summary>Integer division rounding toward positive infinity. <paramref name="divisor"/> must be positive.</summary>
+    private static long DivCeil(long value, long divisor) =>
+        value / divisor + (value % divisor > 0 ? 1 : 0);
 
     private static void CollectDateMinMax(
         string name, Date32Array array,

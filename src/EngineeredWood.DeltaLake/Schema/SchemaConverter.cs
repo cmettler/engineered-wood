@@ -164,6 +164,69 @@ public static class SchemaConverter
         return result;
     }
 
+    /// <summary>
+    /// True for Arrow timestamp units that cannot be written to a Delta table as-is. Both failures are
+    /// silent rather than loud, which is why they are refused rather than converted.
+    /// </summary>
+    internal static bool IsUnsupportedTimestampUnit(Apache.Arrow.Types.TimeUnit unit) =>
+        unit is Apache.Arrow.Types.TimeUnit.Nanosecond or Apache.Arrow.Types.TimeUnit.Second;
+
+    internal static string UnsupportedTimestampUnitMessage(Apache.Arrow.Types.TimeUnit unit) => unit switch
+    {
+        Apache.Arrow.Types.TimeUnit.Nanosecond =>
+            "Delta timestamps are microsecond precision, so a nanosecond Arrow timestamp cannot be written "
+            + "without discarding its sub-microsecond digits. Cast the column to TimeUnit.Microsecond "
+            + "before writing, choosing for yourself how it should round.",
+
+        // Parquet's TimestampType has only MILLIS/MICROS/NANOS units, so a second-unit column has no
+        // faithful encoding: the writer annotates it MICROS and leaves the values untouched, and it reads
+        // back a MILLION times too small (1700000000s becomes 1970-01-01T00:28:20Z). Millisecond is fine —
+        // MILLIS exists, so those values survive exactly.
+        Apache.Arrow.Types.TimeUnit.Second =>
+            "Parquet timestamps have no second-precision unit, so a second-unit Arrow timestamp would be "
+            + "stored unchanged under a microsecond annotation and read back a million times too small. "
+            + "Cast the column to TimeUnit.Microsecond before writing.",
+
+        _ => $"Arrow timestamp unit {unit} cannot be written to a Delta table.",
+    };
+
+    /// <summary>
+    /// Throws if any field of <paramref name="schema"/>, at any nesting depth, is a nanosecond Arrow
+    /// timestamp. <see cref="FromArrowSchema"/> already rejects those when a schema is converted, which
+    /// covers table creation and schema evolution — but a write into an EXISTING table converts nothing,
+    /// so the same rule has to be enforced against the incoming batches directly. Without this a
+    /// nanosecond column reaches Parquet under a schema advertising microseconds.
+    /// </summary>
+    internal static void ThrowIfUnsupportedTimestampUnit(Apache.Arrow.Schema schema)
+    {
+        foreach (var field in schema.FieldsList)
+            ThrowIfUnsupportedTimestampUnit(field.DataType, field.Name);
+    }
+
+    private static void ThrowIfUnsupportedTimestampUnit(IArrowType type, string path)
+    {
+        switch (type)
+        {
+            case TimestampType ts when IsUnsupportedTimestampUnit(ts.Unit):
+                throw new DeltaLake.DeltaFormatException(
+                    $"Column '{path}': {UnsupportedTimestampUnitMessage(ts.Unit)}");
+
+            case ArrowStructType s:
+                foreach (var f in s.Fields)
+                    ThrowIfUnsupportedTimestampUnit(f.DataType, path + "." + f.Name);
+                break;
+
+            case ListType l:
+                ThrowIfUnsupportedTimestampUnit(l.ValueDataType, path + ".element");
+                break;
+
+            case ArrowMapType m:
+                ThrowIfUnsupportedTimestampUnit(m.KeyField.DataType, path + ".key");
+                ThrowIfUnsupportedTimestampUnit(m.ValueField.DataType, path + ".value");
+                break;
+        }
+    }
+
     private static DeltaDataType FromArrowType(IArrowType arrowType) => arrowType switch
     {
         // MUST precede the struct arm: VariantType is an ExtensionType (not a StructType), so it
@@ -191,6 +254,13 @@ public static class SchemaConverter
         BinaryType or LargeBinaryType or BinaryViewType or FixedSizeBinaryType =>
             new PrimitiveType { TypeName = "binary" },
         Date32Type or Date64Type => new PrimitiveType { TypeName = "date" },
+
+        // MUST precede the timestamp arms below. Nothing downstream narrows the Arrow unit, so a unit
+        // Delta or Parquet cannot represent would be written as-is under a microsecond annotation.
+        // Converting here instead would silently alter the caller's data, so require an explicit cast.
+        TimestampType ts when IsUnsupportedTimestampUnit(ts.Unit) =>
+            throw new DeltaLake.DeltaFormatException(UnsupportedTimestampUnitMessage(ts.Unit)),
+
         TimestampType ts when ts.Timezone is not null =>
             new PrimitiveType { TypeName = "timestamp" },
         TimestampType => new PrimitiveType { TypeName = "timestamp_ntz" },
