@@ -2620,12 +2620,76 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// concurrent commit adding a file that matches it is a conflict (concurrentAppend), precise to the
     /// isolation level. Returns the number of rows updated and the committed version.
     /// </summary>
-    public ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
+    public async ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
         Expressions.Predicate predicate,
         Func<RecordBatch, RecordBatch> updater,
         CancellationToken cancellationToken = default)
-        => UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
-            readPredicates: [predicate], cancellationToken);
+    {
+        ThrowIfDisposed();
+        // Symmetric with DeleteAsync: a predicate that addresses rows only PHYSICALLY lowers to a selection,
+        // and one that MENTIONS `_metadata` but cannot lower is REJECTED. Without this the mask below — which
+        // binds DATA columns only — would mis-evaluate it.
+        if (MetadataPredicate.TryLower(predicate, out var lowered))
+        {
+            long version = await UpdateBySelectionAsync(
+                    lowered, MatchedRowsUpdater(lowered, updater), cancellationToken)
+                .ConfigureAwait(false);
+            long rows = lowered.RowsByFile.Sum(kv => (long)kv.Value.Count);
+            return (rows, version);
+        }
+        MetadataPredicate.ThrowIfReferencesMetadata(predicate, "UPDATE");
+
+        return await UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
+            readPredicates: [predicate], cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Adapts the predicate surface's <c>Func&lt;RecordBatch, RecordBatch&gt;</c> updater — which receives only
+    /// the MATCHED rows — onto the selection primitive, which hands over whole source batches plus their
+    /// absolute positions. Matched rows are taken out, updated, and spliced back at their original slots.
+    /// </summary>
+    private static Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>>
+        MatchedRowsUpdater(FileRowSelection selection, Func<RecordBatch, RecordBatch> updater)
+        => (filePath, sourceBatches, positionsPerBatch) =>
+        {
+            var targets = selection.RowsByFile[filePath] as HashSet<long>
+                          ?? new HashSet<long>(selection.RowsByFile[filePath]);
+            var result = new List<RecordBatch>(sourceBatches.Count);
+            for (int b = 0; b < sourceBatches.Count; b++)
+            {
+                var src = sourceBatches[b];
+                var pos = positionsPerBatch[b];
+                var matchedRows = new List<int>();
+                for (int i = 0; i < src.Length; i++)
+                    if (!pos.IsNull(i) && targets.Contains(pos.GetValue(i)!.Value))
+                        matchedRows.Add(i);
+                if (matchedRows.Count == 0) { result.Add(src); continue; }
+
+                var matchColumns = new IArrowArray[src.ColumnCount];
+                for (int c = 0; c < src.ColumnCount; c++)
+                    matchColumns[c] = ArrowCompute.Take(src.Column(c), matchedRows);
+                var updated = updater(new RecordBatch(src.Schema, matchColumns, matchedRows.Count));
+                if (updated.Length != matchedRows.Count)
+                {
+                    throw new InvalidOperationException(
+                        "UpdateAsync: the updater must return one row per matched row.");
+                }
+
+                // take indices: i from the source half, a matched slot from the appended updated half
+                var take = BuildIdentity(src.Length);
+                for (int k = 0; k < matchedRows.Count; k++)
+                    take[matchedRows[k]] = src.Length + k;
+                var columns = new IArrowArray[src.ColumnCount];
+                for (int c = 0; c < src.ColumnCount; c++)
+                {
+                    var combined = ArrowArrayConcatenator.Concatenate(
+                        new[] { src.Column(c), updated.Column(c) });
+                    columns[c] = ArrowCompute.Take(combined, take);
+                }
+                result.Add(new RecordBatch(src.Schema, columns, src.Length));
+            }
+            return result;
+        };
 
     private async ValueTask<(long RowsUpdated, long Version)> UpdateCoreAsync(
         Func<RecordBatch, BooleanArray> predicate,
@@ -4940,6 +5004,164 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: true, cancellationToken,
             rowLevelDeletes: rowLevelRetry ? dvEdits : null).ConfigureAwait(false);
         return (totalDeleted, version);
+    }
+
+    /// <summary>
+    /// MERGE-ON-READ UPDATE of the rows named by a <see cref="FileRowSelection"/> — the UPDATE analogue of
+    /// <see cref="DeleteBySelectionViaVectorsAsync"/>, and the CHEAP shape. Instead of rewriting each affected
+    /// file, it deletion-vector-masks the old rows and APPENDS the new ones as a small post-image file, fusing
+    /// both into ONE commit. For a small update against a large file that is dramatically less IO than
+    /// copy-on-write, which must read and rewrite the whole file.
+    /// </summary>
+    /// <param name="selection">The rows to update, keyed by log <c>add.path</c> with ABSOLUTE in-file
+    /// positions. A path that is not active THROWS.</param>
+    /// <param name="updater">Receives the MATCHED rows of one file and returns them modified — the same
+    /// contract as <see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken)"/>:
+    /// identical schema, identical row count.</param>
+    /// <remarks>
+    /// <para>
+    /// Row tracking is PRESERVED: each moved row keeps its ORIGINAL stable id, materialised into the post-image
+    /// file, so <c>_metadata.row_id</c> is stable across the update (a copy-on-write rewrite has to re-derive
+    /// ids for every row of the file it touches). If any matched row's id cannot be derived — a source file
+    /// predating row tracking — materialisation is abandoned for the whole statement rather than risk baking a
+    /// WRONG id.
+    /// </para>
+    /// <para>
+    /// Change Data Feed is captured as the <c>update_preimage</c>/<c>update_postimage</c> pair, per partition.
+    /// Requires <c>delta.enableDeletionVectors</c>; IcebergCompat is not supported (it needs the committing
+    /// writer). Both are clean errors, never a silent fallback — the caller chooses copy-on-write explicitly via
+    /// <see cref="UpdateBySelectionAsync(FileRowSelection, Func{string, IReadOnlyList{RecordBatch}, IReadOnlyList{Int64Array}, IReadOnlyList{RecordBatch}}, CancellationToken)"/>.
+    /// </para>
+    /// <para>
+    /// First-committer-wins: a concurrent commit aborts with <see cref="DeltaConflictException"/> (the positions
+    /// were resolved against this snapshot), which the caller surfaces as retry-the-statement.
+    /// </para>
+    /// </remarks>
+    public async ValueTask<(long RowsUpdated, long Version)> UpdateBySelectionViaVectorsAsync(
+        FileRowSelection selection,
+        Func<RecordBatch, RecordBatch> updater,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+
+        var snapshot = CurrentSnapshot;
+        if (selection.RowsByFile.Count == 0)
+            return (0, snapshot.Version);
+
+        HonorWriterFeatures(snapshot, isAppend: false);
+        var cfg = snapshot.Metadata.Configuration;
+        if (!DeletionVectors.DeletionVectorConfig.IsEnabled(cfg))
+        {
+            throw new InvalidOperationException(
+                "UpdateBySelectionViaVectorsAsync requires deletion vectors — create the table with "
+                + "DeltaTable.CreateAsync(..., enableDeletionVectors: true), or use the copy-on-write "
+                + "UpdateBySelectionAsync.");
+        }
+        if (IsIcebergCompat)
+        {
+            throw new NotSupportedException(
+                "merge-on-read UPDATE is not supported on IcebergCompat tables — use the copy-on-write "
+                + "UpdateBySelectionAsync.");
+        }
+
+        bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(cfg);
+        var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(cfg);
+        bool materialize = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(cfg)
+                           && matRowIdName is not null && matRowVerName is not null;
+
+        var preImages = new List<RecordBatch>();
+        var postImages = new List<RecordBatch>();
+        var matIds = new List<long>();
+        long matched = 0;
+
+        foreach (var (addFile, targets) in
+                 ResolveSelection(selection, snapshot, "merge-on-read UPDATE"))
+        {
+            var srcIds = materialize ? new List<Int64Array?>() : null;
+            var srcVers = materialize ? new List<Int64Array?>() : null;
+            var absOut = new List<Int64Array?>();
+            int bi = -1;
+            await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
+                                                     srcIds, srcVers, absOut).ConfigureAwait(false))
+            {
+                bi++;
+                var absPos = bi < absOut.Count ? absOut[bi] : null;
+                var matchRows = new List<int>();
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
+                        ? absPos.GetValue(i)!.Value : i;
+                    if (targets.Contains(abs))
+                        matchRows.Add(i);
+                }
+                if (matchRows.Count == 0)
+                    continue;
+
+                // The matched rows as they stand: the pre-image, and the updater's input.
+                var preColumns = new IArrowArray[batch.ColumnCount];
+                for (int c = 0; c < batch.ColumnCount; c++)
+                    preColumns[c] = ArrowCompute.Take(batch.Column(c), matchRows);
+                var pre = new RecordBatch(batch.Schema, preColumns, matchRows.Count);
+
+                var post = updater(pre);
+                if (post.Length != matchRows.Count)
+                {
+                    throw new InvalidOperationException(
+                        "merge-on-read UPDATE: the updater must return one row per matched row.");
+                }
+
+                preImages.Add(pre);
+                postImages.Add(post);
+                matched += matchRows.Count;
+
+                // Each moved row keeps its ORIGINAL stable id. An underivable id disables materialisation
+                // for the WHOLE statement — a fresh id would silently change row identity.
+                if (materialize)
+                {
+                    var ids = bi < srcIds!.Count ? srcIds[bi] : null;
+                    foreach (int i in matchRows)
+                    {
+                        if (ids is null || i >= ids.Length || ids.IsNull(i)) { materialize = false; break; }
+                        matIds.Add(ids.GetValue(i)!.Value);
+                    }
+                }
+            }
+        }
+
+        if (matched == 0)
+            return (0, snapshot.Version);
+
+        // Mask the old rows (remove+add DV pairs — no rewrite) and append the post-images as new file(s).
+        var (dvActions, _) = await ComputeDeletionVectorActionsAsync(selection, cancellationToken)
+            .ConfigureAwait(false);
+        var files = await WriteDataFilesAsync(postImages, cancellationToken,
+                materializedRowIds: materialize && matIds.Count > 0 ? matIds : null)
+            .ConfigureAwait(false);
+
+        var extra = new List<DeltaAction>(dvActions);
+        if (cdfEnabled)
+        {
+            foreach (var pre in preImages)
+            {
+                extra.AddRange(await WriteChangeDataFilesAsync(
+                    pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage, cancellationToken)
+                    .ConfigureAwait(false));
+            }
+            foreach (var post in postImages)
+            {
+                extra.AddRange(await WriteChangeDataFilesAsync(
+                    post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage, cancellationToken)
+                    .ConfigureAwait(false));
+            }
+        }
+
+        long version = await CommitDataFilesAsync(files, DeltaWriteMode.Append,
+                cancellationToken: cancellationToken, extraActions: extra,
+                expectedVersion: snapshot.Version, operation: "UPDATE")
+            .ConfigureAwait(false);
+        return (matched, version);
     }
 
     /// <summary>

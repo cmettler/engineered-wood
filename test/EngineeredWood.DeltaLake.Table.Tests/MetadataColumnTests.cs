@@ -383,6 +383,180 @@ public class MetadataColumnTests : IDisposable
         Assert.False(invoked);
     }
 
+    /// <summary>
+    /// THE NATURAL USAGE, end to end and with no predicate anywhere: read with
+    /// <see cref="DeltaTable.ReadAllWithMetadataAsync"/>, KEEP the rows you want to change (carrying their
+    /// <c>_metadata</c> along), change a column, hand that batch back to
+    /// <c>UpdateBySelectionAsync</c>. This is the documented flow, so it is worth a test rather than prose.
+    /// </summary>
+    /// <remarks>
+    /// The one thing a caller must get right: hand back ONLY the rows being changed. Passing every row read
+    /// would make the selection the whole file — semantically valid, but it rewrites everything and bumps every
+    /// row's commit version. Filtering first is what keeps the update minimal.
+    /// </remarks>
+    [Fact]
+    public async Task RoundTrip_ReadFilterModifyWriteBack_NeedsNoPredicate()
+    {
+        await using (var table = await CreateTrackedAsync())
+        {
+            var updateBatches = new List<RecordBatch>();
+            await foreach (var batch in table.ReadAllWithMetadataAsync())
+            {
+                var ids = (Int64Array)batch.Column("id");
+                // keep only the rows we intend to change (ids 2 and 22)
+                var keep = new List<int>();
+                for (int i = 0; i < batch.Length; i++)
+                    if (ids.GetValue(i) is 2 or 22)
+                        keep.Add(i);
+                if (keep.Count == 0)
+                    continue;
+
+                // carry _metadata through untouched; rewrite the value column
+                var meta = EngineeredWood.Arrow.ArrowCompute.Take(batch.Column(DeltaTable.MetadataColumnName), keep);
+                var newIds = new Int64Array.Builder();
+                foreach (int i in keep)
+                    newIds.Append(ids.GetValue(i)!.Value * 10);
+
+                updateBatches.Add(new RecordBatch(
+                    new Apache.Arrow.Schema.Builder()
+                        .Field(batch.Schema.GetFieldByName(DeltaTable.MetadataColumnName)!)
+                        .Field(new Field("id", Int64Type.Default, false))
+                        .Build(),
+                    new IArrowArray[] { meta, newIds.Build() }, keep.Count));
+            }
+
+            // one call per batch of changes; each addresses exactly its own rows
+            foreach (var upd in updateBatches)
+                await table.UpdateBySelectionAsync(upd);
+        }
+
+        await using var check = await OpenAsync();
+        var after = (await ReadMetaAsync(check)).Select(r => r.Id).OrderBy(x => x).ToArray();
+        Assert.Equal(new long[] { 1, 3, 11, 12, 13, 20, 21, 23, 220 }, after);
+    }
+
+    // ── merge-on-read UPDATE (UpdateBySelectionViaVectorsAsync) ───────────────────────────────────────────
+    //
+    // The cheap UPDATE shape: mask the old rows with a deletion vector and APPEND the new ones, instead of
+    // rewriting the whole file. The two tests that justify it prove exactly that — the source file survives
+    // (so it was not rewritten) and each moved row keeps its stable id.
+
+    /// <summary>
+    /// IT DOES NOT REWRITE. After the update the source file is STILL ACTIVE — carrying a deletion vector —
+    /// and a small post-image file has been added beside it. Copy-on-write would instead have removed that path
+    /// and replaced it, so "path still active + file count grew" is the discriminating evidence.
+    /// </summary>
+    [Fact]
+    public async Task MergeOnReadUpdate_MasksAndAppends_WithoutRewritingTheFile()
+    {
+        await using var table = await CreateTrackedAsync();
+        var before = table.CurrentSnapshot;
+        int filesBefore = before.ActiveFiles.Count;
+
+        var target = (await ReadMetaAsync(table)).First(r => r.Id == 12);
+        var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            [target.FilePath] = new long[] { target.RowIndex },
+        });
+
+        var (rows, _) = await table.UpdateBySelectionViaVectorsAsync(selection, matched =>
+        {
+            Assert.Equal(1, matched.Length);
+            Assert.Equal(12L, ((Int64Array)matched.Column("id")).GetValue(0)!.Value);
+            return new RecordBatch(matched.Schema,
+                new IArrowArray[] { new Int64Array.Builder().Append(120L).Build() }, 1);
+        });
+        Assert.Equal(1, rows);
+
+        await using var check = await OpenAsync();
+        var after = check.CurrentSnapshot;
+
+        // the source file was NOT rewritten away — it is still active, now with a deletion vector
+        var survivor = after.ActiveFiles.Values.FirstOrDefault(f => f.Path == target.FilePath);
+        Assert.NotNull(survivor);
+        Assert.NotNull(survivor!.DeletionVector);
+        // ...and the post-image landed in a NEW file beside it
+        Assert.Equal(filesBefore + 1, after.ActiveFiles.Count);
+
+        Assert.Equal(new long[] { 1, 2, 3, 11, 13, 21, 22, 23, 120 },
+            (await ReadMetaAsync(check)).Select(r => r.Id).OrderBy(x => x).ToArray());
+    }
+
+    /// <summary>
+    /// THE CAPABILITY: the moved row keeps its ORIGINAL stable id. That is what merge-on-read buys over
+    /// copy-on-write, whose rewrite re-derives ids for every row of the file it touches.
+    /// </summary>
+    [Fact]
+    public async Task MergeOnReadUpdate_PreservesTheStableRowId()
+    {
+        long? idBefore;
+        long targetPos;
+        string targetPath;
+        await using (var table = await CreateTrackedAsync())
+        {
+            var target = (await ReadMetaAsync(table)).First(r => r.Id == 22);
+            idBefore = target.RowId;
+            targetPos = target.RowIndex;
+            targetPath = target.FilePath;
+            Assert.NotNull(idBefore);
+
+            await table.UpdateBySelectionViaVectorsAsync(
+                new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+                {
+                    [targetPath] = new long[] { targetPos },
+                }),
+                matched => new RecordBatch(matched.Schema,
+                    new IArrowArray[] { new Int64Array.Builder().Append(2200L).Build() }, 1));
+        }
+
+        await using var check = await OpenAsync();
+        var updated = (await ReadMetaAsync(check)).Single(r => r.Id == 2200);
+        Assert.Equal(idBefore, updated.RowId);          // identity survived the move
+        Assert.NotEqual(targetPath, updated.FilePath);  // ...even though the row is in a DIFFERENT file now
+    }
+
+    /// <summary>Without deletion vectors it refuses cleanly and points at the copy-on-write form — never a
+    /// silent fallback, since the two have very different IO costs.</summary>
+    [Fact]
+    public async Task MergeOnReadUpdate_WithoutDeletionVectors_RefusesCleanly()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), BuildSchema());   // no DVs
+        await table.WriteAsync([BuildBatch(1, 2)]);
+        await table.WriteAsync([BuildBatch(11, 2)]);
+        var path = table.CurrentSnapshot.ActiveFiles.Values.First().Path;
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await table.UpdateBySelectionViaVectorsAsync(
+                new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+                {
+                    [path] = new long[] { 0 },
+                }),
+                m => m));
+        Assert.Contains("deletion vectors", ex.Message);
+        Assert.Contains("UpdateBySelectionAsync", ex.Message);   // names the alternative
+    }
+
+    /// <summary>An updater returning the wrong row count is a caller error, caught rather than committed.</summary>
+    [Fact]
+    public async Task MergeOnReadUpdate_UpdaterReturningWrongRowCount_Throws()
+    {
+        await using var table = await CreateTrackedAsync();
+        var target = (await ReadMetaAsync(table)).First(r => r.Id == 2);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await table.UpdateBySelectionViaVectorsAsync(
+                new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+                {
+                    [target.FilePath] = new long[] { target.RowIndex },
+                }),
+                matched => new RecordBatch(matched.Schema,
+                    new IArrowArray[] { new Int64Array.Builder().Append(1L).Append(2L).Build() }, 2)));
+        Assert.Contains("one row per matched row", ex.Message);
+
+        // nothing committed
+        Assert.Equal(9, (await ReadMetaAsync(table)).Count);
+    }
+
     /// <summary>An updates batch naming a file that is no longer active is an error, not a silent no-op.</summary>
     [Fact]
     public async Task UpdateBySelection_StalePath_Throws()
@@ -487,6 +661,83 @@ public class MetadataColumnTests : IDisposable
         Assert.Equal(new long[] { 1, 2, 3, 11, 13, 21, 22, 23 }, left);
     }
 
+    /// <summary>
+    /// SCOPES the zero-read claim, so it cannot be over-read. Without deletion vectors the same lowered
+    /// predicate routes to COPY-ON-WRITE, which must read and rewrite each affected file — so it opens data
+    /// files, and is NOT a zero-read fast path. The lowering still helps (it names the files directly instead
+    /// of evaluating a mask over pruning candidates), but the saving is different in kind.
+    /// </summary>
+    [Fact]
+    public async Task MetadataPredicateDelete_WithoutDeletionVectors_IsCopyOnWrite_AndDoesReadData()
+    {
+        string targetPath;
+        await using (var setup = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), BuildSchema()))   // NO deletion vectors
+        {
+            await setup.WriteAsync([BuildBatch(1, 3)]);
+            await setup.WriteAsync([BuildBatch(11, 3)]);
+            targetPath = (await ReadMetaAsync(setup)).First(r => r.Id == 12).FilePath;
+        }
+
+        var countingFs = new CountingFileSystem(new LocalTableFileSystem(_tempDir));
+        await using (var table = await DeltaTable.OpenAsync(countingFs))
+        {
+            var pred = new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
+            {
+                Ex.Equal(MetadataPredicate.FilePathColumn, targetPath),
+                Ex.Equal(MetadataPredicate.RowIndexColumn, 1L),
+            });
+            var (deleted, _) = await table.DeleteAsync(pred);
+            Assert.Equal(1, deleted);
+        }
+
+        // the rewrite had to read the affected file — this is the assertion that scopes the DV-path claim
+        Assert.True(countingFs.DataParquetOpens > 0,
+            "copy-on-write must read the file it rewrites; only the deletion-vector path is zero-read");
+
+        await using var check = await OpenAsync();
+        Assert.Equal(new long[] { 1, 2, 3, 11, 13 },
+            (await ReadMetaAsync(check)).Select(r => r.Id).OrderBy(x => x).ToArray());
+    }
+
+    /// <summary>
+    /// The other boundary: with Change Data Feed on, even the deletion-vector path must read the SELECTED
+    /// files to capture the deleted rows' content for the feed — so it is not zero-read either. It still reads
+    /// only the selected file, not the whole table, which is the actual guarantee.
+    /// </summary>
+    [Fact]
+    public async Task MetadataPredicateDelete_WithChangeDataFeed_ReadsOnlyTheSelectedFile()
+    {
+        string targetPath;
+        await using (var setup = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), BuildSchema(),
+            enableDeletionVectors: true,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" }))
+        {
+            await setup.WriteAsync([BuildBatch(1, 3)]);
+            await setup.WriteAsync([BuildBatch(11, 3)]);
+            await setup.WriteAsync([BuildBatch(21, 3)]);
+            targetPath = (await ReadMetaAsync(setup)).First(r => r.Id == 12).FilePath;
+        }
+
+        var countingFs = new CountingFileSystem(new LocalTableFileSystem(_tempDir));
+        await using (var table = await DeltaTable.OpenAsync(countingFs))
+        {
+            var pred = new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
+            {
+                Ex.Equal(MetadataPredicate.FilePathColumn, targetPath),
+                Ex.Equal(MetadataPredicate.RowIndexColumn, 1L),
+            });
+            var (deleted, _) = await table.DeleteAsync(pred);
+            Assert.Equal(1, deleted);
+        }
+
+        // reads happened (for the feed) but were confined to the ONE selected file out of three
+        Assert.True(countingFs.DataParquetOpens > 0, "CDF capture must read the selected rows' content");
+        Assert.True(countingFs.DataParquetOpens <= 2,
+            $"only the selected file should be read, not all three — saw {countingFs.DataParquetOpens} opens");
+    }
+
     /// <summary>An IN set names several positions, and OR combines several files — the shapes the lowering
     /// supports. Still zero data reads.</summary>
     [Fact]
@@ -543,6 +794,62 @@ public class MetadataColumnTests : IDisposable
         Assert.Contains("_metadata", ex.Message);
 
         // and nothing was deleted
+        Assert.Equal(9, (await ReadMetaAsync(table)).Count);
+    }
+
+    /// <summary>UpdateAsync is now SYMMETRIC with DeleteAsync: a physically-addressing predicate lowers to a
+    /// selection, and the updater sees only the MATCHED rows. Non-matched rows pass through untouched.</summary>
+    [Fact]
+    public async Task MetadataPredicateUpdate_LowersAndUpdatesOnlyTheMatchedRows()
+    {
+        string targetFile;
+        await using (var setup = await CreateTrackedAsync())
+        {
+            targetFile = (await ReadMetaAsync(setup)).First(r => r.Id == 12).FilePath;
+        }
+
+        await using (var table = await OpenAsync())
+        {
+            var pred = new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
+            {
+                Ex.Equal(MetadataPredicate.FilePathColumn, targetFile),
+                Ex.Equal(MetadataPredicate.RowIndexColumn, 1L),
+            });
+            var (rows, _) = await table.UpdateAsync(pred, matched =>
+            {
+                // exactly the one selected row reaches the updater
+                Assert.Equal(1, matched.Length);
+                var ids = (Int64Array)matched.Column("id");
+                Assert.Equal(12L, ids.GetValue(0)!.Value);
+                return new RecordBatch(matched.Schema,
+                    new IArrowArray[] { new Int64Array.Builder().Append(9999L).Build() }, 1);
+            });
+            Assert.Equal(1, rows);
+        }
+
+        await using var check = await OpenAsync();
+        var after = (await ReadMetaAsync(check)).Select(r => r.Id).OrderBy(x => x).ToArray();
+        Assert.Equal(new long[] { 1, 2, 3, 11, 13, 21, 22, 23, 9999 }, after);
+    }
+
+    /// <summary>THE DEFECT THIS FIXES: before UpdateAsync got the guard, a `_metadata` predicate it could not
+    /// lower fell through to a row mask that binds DATA columns only — so it would mis-evaluate rather than
+    /// refuse. DeleteAsync rejected it; UpdateAsync did not. Now both do.</summary>
+    [Fact]
+    public async Task MetadataPredicateUpdate_ThatCannotLower_IsRejected_LikeDelete()
+    {
+        await using var table = await CreateTrackedAsync();
+        var pred = new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
+        {
+            Ex.Equal(MetadataPredicate.FilePathColumn, "somewhere.parquet"),
+            Ex.Equal("id", 2L),
+        });
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(
+            async () => await table.UpdateAsync(pred, b => b));
+        Assert.Contains("_metadata", ex.Message);
+        Assert.Contains("UPDATE", ex.Message);
+
+        // untouched
         Assert.Equal(9, (await ReadMetaAsync(table)).Count);
     }
 
