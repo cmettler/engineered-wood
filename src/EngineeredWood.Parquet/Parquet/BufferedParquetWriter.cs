@@ -130,7 +130,10 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     ? (float)s.DictionaryCount / s.NonNullCount
                     : 0;
 
-                if (_options.DictionaryEnabled && cardinality <= DictionaryEncoder.CardinalityThreshold)
+                // Per-column resolution, not the file-wide flag: an option that held for one writer and
+                // not the other would be worse than not having it.
+                if (_options.GetDictionaryEnabled(s.PathInSchema)
+                    && cardinality <= DictionaryEncoder.CardinalityThreshold)
                 {
                     dictResults[i] = new DictionaryEncoder.DictionaryResult
                     {
@@ -398,7 +401,13 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         int[]? defLevels,
         int numRows)
     {
-        int[] indices = dictResult.Indices;
+        // Every dictionary this writer builds carries one index per row: it accumulates ROWS, appending an
+        // index as each arrives. The run form comes only out of DictionaryEncoder's run-end-encoded arm,
+        // which nothing here reaches — so this is an assertion, not a case left unhandled.
+        int[] indices = dictResult.Indices
+            ?? throw new InvalidOperationException(
+                "A buffered column cannot be reconstructed from run-form dictionary indices.");
+
         byte[] dictPage = dictResult.DictionaryPageData;
         int dictCount = dictResult.DictionaryCount;
 
