@@ -2408,12 +2408,31 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        // A predicate that only addresses rows PHYSICALLY (_metadata.file_path / _metadata.row_index) lowers to
+        // a selection, which deletes without reading any data at all. One that mentions `_metadata` but cannot
+        // lower is REJECTED rather than handed to the row mask, which binds data columns only and would
+        // silently mis-evaluate it.
+        if (MetadataPredicate.TryLower(predicate, out var lowered))
+        {
+            return await DeleteBySelectionViaVectorsOrRewriteAsync(lowered, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        MetadataPredicate.ThrowIfReferencesMetadata(predicate, "DELETE");
+
         var transaction = StartTransaction();
         long rowsDeleted = await transaction.DeleteAsync(predicate, cancellationToken)
             .ConfigureAwait(false);
         long version = await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return (rowsDeleted, version);
     }
+
+    /// <summary>Routes a lowered selection to the deletion-vector path when the table enables DVs (no data read
+    /// at all), else to copy-on-write. Mirrors the choice the rowid DELETE surface makes.</summary>
+    private ValueTask<(long RowsDeleted, long Version)> DeleteBySelectionViaVectorsOrRewriteAsync(
+        FileRowSelection selection, CancellationToken cancellationToken)
+        => DeletionVectors.DeletionVectorConfig.IsEnabled(CurrentSnapshot.Metadata.Configuration)
+            ? DeleteBySelectionViaVectorsAsync(selection, cancellationToken)
+            : DeleteBySelectionAsync(selection, cancellationToken);
 
     /// <summary>The remove/add (and CDC) actions a DELETE produces, its removed-file paths, the row
     /// count, and the per-file row-level edits — everything a commit needs, but without committing. Shared
@@ -5229,8 +5248,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyCollection<long> rowIds,
         Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<RecordBatch>> rewriteFile,
         CancellationToken cancellationToken = default)
-        => UpdateByRowIdsCoreAsync(rowIds, (ordinal, batches, _) => rewriteFile(ordinal, batches),
-                                   cancellationToken);
+    {
+        ThrowIfDisposed();
+        if (rowIds.Count == 0)
+            return new ValueTask<long>(CurrentSnapshot.Version);
+        var snapshot = CurrentSnapshot;
+        var ordinalByPath = OrdinalByPath(snapshot);
+        return UpdateBySelectionCoreAsync(
+            SelectionFromRowIds(rowIds, snapshot),
+            (path, batches, _) => rewriteFile(ordinalByPath[path], batches),
+            cancellationToken);
+    }
 
     /// <summary>
     /// Copy-on-write UPDATE by TRANSIENT rowid, with each source row's rowid ALSO handed to the rewriter — so a
@@ -5245,7 +5273,31 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyCollection<long> rowIds,
         Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
         CancellationToken cancellationToken = default)
-        => UpdateByRowIdsCoreAsync(rowIds, rewriteFile, cancellationToken);
+    {
+        ThrowIfDisposed();
+        if (rowIds.Count == 0)
+            return new ValueTask<long>(CurrentSnapshot.Version);
+        var snapshot = CurrentSnapshot;
+        var ordinalByPath = OrdinalByPath(snapshot);
+        return UpdateBySelectionCoreAsync(
+            SelectionFromRowIds(rowIds, snapshot),
+            // Re-PACK the (path, position) identity the core now provides into the transient rowids this
+            // overload's contract promises, so existing rewriters are untouched.
+            (path, batches, positions) => rewriteFile(
+                ordinalByPath[path], batches, PackRowIds(ordinalByPath[path], positions)),
+            cancellationToken);
+    }
+
+    /// <summary>Inverse of the ordinal→path resolution, for the rowid-keyed adapters that must report a file
+    /// ordinal to a legacy rewriter.</summary>
+    private static Dictionary<string, long> OrdinalByPath(Snapshot.Snapshot snapshot)
+    {
+        var ordered = OrderedActiveFiles(snapshot);
+        var map = new Dictionary<string, long>(ordered.Count, StringComparer.Ordinal);
+        for (int i = 0; i < ordered.Count; i++)
+            map[ordered[i].Path] = i;
+        return map;
+    }
 
     /// <summary>
     /// Copy-on-write UPDATE by TRANSIENT rowid from a batch of new values — the convenience form for the
@@ -5289,11 +5341,111 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 setColumns.Add((updates.Schema.FieldsList[c].Name, updates.Column(c)));
 
         var rowIds = updIndexByRowId.Keys.ToArray();
-        return UpdateByRowIdsCoreAsync(
-            rowIds,
-            (ordinal, sourceBatches, rowIdsPerBatch) =>
-                ApplyRowIdKeyedUpdates(sourceBatches, rowIdsPerBatch, updIndexByRowId, setColumns),
+        if (rowIds.Length == 0)
+            return new ValueTask<long>(CurrentSnapshot.Version);
+        var snapshot = CurrentSnapshot;
+        var ordinalByPath = OrdinalByPath(snapshot);
+        return UpdateBySelectionCoreAsync(
+            SelectionFromRowIds(rowIds, snapshot),
+            // This overload's `updates` batch is keyed BY ROWID (that is its public contract), so the
+            // (path, position) identity the core provides is re-packed to match the caller's keys.
+            (path, sourceBatches, positions) =>
+                ApplyRowIdKeyedUpdates(
+                    sourceBatches, PackRowIds(ordinalByPath[path], positions),
+                    updIndexByRowId, setColumns),
             cancellationToken);
+    }
+
+    /// <summary>
+    /// Copy-on-write UPDATE from a batch that carries a <c>_metadata</c> struct column — the round trip:
+    /// <see cref="ReadAllWithMetadataAsync"/>, change the values you want, hand the batch back. The caller
+    /// writes NO substitution code and needs no knowledge of file ordering or rowid packing.
+    /// </summary>
+    /// <param name="updates">One row per row to change: the <c>_metadata</c> struct (only its
+    /// <c>file_path</c> and <c>row_index</c> members are read — the identity members are ignored here, since
+    /// this addresses rows physically) plus one column per SET column, named by its LOGICAL table-column name
+    /// and typed to match. Every other column of the target table passes through unchanged.</param>
+    /// <remarks>
+    /// The <c>_metadata</c>-shaped twin of <see cref="UpdateByRowIdsAsync(RecordBatch, string, CancellationToken)"/>.
+    /// Duplicate (file_path, row_index) pairs are a caller error — last one wins. Rows whose file is no longer
+    /// active THROW, rather than silently updating nothing.
+    /// </remarks>
+    public ValueTask<long> UpdateBySelectionAsync(
+        RecordBatch updates,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (updates is null)
+            throw new ArgumentNullException(nameof(updates));
+
+        int metaIdx = updates.Schema.GetFieldIndex(MetadataColumnName);
+        if (metaIdx < 0)
+            throw new ArgumentException(
+                $"updates has no '{MetadataColumnName}' struct column — read the rows with "
+                + $"{nameof(ReadAllWithMetadataAsync)} so each carries its identity.", nameof(updates));
+        if (updates.Column(metaIdx) is not StructArray meta)
+            throw new ArgumentException(
+                $"updates column '{MetadataColumnName}' must be a struct.", nameof(updates));
+
+        var metaType = (Apache.Arrow.Types.StructType)updates.Schema.FieldsList[metaIdx].DataType;
+        int pathChild = metaType.Fields.ToList().FindIndex(
+            f => string.Equals(f.Name, "file_path", StringComparison.Ordinal));
+        int idxChild = metaType.Fields.ToList().FindIndex(
+            f => string.Equals(f.Name, "row_index", StringComparison.Ordinal));
+        if (pathChild < 0 || idxChild < 0
+            || meta.Fields[pathChild] is not StringArray paths
+            || meta.Fields[idxChild] is not Int64Array indexes)
+        {
+            throw new ArgumentException(
+                $"updates column '{MetadataColumnName}' must carry a string 'file_path' and an int64 "
+                + "'row_index'.", nameof(updates));
+        }
+
+        // (file_path -> (row_index -> row in `updates`)). Per FILE the position alone is a unique key, which is
+        // why the rowid-keyed substitution helper can be reused verbatim with positions in place of rowids.
+        var byFile = new Dictionary<string, Dictionary<long, int>>(StringComparer.Ordinal);
+        var selection = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
+        for (int i = 0; i < updates.Length; i++)
+        {
+            if (paths.IsNull(i) || indexes.IsNull(i))
+                continue;
+            string p = paths.GetString(i);
+            long pos = indexes.GetValue(i)!.Value;
+            if (!byFile.TryGetValue(p, out var inner))
+            {
+                byFile[p] = inner = new Dictionary<long, int>();
+                selection[p] = new HashSet<long>();
+            }
+            inner[pos] = i;
+            ((HashSet<long>)selection[p]).Add(pos);
+        }
+        if (byFile.Count == 0)
+            return new ValueTask<long>(CurrentSnapshot.Version);
+
+        var setColumns = new List<(string Name, IArrowArray Values)>();
+        for (int c = 0; c < updates.ColumnCount; c++)
+            if (c != metaIdx)
+                setColumns.Add((updates.Schema.FieldsList[c].Name, updates.Column(c)));
+
+        return UpdateBySelectionCoreAsync(
+            new FileRowSelection(selection),
+            (path, sourceBatches, positions) =>
+                ApplyRowIdKeyedUpdates(sourceBatches, positions, byFile[path], setColumns),
+            cancellationToken);
+    }
+
+    /// <summary>Re-packs per-batch absolute positions into transient rowids for a rowid-keyed caller.</summary>
+    private static List<Int64Array> PackRowIds(long ordinal, IReadOnlyList<Int64Array> positionsPerBatch)
+    {
+        var rids = new List<Int64Array>(positionsPerBatch.Count);
+        foreach (var pos in positionsPerBatch)
+        {
+            var ridb = new Int64Array.Builder();
+            for (int i = 0; i < pos.Length; i++)
+                ridb.Append((ordinal << RowIdPositionBits) | pos.GetValue(i)!.Value);
+            rids.Add(ridb.Build());
+        }
+        return rids;
     }
 
     // Substitutes the SET columns' values at every source row whose rowid is in `updIndexByRowId`, pulling the
@@ -5349,23 +5501,42 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return list;
     }
 
-    private async ValueTask<long> UpdateByRowIdsCoreAsync(
-        IReadOnlyCollection<long> rowIds,
-        Func<long, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
+    /// <summary>
+    /// Copy-on-write UPDATE of the rows named by a <see cref="FileRowSelection"/> — the self-describing form,
+    /// and the one to prefer. <paramref name="rewriteFile"/> is invoked once per selected file with
+    /// <c>(filePath, sourceBatches, positionsPerBatch)</c>, where <c>positionsPerBatch[b][i]</c> is the ABSOLUTE
+    /// in-file position of row <c>i</c> of source batch <c>b</c> — so a caller holding new values keyed by
+    /// <c>(file_path, row_index)</c> (exactly what <see cref="ReadAllWithMetadataAsync"/> emits) substitutes them
+    /// by an O(1) lookup. It must return one batch per source batch, with identical row counts.
+    /// </summary>
+    /// <remarks>
+    /// This is the shape that removes the positional PACKING from the contract. The rowid overloads hand the
+    /// caller <c>(fileOrdinal, …, rowIdsPerBatch)</c>, whose per-row key is a 64-bit
+    /// <c>(ordinal &lt;&lt; 40) | position</c> — a convention the caller must reproduce, carrying a ~8.4M-file
+    /// ceiling. Here the identity is (path, position), which needs no shared convention and has no ceiling.
+    /// Row tracking, CDF pre/post-images and the commit shape are identical either way; only the key differs.
+    /// </remarks>
+    public ValueTask<long> UpdateBySelectionAsync(
+        FileRowSelection selection,
+        Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
+        CancellationToken cancellationToken = default)
+        => UpdateBySelectionCoreAsync(selection, rewriteFile, cancellationToken);
+
+    private async ValueTask<long> UpdateBySelectionCoreAsync(
+        FileRowSelection selection,
+        Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
 
         var snapshot = CurrentSnapshot;
-        if (rowIds.Count == 0)
+        if (selection.RowsByFile.Count == 0)
             return snapshot.Version;
 
         HonorWriterFeatures(snapshot, isAppend: false);
         RejectCopyOnWriteRowIdUnsupported("copy-on-write UPDATE");
 
-        var positionsByFile = DecodeRowIdPositions(rowIds);
-        var ordered = OrderedActiveFiles(snapshot);
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             snapshot.Metadata.Configuration);
@@ -5379,14 +5550,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (var kvp in positionsByFile)
+        foreach (var (addFile, targets) in
+                 ResolveSelection(selection, snapshot, "copy-on-write UPDATE"))
         {
-            int ordinal = kvp.Key;
-            if (ordinal < 0 || ordinal >= ordered.Count)
-                continue;
-            var addFile = ordered[ordinal];
-            var targets = kvp.Value;
-
             var srcIds = materializeIds ? new List<Int64Array?>() : null;
             var srcVers = materializeIds ? new List<Int64Array?>() : null;
             var absOut = new List<Int64Array?>();
@@ -5399,26 +5565,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (userBatches.Count == 0)
                 continue;
 
-            // Per-batch transient rowids (row-aligned), so the rewriter can key its new values by rowid.
-            var rowIdsPerBatch = new List<Int64Array>(userBatches.Count);
+            // Per-batch ABSOLUTE in-file positions (row-aligned), so the rewriter can key its new values by
+            // (file, position) — the self-describing identity, with no packing and no file-count ceiling.
+            var positionsPerBatch = new List<Int64Array>(userBatches.Count);
             for (int bi = 0; bi < userBatches.Count; bi++)
             {
                 var absPos = bi < absOut.Count ? absOut[bi] : null;
-                var ridb = new Int64Array.Builder();
+                var pb = new Int64Array.Builder();
                 for (int i = 0; i < userBatches[bi].Length; i++)
                 {
-                    long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
-                        ? absPos.GetValue(i)!.Value : i;
-                    ridb.Append(((long)ordinal << RowIdPositionBits) | abs);
+                    pb.Append(absPos is not null && i < absPos.Length && !absPos.IsNull(i)
+                        ? absPos.GetValue(i)!.Value : i);
                 }
-                rowIdsPerBatch.Add(ridb.Build());
+                positionsPerBatch.Add(pb.Build());
             }
 
             // The caller rebuilds each batch's rows with the SET columns modified on the matched positions.
-            var rewritten = rewriteFile(ordinal, userBatches, rowIdsPerBatch);
+            var rewritten = rewriteFile(addFile.Path, userBatches, positionsPerBatch);
             if (rewritten.Count != userBatches.Count)
                 throw new InvalidOperationException(
-                    "UpdateByRowIdsAsync: rewriteFile must return one batch per source batch.");
+                    "copy-on-write UPDATE: rewriteFile must return one batch per source batch.");
 
             // Build the materialized id/version arrays (an UPDATED row's version advances to this commit) and
             // count the rows actually matched in this file.
