@@ -803,28 +803,11 @@ public class SparkInteropTests : IDisposable
             .Field(new Field("amt", type, false))
             .Build();
 
-        RecordBatch AmtRow(long id, decimal amt)
-        {
-            var ids = new Int64Array.Builder().Append(id).Build();
-            var unscaled = new BigInteger(amt * 100m); // scale 2
-            var bytes = new byte[16];
-            var dest = bytes.AsSpan();
-            dest.Fill(unscaled.Sign < 0 ? (byte)0xFF : (byte)0x00);
-#if NET6_0_OR_GREATER
-            unscaled.TryWriteBytes(dest, out _, isUnsigned: false, isBigEndian: false);
-#else
-            var bb = unscaled.ToByteArray();
-            bb.AsSpan(0, Math.Min(bb.Length, 16)).CopyTo(dest);
-#endif
-            var data = new ArrayData(type, 1, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(bytes)]);
-            return new RecordBatch(schema, [ids, new Decimal128Array(data)], 1);
-        }
-
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(fs, schema);
-        await table.WriteAsync([AmtRow(1, 10.00m)]);    // pruned
-        await table.WriteAsync([AmtRow(2, 500.00m)]);
-        await table.WriteAsync([AmtRow(3, 2000.00m)]);
+        await table.WriteAsync([DecimalRow(schema, type, 1, 10.00m)]);    // pruned
+        await table.WriteAsync([DecimalRow(schema, type, 2, 500.00m)]);
+        await table.WriteAsync([DecimalRow(schema, type, 3, 2000.00m)]);
 
         var result = Spark.Invoke("scan", new { path = _tempDir, filter = "amt >= 100" });
 
@@ -861,6 +844,224 @@ public class SparkInteropTests : IDisposable
             .Select(r => r.GetProperty("payload").GetProperty("score").GetInt64())
             .OrderBy(v => v).ToList();
         Assert.Equal([100L, 101L, 200L], scores);
+    }
+
+    // ── Checkpoints. Everything above reads the table through its JSON commits; these read it
+    //    through the CHECKPOINT, which carries its own copy of the statistics. ──
+
+    /// <summary>
+    /// <para>Every stats test above answers from the commit JSONs, so the copy of the statistics that
+    /// a checkpoint carries has never been read by anything but EW. This hides every commit at or
+    /// below the checkpoint version before Spark opens the table, leaving the checkpoint as the only
+    /// source — so a checkpoint whose stats are missing, mistyped or misaligned prunes a file it
+    /// should have read and quietly returns fewer rows.</para>
+    ///
+    /// <para>Asserting <c>files_scanned &lt; files_total</c> is what keeps this honest, exactly as in
+    /// the commit-JSON cases: correct rows alone would also pass on an engine that never pruned.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwCheckpointed_MinMaxStats_SparkSkipsFilesReadingTheCheckpointAlone()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        // A checkpoint per commit, so the last one summarises all three files.
+        await using var table = await DeltaTable.CreateAsync(
+            fs, IdRegionSchema, new DeltaTableOptions { CheckpointInterval = 1 });
+        await table.WriteAsync([IdRegionBatch([10, 11, 12], ["us", "eu", "us"])]);
+        await table.WriteAsync([IdRegionBatch([100, 101], ["eu", "apac"])]);
+        await table.WriteAsync([IdRegionBatch([200], ["us"])]);
+
+        var result = Spark.Invoke("checkpoint_stats",
+            new { path = _tempDir, filter = "id >= 100", stats_column = "id" });
+
+        Assert.NotEmpty(result.GetProperty("hidden_commits").EnumerateArray());
+        Assert.Equal(3, result.GetProperty("files_total").GetInt32());
+        Assert.Equal(2, result.GetProperty("files_scanned").GetInt32());
+        Assert.Equal([(100L, "eu"), (101L, "apac"), (200L, "us")], RowsFromJson(result));
+    }
+
+    /// <summary>
+    /// <para>The decimal case is the one that broke: <c>stats_parsed</c> gives every float, double and
+    /// decimal column a floating-point bounds column, and those were written with
+    /// <c>BYTE_STREAM_SPLIT</c> — an encoding Spark's vectorized Parquet reader rejects outright. One
+    /// such column made the entire checkpoint unreadable, so the table stopped opening in the reference
+    /// implementation altogether once its commits aged out. Nothing caught it: EW's own reader supports
+    /// the encoding, and no test had ever put Spark in front of an EW checkpoint.</para>
+    ///
+    /// <para>Hence a decimal table specifically, read through its checkpoint: this fails on the read,
+    /// not on the pruning, if checkpoints ever go back to an exotic encoding.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwCheckpointed_DecimalStats_SparkReadsTheCheckpointAndPrunes()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        var type = new Decimal128Type(12, 2);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("amt", type, false))
+            .Build();
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, schema, new DeltaTableOptions { CheckpointInterval = 1 });
+        await table.WriteAsync([DecimalRow(schema, type, 1, 10.00m)]);    // pruned
+        await table.WriteAsync([DecimalRow(schema, type, 2, 500.00m)]);
+        await table.WriteAsync([DecimalRow(schema, type, 3, 2000.00m)]);
+
+        var result = Spark.Invoke("checkpoint_stats",
+            new { path = _tempDir, filter = "amt >= 100", stats_column = "amt" });
+
+        Assert.NotEmpty(result.GetProperty("hidden_commits").EnumerateArray());
+        Assert.Equal(3, result.GetProperty("files_total").GetInt32());
+        Assert.Equal(2, result.GetProperty("files_scanned").GetInt32());
+        Assert.Equal(2, result.GetProperty("row_count").GetInt32());
+    }
+
+    /// <summary>
+    /// <para>The typed half of a checkpoint's statistics. EW writes bounds twice — once as the JSON
+    /// <c>stats</c> string every engine reads, once as a typed <c>stats_parsed</c> struct — and the two
+    /// are built by different code from the same source, so they can disagree without anything
+    /// noticing: EW's own checkpoint reader parses only the JSON.</para>
+    ///
+    /// <para>Spark reads the checkpoint as Parquet here, which is the only way to see the typed values
+    /// at all — a table read cannot, because Delta prefers the JSON string when a checkpoint carries
+    /// both. The reference's own checkpoint is captured alongside to record what it carries.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwCheckpoint_TypedStats_AgreeWithTheJsonStatsSparkReads()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        string ewDir = Path.Combine(_tempDir, "ew");
+        string referenceDir = Path.Combine(_tempDir, "reference");
+        Directory.CreateDirectory(ewDir);
+        Directory.CreateDirectory(referenceDir);
+
+        var fs = new LocalTableFileSystem(ewDir);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, IdRegionSchema, new DeltaTableOptions { CheckpointInterval = 1 });
+        await table.WriteAsync([IdRegionBatch([10, 11, 12], ["us", "eu", "us"])]);
+        await table.WriteAsync([IdRegionBatch([100, 101], ["eu", "apac"])]);
+
+        var result = Spark.Invoke("checkpoint_stats",
+            new { path = ewDir, filter = (string?)null, stats_column = "id" });
+
+        Assert.NotNull(result.GetProperty("stats_parsed_at").GetString());
+
+        var typed = result.GetProperty("typed_stats").EnumerateArray().ToList();
+        Assert.Equal(2, typed.Count);   // one per data file
+
+        foreach (var row in typed)
+        {
+            using var json = JsonDocument.Parse(row.GetProperty("stats_json").GetString()!);
+            var stats = json.RootElement;
+
+            Assert.Equal(stats.GetProperty("numRecords").GetInt64(),
+                row.GetProperty("num_records").GetInt64());
+            Assert.Equal(stats.GetProperty("minValues").GetProperty("id").GetInt64(),
+                row.GetProperty("min_value").GetInt64());
+            Assert.Equal(stats.GetProperty("maxValues").GetProperty("id").GetInt64(),
+                row.GetProperty("max_value").GetInt64());
+            Assert.Equal(stats.GetProperty("nullCount").GetProperty("id").GetInt64(),
+                row.GetProperty("null_count").GetInt64());
+        }
+
+        // What the reference itself puts in a checkpoint, asked explicitly for typed stats. Two states
+        // are legitimate and both are asserted, because the answer depends on the delta-spark build:
+        // 4.0.0 writes none (its buildCheckpoint adds only partitionValues_parsed), while 4.1.0 writes
+        // them by default, INSIDE the add struct — never top-level, which is where EW puts its own.
+        // Anything else means Delta moved the column and EW's placement question needs revisiting.
+        // The JSON string is written either way (checkpoint.writeStatsAsJson defaults to true), which
+        // is what every reader here actually prunes on.
+        var reference = Spark.Invoke("reference_checkpoint_schema",
+            new { path = referenceDir, stats_as_struct = true });
+        Assert.Equal("string", reference.GetProperty("checkpoint_schema")
+            .GetProperty("add.stats").GetString());
+        string? referencePlacement = reference.GetProperty("stats_parsed_at").GetString();
+        Assert.True(referencePlacement is null or "add.stats_parsed",
+            $"delta-spark put typed stats at '{referencePlacement}'; EW writes a top-level "
+            + "stats_parsed column and would need to follow.");
+    }
+
+    /// <summary>
+    /// <para>The typed statistics, actually driving a query. With
+    /// <c>delta.checkpoint.writeStatsAsJson=false</c> the checkpoint carries no <c>add.stats</c> string
+    /// at all, so <c>add.stats_parsed</c> is the only source of bounds there is: Spark's
+    /// <c>Snapshot.loadActions</c> spots the missing JSON column and re-encodes the typed struct back
+    /// into a stats string. If Spark still skips a file, it read EW's typed values — the placement,
+    /// the field names and the per-column types all have to be right for that to happen.</para>
+    ///
+    /// <para>Requires delta-spark 4.1+: 4.0 neither writes nor reads the column (its
+    /// <c>loadActions</c> maps <c>add.stats</c> and nothing else), so on the pinned 4.0 pairing this
+    /// self-skips rather than asserting something the build cannot do.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwCheckpointed_StructStatsOnly_SparkPrunesFromTheTypedStats()
+    {
+        if (!Spark.EnsureAvailable()) return;
+        if (!SparkReadsStructStats()) return;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, IdRegionSchema, new DeltaTableOptions { CheckpointInterval = 1 },
+            configuration: new Dictionary<string, string>
+            {
+                ["delta.checkpoint.writeStatsAsJson"] = "false",
+                ["delta.checkpoint.writeStatsAsStruct"] = "true",
+            });
+
+        // The file that must be pruned goes in the first commit, which the driver hides.
+        await table.WriteAsync([IdRegionBatch([10, 11, 12], ["us", "eu", "us"])]);
+        await table.WriteAsync([IdRegionBatch([100, 101], ["eu", "apac"])]);
+        await table.WriteAsync([IdRegionBatch([200], ["us"])]);
+
+        var result = Spark.Invoke("checkpoint_stats",
+            new { path = _tempDir, filter = "id >= 100", stats_column = "id" });
+
+        // No JSON stats anywhere — the typed struct is carrying the query.
+        Assert.DoesNotContain("add.stats",
+            result.GetProperty("checkpoint_schema").EnumerateObject().Select(p => p.Name));
+        Assert.Equal("add.stats_parsed", result.GetProperty("stats_parsed_at").GetString());
+
+        Assert.Equal(3, result.GetProperty("files_total").GetInt32());
+        Assert.Equal(2, result.GetProperty("files_scanned").GetInt32());
+        Assert.Equal([(100L, "eu"), (101L, "apac"), (200L, "us")], RowsFromJson(result));
+    }
+
+    /// <summary>
+    /// True when the delta-spark behind this tier reads <c>add.stats_parsed</c> — 4.1 and later. Asked
+    /// by writing a reference checkpoint and seeing whether Delta puts typed stats in it: a build that
+    /// writes the column is a build that reads it (both landed together), and the check needs no
+    /// version parsing that a patch release could invalidate.
+    /// </summary>
+    private bool SparkReadsStructStats()
+    {
+        string probeDir = Path.Combine(_tempDir, "reference-probe");
+        Directory.CreateDirectory(probeDir);
+        var reference = Spark.Invoke("reference_checkpoint_schema",
+            new { path = probeDir, stats_as_struct = true });
+        return reference.GetProperty("stats_parsed_at").GetString() is not null;
+    }
+
+    /// <summary>Builds a one-row batch of (id, decimal) for the decimal statistics cases.</summary>
+    private static RecordBatch DecimalRow(
+        Apache.Arrow.Schema schema, Decimal128Type type, long id, decimal amount)
+    {
+        var ids = new Int64Array.Builder().Append(id).Build();
+        var unscaled = new BigInteger(amount * 100m); // scale 2
+        var bytes = new byte[16];
+        var dest = bytes.AsSpan();
+        dest.Fill(unscaled.Sign < 0 ? (byte)0xFF : (byte)0x00);
+#if NET6_0_OR_GREATER
+        unscaled.TryWriteBytes(dest, out _, isUnsigned: false, isBigEndian: false);
+#else
+        var bb = unscaled.ToByteArray();
+        bb.AsSpan(0, Math.Min(bb.Length, 16)).CopyTo(dest);
+#endif
+        var data = new ArrayData(type, 1, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(bytes)]);
+        return new RecordBatch(schema, [ids, new Decimal128Array(data)], 1);
     }
 
     // ── VACUUM: a destructive operation validated by the reference implementation. ──
@@ -1155,6 +1356,133 @@ public class SparkInteropTests : IDisposable
         Assert.Contains(rows, t => t.Ct == "insert" && t.Id == 2 && t.Value == "b");
         Assert.Contains(rows, t => t.Ct == "update_preimage" && t.Id == 1 && t.Value == "a");
         Assert.Contains(rows, t => t.Ct == "update_postimage" && t.Id == 1 && t.Value == "z");
+    }
+
+    // Creates an UNMAPPED table partitioned by region with CDF enabled (property + writer feature patched in,
+    // as CreateAsync has no CDF switch).
+    private async Task<DeltaTable> CreatePartitionedCdfTableAsync()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        long next;
+        MetadataAction meta;
+        ProtocolAction proto;
+        await using (var created = await DeltaTable.CreateAsync(
+            fs, IdValueRegionSchema, partitionColumns: ["region"]))
+        {
+            meta = created.CurrentSnapshot.Metadata;
+            proto = created.CurrentSnapshot.Protocol;
+            next = created.CurrentSnapshot.Version + 1;
+        }
+        var cfg = meta.Configuration!.ToDictionary(kv => kv.Key, kv => kv.Value);
+        cfg[CdfConfig.EnableKey] = "true";
+
+        // CDF needs writer support. A plain table is created on a LEGACY protocol (no feature lists), where the
+        // capability is implied by the version — bumping to 4 is the whole declaration. Naming the feature there
+        // instead would be rejected outright ("Mismatched minWriterVersion and writerFeatures"), since a feature
+        // list is only legal at writer 7.
+        var upgraded = proto.WriterFeatures is { Count: > 0 } features
+            ? proto with { WriterFeatures = features.Contains("changeDataFeed") ? features : [.. features, "changeDataFeed"] }
+            : proto with { MinWriterVersion = Math.Max(proto.MinWriterVersion, 4) };
+
+        await new TransactionLog(fs).WriteCommitAsync(next, new List<DeltaAction>
+        {
+            upgraded,
+            meta with { Configuration = cfg },
+        });
+        return await DeltaTable.OpenAsync(fs);
+    }
+
+    /// <summary>Transient rowids (<c>_metadata.row_id</c>) of the rows whose <c>id</c> is listed.</summary>
+    private static async Task<List<long>> RowIdsOfAsync(DeltaTable table, params long[] ids)
+    {
+        var wanted = new HashSet<long>(ids);
+        var result = new List<long>();
+        await foreach (var b in table.ReadAllWithRowIdsAsync(null, null))
+        {
+            var id = (Int64Array)b.Column("id");
+            var rid = (Int64Array)b.Column("_metadata.row_id");
+            for (int i = 0; i < b.Length; i++)
+                if (wanted.Contains(id.GetValue(i)!.Value))
+                    result.Add(rid.GetValue(i)!.Value);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// <para>The cross-engine proof for Change Data Feed on the COPY-ON-WRITE row-id DML paths
+    /// (<see cref="DeltaTable.UpdateByRowIdsAsync(RecordBatch, string?, CancellationToken)"/> and
+    /// <see cref="DeltaTable.DeleteByRowIdsAsync"/>). Both commit <c>remove</c>(old)+<c>add</c>(new) for each
+    /// rewritten file, so without change files the feed would be INFERRED — reporting every surviving row of
+    /// the file as deleted and re-inserted. Each path therefore writes <c>_change_data</c> files for exactly
+    /// the rows it touched, and a version carrying <c>cdc</c> actions is read cdc-only.</para>
+    ///
+    /// <para>The table is PARTITIONED so the change files' partition values are exercised end to end. Note what
+    /// this tier does and does not prove: Spark resolves a change file by NAME, so it reads the feed correctly
+    /// whether or not the partition column is in the file bytes (MEASURED — it passes with the writer's
+    /// partition-column strip disabled). The strict reader is EW's own, which re-materializes partition columns
+    /// POSITIONALLY; that half is pinned by <c>RowIdDmlTests</c>. What Spark alone can prove is that the cdc
+    /// actions make the rewrite commit read as three row-level changes instead of an inferred whole-file
+    /// delete + insert.</para>
+    /// </summary>
+    [Fact]
+    public async Task EwRowIdDml_CopyOnWrite_ChangeDataFeed_SparkReadsPreImagePostImageAndDelete()
+    {
+        if (!Spark.EnsureAvailable()) return;
+
+        long updateVersion, deleteVersion;
+        await using (var table = await CreatePartitionedCdfTableAsync())
+        {
+            await table.WriteAsync([IdValueRegionBatch([1, 2, 3], ["a", "b", "c"], ["emea", "emea", "emea"])]);
+
+            // UPDATE id=2's value → "z" by transient rowid (copy-on-write rewrite of its file).
+            updateVersion = table.CurrentSnapshot.Version + 1;
+            long rid2 = (await RowIdsOfAsync(table, 2)).Single();
+            var updates = new RecordBatch(
+                new Apache.Arrow.Schema.Builder()
+                    .Field(new Field("_metadata.row_id", Int64Type.Default, false))
+                    .Field(new Field("value", StringType.Default, true))
+                    .Build(),
+                [
+                    new Int64Array.Builder().Append(rid2).Build(),
+                    new StringArray.Builder().Append("z").Build(),
+                ], 1);
+            Assert.Equal(updateVersion, await table.UpdateByRowIdsAsync(updates));
+
+            // DELETE id=3 by transient rowid (copy-on-write again — no deletion vectors on this table).
+            deleteVersion = table.CurrentSnapshot.Version + 1;
+            var (deleted, version) = await table.DeleteByRowIdsAsync(await RowIdsOfAsync(table, 3));
+            Assert.Equal(1, deleted);
+            Assert.Equal(deleteVersion, version);
+        }
+
+        var result = Spark.Invoke("read_changes",
+            new { path = _tempDir, start = updateVersion, end = deleteVersion });
+
+        var rows = result.GetProperty("rows").EnumerateArray()
+            .Select(r => (
+                Ct: r.GetProperty(CdfConfig.ChangeTypeColumn).GetString(),
+                Id: r.GetProperty("id").GetInt64(),
+                Value: r.GetProperty("value").GetString(),
+                Region: r.GetProperty("region").GetString()))
+            .OrderBy(t => t.Ct, StringComparer.Ordinal).ThenBy(t => t.Id)
+            .ToList();
+
+        // Exactly the touched rows: id=1 was rewritten by neither statement, and the delete's surviving rows
+        // are not re-inserted. Every row carries the re-materialized partition value.
+        Assert.Equal(
+            [
+                ("delete", 3L, "c", "emea"),
+                ("update_postimage", 2L, "z", "emea"),
+                ("update_preimage", 2L, "b", "emea"),
+            ],
+            rows);
+
+        // …and the table itself reads as the two survivors with the update applied.
+        var table_ = Spark.Invoke("read", new { path = _tempDir });
+        var data = table_.GetProperty("rows").EnumerateArray()
+            .Select(r => (Id: r.GetProperty("id").GetInt64(), Value: r.GetProperty("value").GetString()))
+            .OrderBy(t => t.Id).ToList();
+        Assert.Equal([(1L, "a"), (2L, "z")], data);
     }
 
     // ── CDF inference over a deletion-vector-carrying file ──

@@ -401,16 +401,103 @@ Parquet unit, and only Delta cannot carry it.
 
 **Stats collection gaps.**
 
-- `tightBounds` is never written.
-- `stats_parsed` is built by `StatsParsedBuilder` for checkpoint writes
-  but `CheckpointReader.ExtractAdd` reads only the JSON `stats` string.
+- `tightBounds` is written only where it changes meaning: `StatsWithLooseBounds`
+  marks a file wide wherever a deletion vector is ATTACHED, since the min/max then
+  describe rows the vector removed. A freshly written file leaves the flag off,
+  which the spec reads as `true`. Only the flag is rewritten, not `nullCount`:
+  Delta's tight-state null counts are logical and have to be converted on the way
+  to wide, whereas EW collects over the physical rows and never recomputes, so an
+  all-null column's count already equals the physical `numRecords` the wide
+  reading tests against.
+
+  Worth knowing how little this buys on the read side: the spec says the bounds
+  are "sufficient information for data skipping" either way, and delta-spark's
+  `DataSkippingReader` never mentions the flag. It matters to a reader answering
+  `MIN`/`MAX`/`COUNT` from statistics alone, which EW does not do — the flag is
+  written for other engines' benefit, not our own. EW's pruner is safe against
+  wide statistics regardless: it only skips on the two `nullCount` states (0 and
+  `== numRecords`) that the spec preserves when bounds go wide.
 - `delta.dataSkippingNumIndexedCols` / `delta.dataSkippingStatsColumns`
   are ignored; every eligible column gets stats.
 
 (String-stat truncation and nested-struct recursion are both implemented —
 `StatsCollector.TruncateMaxString` and `CollectStruct`. Nested stats are
 verified externally: `EwWritten_NestedStats_SparkSkipsOnNestedFieldWithoutLosingRows`
-asserts Spark prunes on `payload.score` and still returns every matching row.)
+asserts Spark prunes on `payload.score` and still returns every matching row.
+The checkpoint's own copy of the JSON stats is verified by
+`EwCheckpointed_MinMaxStats_SparkSkipsFilesReadingTheCheckpointAlone`, which hides
+the earlier commits so only the checkpoint can answer the scan.)
+
+**`stats_parsed`.** `StatsParsedBuilder` writes typed per-file bounds as
+`add.stats_parsed` — inside the add struct, where delta-spark writes them and the
+only place its readers look. It is an implementation extension, not a spec'd
+field: `stats_parsed` appears nowhere in `PROTOCOL.md` (checked), so delta-spark's
+layout is the only definition there is, and EW's is measured against it rather
+than copied from prose.
+
+Which delta-spark you run decides whether it reads or writes the column at all.
+4.0.0 (the pairing tier 3 pins) does neither — its `buildCheckpoint` adds only
+`partitionValues_parsed` and its `loadActions` maps `add.stats` and nothing else;
+the `extractStats` call landed after that tag. **4.1.0 writes `add.stats_parsed`
+by default** (`checkpoint.writeStatsAsStruct` defaults to `true`) and reads it
+back, but only as a fallback: `Snapshot.loadActions` re-encodes the typed struct
+to JSON **iff** the add struct has `stats_parsed` and lacks `stats`, then drops
+the field. A checkpoint carrying both — Delta's default, and EW's — is always read
+from the JSON. delta-rs 1.6.2 writes JSON stats only. All measured.
+
+`delta.checkpoint.writeStatsAsJson` / `delta.checkpoint.writeStatsAsStruct` are
+honoured (`CheckpointStatsMode`), both defaulting to true as in delta-spark, and
+settable at create time through `DeltaTable.CreateAsync(configuration: ...)`.
+Turning JSON off leaves the typed struct as the only statistics, which is the
+shape `EwCheckpointed_StructStatsOnly_SparkPrunesFromTheTypedStats` uses to prove
+Spark prunes from EW's typed values — it needs delta-spark 4.1+ and self-skips on
+4.0.
+
+Bounds carry each column's own Arrow type (`decimal(p,s)`, `timestamp`), decimal
+digits decoded exactly rather than through `System.Decimal`; nested structs
+recurse; and boolean/binary/array/map columns are absent from `minValues`/
+`maxValues` while still counted in `nullCount` — matching delta-spark 4.1.0's own
+checkpoint, measured for
+`(id BIGINT, amount DECIMAL(9,2), d DATE, ts TIMESTAMP, s STRING, b BOOLEAN)`:
+
+```
+add.stats_parsed.numRecords          bigint
+add.stats_parsed.minValues           struct<id:bigint,amount:decimal(9,2),d:date,ts:timestamp,s:string>
+add.stats_parsed.maxValues           struct<id:bigint,amount:decimal(9,2),d:date,ts:timestamp,s:string>
+add.stats_parsed.nullCount           struct<id:bigint,amount:bigint,d:bigint,ts:bigint,s:bigint,b:bigint>
+```
+
+A bound that will not fit the column's own type is written as null (no bound)
+rather than rounded, since a wrong bound skips a file that matches.
+
+**EW reads `stats_parsed` for pruning.** `CheckpointStatsView` maps a checkpoint's
+typed columns once per batch and each `AddFile` carries its row, so a bound costs
+one indexed read instead of parsing the file's whole statistics blob — which the
+pruner otherwise does inside `ShouldInclude`, i.e. per file per query. Measured
+over a 100,000-file checkpoint with a single-column predicate: 210 ms -> 15 ms and
+413 MB -> 4 MB of allocation. `DeltaTableOptions.PreferTypedCheckpointStats`
+(default true) decides only the tie; a checkpoint carrying one copy is read from
+that one either way, and a column the typed struct does not bound falls back to the
+JSON, which is parsed lazily so the fast path never pays for it. That fallback is
+load-bearing: `stats_parsed` omits boolean bounds and EW's JSON statistics carry
+them, so a typed-only lookup silently stops pruning on booleans.
+
+`AddFile.GetNumRecords()` reads the row count from whichever copy has one. Callers
+must not reach for `Stats` directly — a struct-only checkpoint has no JSON string,
+and a row count silently read as zero would mis-assign row ids and mis-size
+compaction groups.
+
+**Statistics survive a move on a struct-only table.** `CheckpointStatsView.BuildStatsJson`
+writes a file's typed statistics back out as a Delta `stats` string — the inverse
+of what `StatsParsedBuilder` read in, and the same answer delta-spark reaches with
+`to_json(stats_parsed)`. Anything that WRITES statistics back goes through
+`AddFile.GetStatsJson()` rather than `Stats`: the serialiser, and the loose-bounds
+rewrite a deletion vector triggers. Without it, a file read from a checkpoint with
+`writeStatsAsJson=false` lost its statistics the moment a DELETE or compaction
+re-committed it, and the table scanned every file from then on. Values go out in
+the forms `StatsCollector` emits, so a synthesised string is interchangeable with
+an original one — including decimals, whose exact digits never pass through
+`System.Decimal`.
 
 **CommitInfo.** `InCommitTimestamp.CreateCommitInfo` emits `timestamp`,
 `operation`, `inCommitTimestamp`, `engineInfo` and `operationParameters`
@@ -484,7 +571,10 @@ not apply. There is still **no way to enable DVs on an EXISTING table** (no
 `DeleteAsync` path has **no copy-on-write fallback** when DVs are off — it
 removes whole files or throws. (A separate copy-on-write DELETE/UPDATE does
 exist, keyed by transient row id — `DeleteByRowIdsAsync` / `UpdateByRowIdsAsync`
-— which rewrites the affected files with no DV; it requires row tracking.)
+— which rewrites the affected files with no DV. It needs neither deletion
+vectors nor row tracking, preserves row-tracking ids when the table has them,
+and writes the Change Data Feed for exactly the rows it touched; only
+IcebergCompat tables are still refused on that path.)
 Earlier EW always wrote a DV without declaring the feature, so a conformant
 foreign reader silently returned the deleted rows; that data-loss gap is closed.
 

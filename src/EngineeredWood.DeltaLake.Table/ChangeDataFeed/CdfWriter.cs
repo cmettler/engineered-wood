@@ -36,6 +36,12 @@ internal static class CdfWriter
         ParquetWriteOptions? parquetOptions,
         CancellationToken cancellationToken)
     {
+        // Partition columns never live in the file bytes — they ride on the action's partitionValues and the
+        // reader re-materializes them POSITIONALLY against the table schema. A caller whose rows came from the
+        // read path (which materializes partition columns) would otherwise write them into the file, and the
+        // reader would both duplicate the partition column and shift every column after it out of the feed.
+        rows = Partitioning.PartitionUtils.RemovePartitionColumns(rows, snapshot.Metadata.PartitionColumns);
+
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         if (mappingMode != ColumnMappingMode.None)
             rows = ColumnMappingRecursive.ToPhysical(rows, snapshot.Schema, mappingMode);
