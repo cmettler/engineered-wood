@@ -284,6 +284,105 @@ public class MetadataColumnTests : IDisposable
         Assert.Equal(idsBefore[22], byId[1022].RowId);
     }
 
+    /// <summary>
+    /// The PRIMITIVE overload's callback contract, which the RecordBatch form hides: the rewriter is invoked
+    /// ONCE PER SELECTED FILE with that file's path, and <c>positionsPerBatch</c> is row-aligned with
+    /// <c>sourceBatches</c> carrying ABSOLUTE in-file positions.
+    /// </summary>
+    /// <remarks>
+    /// The table is given a DELETION VECTOR first, on purpose. Without one, an absolute position and a row's
+    /// index within the emitted batch are the same number, so a callback handed in-batch indices instead of
+    /// absolute positions would look correct — the same blind spot a single-file fixture has for ordinals.
+    /// Masking row 0 makes the emitted batch's row 0 sit at absolute position 1, so the two disagree and the
+    /// contract becomes testable.
+    /// </remarks>
+    [Fact]
+    public async Task UpdateBySelection_Primitive_PassesThePathAndABSOLUTEPositions()
+    {
+        string targetFile;
+        long survivingIdAtAbs2;
+        await using (var table = await CreateTrackedAsync())
+        {
+            var rows = await ReadMetaAsync(table);
+            // pick a file and mask its FIRST row, so absolute != in-batch index afterwards
+            targetFile = rows.First(r => r.Id == 11).FilePath;
+            long maskedAbs = rows.First(r => r.Id == 11).RowIndex;
+            await table.DeleteBySelectionViaVectorsAsync(new FileRowSelection(
+                new Dictionary<string, IReadOnlyCollection<long>> { [targetFile] = new long[] { maskedAbs } }));
+            survivingIdAtAbs2 = (await ReadMetaAsync(table))
+                .First(r => r.FilePath == targetFile && r.RowIndex == 2).Id;
+        }
+
+        var observedPaths = new List<string>();
+        var observedPositions = new List<long>();
+        int invocations = 0;
+
+        await using (var table = await OpenAsync())
+        {
+            // target the row at ABSOLUTE position 2 of that file
+            var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+            {
+                [targetFile] = new long[] { 2 },
+            });
+
+            await table.UpdateBySelectionAsync(selection, (filePath, sourceBatches, positionsPerBatch) =>
+            {
+                invocations++;
+                observedPaths.Add(filePath);
+                Assert.Equal(sourceBatches.Count, positionsPerBatch.Count);   // row-aligned, per batch
+
+                var result = new List<RecordBatch>(sourceBatches.Count);
+                for (int b = 0; b < sourceBatches.Count; b++)
+                {
+                    var src = sourceBatches[b];
+                    var pos = positionsPerBatch[b];
+                    Assert.Equal(src.Length, pos.Length);                      // ...and per row
+                    for (int i = 0; i < pos.Length; i++)
+                        observedPositions.Add(pos.GetValue(i)!.Value);
+
+                    // Substitute keyed on the ABSOLUTE position, exactly as a real caller would.
+                    var ids = (Int64Array)src.Column("id");
+                    var nb = new Int64Array.Builder();
+                    for (int i = 0; i < src.Length; i++)
+                        nb.Append(pos.GetValue(i)!.Value == 2 ? 7777L : ids.GetValue(i)!.Value);
+                    result.Add(new RecordBatch(src.Schema, new IArrowArray[] { nb.Build() }, src.Length));
+                }
+                return result;
+            });
+        }
+
+        Assert.Equal(1, invocations);                       // once per SELECTED file, not per batch
+        Assert.Equal(new[] { targetFile }, observedPaths);  // and it is the file we selected
+
+        // The masked row is gone from the emitted batch, so the positions the rewriter saw START AT 1.
+        // Were they in-batch indices they would have started at 0 — that is the discriminating assertion.
+        Assert.Equal(new long[] { 1, 2 }, observedPositions.OrderBy(x => x).ToArray());
+        Assert.DoesNotContain(0L, observedPositions);
+
+        // and the substitution landed on the row that really sat at absolute 2
+        await using var check = await OpenAsync();
+        var after = await ReadMetaAsync(check);
+        Assert.Contains(7777L, after.Select(r => r.Id));
+        Assert.DoesNotContain(survivingIdAtAbs2, after.Select(r => r.Id));
+    }
+
+    /// <summary>The primitive rejects a stale path too, and the rewriter is never invoked for it.</summary>
+    [Fact]
+    public async Task UpdateBySelection_Primitive_StalePath_ThrowsWithoutInvokingTheRewriter()
+    {
+        await using var table = await CreateTrackedAsync();
+        bool invoked = false;
+        var bogus = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            ["part-vanished.parquet"] = new long[] { 0 },
+        });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await table.UpdateBySelectionAsync(bogus, (_, batches, _) => { invoked = true; return batches; }));
+        Assert.Contains("part-vanished.parquet", ex.Message);
+        Assert.False(invoked);
+    }
+
     /// <summary>An updates batch naming a file that is no longer active is an error, not a silent no-op.</summary>
     [Fact]
     public async Task UpdateBySelection_StalePath_Throws()
