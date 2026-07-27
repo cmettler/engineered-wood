@@ -515,6 +515,72 @@ public class MetadataColumnTests : IDisposable
         Assert.NotEqual(targetPath, updated.FilePath);  // ...even though the row is in a DIFFERENT file now
     }
 
+    /// <summary>
+    /// The KEYED overload's contract — the one a host-side join depends on, and the one the single-argument
+    /// form cannot express. The updater receives the file's <c>add.path</c> and the matched rows' ABSOLUTE
+    /// positions, row-aligned, so values can be looked up by identity instead of by emission order.
+    /// </summary>
+    /// <remarks>
+    /// A deletion vector is applied first so that an absolute position and a row's index within the matched
+    /// batch DISAGREE. Without that, handing the updater in-batch indices would look correct — the same blind
+    /// spot as elsewhere in this file.
+    /// </remarks>
+    [Fact]
+    public async Task MergeOnReadUpdate_KeyedOverload_PassesPathAndAbsolutePositions()
+    {
+        string targetFile;
+        await using (var table = await CreateTrackedAsync())
+        {
+            var rows = await ReadMetaAsync(table);
+            targetFile = rows.First(r => r.Id == 11).FilePath;
+            // mask absolute 0 of that file, so its survivors sit at absolute 1 and 2
+            await table.DeleteBySelectionViaVectorsAsync(new FileRowSelection(
+                new Dictionary<string, IReadOnlyCollection<long>>
+                {
+                    [targetFile] = new long[] { rows.First(r => r.Id == 11).RowIndex },
+                }));
+        }
+
+        var observedPaths = new List<string>();
+        var observedPositions = new List<long>();
+
+        await using (var table = await OpenAsync())
+        {
+            // select BOTH survivors, and key the new values by absolute position
+            var newByPos = new Dictionary<long, long> { [1] = 777L, [2] = 888L };
+            var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+            {
+                [targetFile] = new long[] { 1, 2 },
+            });
+
+            var (rows, _) = await table.UpdateBySelectionViaVectorsAsync(selection,
+                (filePath, matched, positions) =>
+                {
+                    observedPaths.Add(filePath);
+                    Assert.Equal(matched.Length, positions.Length);      // row-aligned
+                    var nb = new Int64Array.Builder();
+                    for (int i = 0; i < matched.Length; i++)
+                    {
+                        long pos = positions.GetValue(i)!.Value;
+                        observedPositions.Add(pos);
+                        nb.Append(newByPos[pos]);                        // keyed, not ordered
+                    }
+                    return new RecordBatch(matched.Schema, new IArrowArray[] { nb.Build() }, matched.Length);
+                });
+            Assert.Equal(2, rows);
+        }
+
+        Assert.Equal(new[] { targetFile }, observedPaths.Distinct().ToArray());
+        // ABSOLUTE: the masked row is absent, so positions start at 1 — in-batch indices would be {0,1}
+        Assert.Equal(new long[] { 1, 2 }, observedPositions.OrderBy(x => x).ToArray());
+        Assert.DoesNotContain(0L, observedPositions);
+
+        // the keyed substitution landed on the right rows
+        await using var check = await OpenAsync();
+        var after = (await ReadMetaAsync(check)).Select(r => r.Id).OrderBy(x => x).ToArray();
+        Assert.Equal(new long[] { 1, 2, 3, 21, 22, 23, 777, 888 }, after);
+    }
+
     /// <summary>Without deletion vectors it refuses cleanly and points at the copy-on-write form — never a
     /// silent fallback, since the two have very different IO costs.</summary>
     [Fact]

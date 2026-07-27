@@ -5037,9 +5037,36 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// were resolved against this snapshot), which the caller surfaces as retry-the-statement.
     /// </para>
     /// </remarks>
-    public async ValueTask<(long RowsUpdated, long Version)> UpdateBySelectionViaVectorsAsync(
+    public ValueTask<(long RowsUpdated, long Version)> UpdateBySelectionViaVectorsAsync(
         FileRowSelection selection,
         Func<RecordBatch, RecordBatch> updater,
+        CancellationToken cancellationToken = default)
+        => UpdateBySelectionViaVectorsAsync(
+            selection, (_, matched, _) => updater(matched), cancellationToken);
+
+    /// <summary>
+    /// Merge-on-read UPDATE where the updater ALSO receives each matched row's identity — the file's
+    /// <c>add.path</c> and the matched rows' ABSOLUTE in-file positions, row-aligned with the batch. For a
+    /// caller whose new values are KEYED (a host-side join producing <c>(file, position) → new values</c>)
+    /// rather than a function of the row's own content, which the single-argument form cannot express without
+    /// relying on row ORDER.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The merge-on-read twin of
+    /// <see cref="UpdateBySelectionAsync(FileRowSelection, Func{string, IReadOnlyList{RecordBatch}, IReadOnlyList{Int64Array}, IReadOnlyList{RecordBatch}}, CancellationToken)"/>;
+    /// same identity vocabulary, but the updater sees only the MATCHED rows rather than whole source batches.
+    /// </para>
+    /// <para>
+    /// ⚠ INVOCATION GRANULARITY DIFFERS from that copy-on-write sibling, and a keyed caller must not assume
+    /// otherwise: <paramref name="updater"/> is called once per SOURCE BATCH that contains a matched row —
+    /// possibly several times for one file — whereas the copy-on-write form is called once per FILE with all of
+    /// its batches. Key your values by <c>(filePath, position)</c> rather than accumulating state per call.
+    /// </para>
+    /// </remarks>
+    public async ValueTask<(long RowsUpdated, long Version)> UpdateBySelectionViaVectorsAsync(
+        FileRowSelection selection,
+        Func<string, RecordBatch, Int64Array, RecordBatch> updater,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
@@ -5105,7 +5132,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     preColumns[c] = ArrowCompute.Take(batch.Column(c), matchRows);
                 var pre = new RecordBatch(batch.Schema, preColumns, matchRows.Count);
 
-                var post = updater(pre);
+                // ...and their ABSOLUTE positions, row-aligned, so a KEYED updater can look its values up.
+                var matchedPositions = new Int64Array.Builder();
+                foreach (int i in matchRows)
+                {
+                    matchedPositions.Append(absPos is not null && i < absPos.Length && !absPos.IsNull(i)
+                        ? absPos.GetValue(i)!.Value : i);
+                }
+
+                var post = updater(addFile.Path, pre, matchedPositions.Build());
                 if (post.Length != matchRows.Count)
                 {
                     throw new InvalidOperationException(
