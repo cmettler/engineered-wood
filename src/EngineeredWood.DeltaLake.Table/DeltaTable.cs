@@ -3310,6 +3310,138 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Reads the table with a trailing <c>_metadata</c> STRUCT column — the SELF-DESCRIBING per-row identity
+    /// surface, in Spark's vocabulary. Four members:
+    /// </summary>
+    /// <remarks>
+    /// <list type="table">
+    ///   <item><term><c>file_path</c> (string, non-null)</term><description>the log <c>add.path</c>, URL-encoded
+    ///     exactly as stored — pair it with <c>row_index</c> to build a <see cref="FileRowSelection"/>.</description></item>
+    ///   <item><term><c>row_index</c> (int64, non-null)</term><description>the row's ABSOLUTE physical position in
+    ///     its file, COUNTING rows masked by the deletion vector (Spark's <c>_metadata.row_index</c> semantics),
+    ///     which is what makes repeated DV deletes compose.</description></item>
+    ///   <item><term><c>row_id</c> (int64, NULLABLE)</term><description>the STABLE row-tracking id: the
+    ///     materialized value where the file carries one, else <c>baseRowId + row_index</c>.</description></item>
+    ///   <item><term><c>row_commit_version</c> (int64, NULLABLE)</term><description>its commit-version twin.</description></item>
+    /// </list>
+    /// <para>
+    /// The first two are a LOCATOR (a physical address, valid for THIS snapshot); the last two are IDENTITY
+    /// (durable across rewrites). Keeping both in one struct is deliberate — it is the distinction
+    /// <c>_metadata.row_id</c> is FOR, and separating them is what previously forced the transient locator to
+    /// borrow the stable id's spec name.
+    /// </para>
+    /// <para>
+    /// The id members are NULL when no id is derivable: a file written before row tracking was enabled, a row
+    /// rewritten from such a file, or an <c>add</c> with no <c>baseRowId</c>. They are null for EVERY row when
+    /// the table does not enable row tracking — the struct's SHAPE stays fixed either way, so a consumer binds
+    /// one schema regardless of table configuration.
+    /// </para>
+    /// <para>
+    /// Prefer this over <see cref="ReadAllWithRowIdsAsync"/>: it needs no shared convention about file ordering,
+    /// it has no packing limit, and it exposes the stable identity that the rowid form can only deliver through
+    /// separate out-params.
+    /// </para>
+    /// </remarks>
+    public IAsyncEnumerable<RecordBatch> ReadAllWithMetadataAsync(
+        IReadOnlyList<string>? columns = null,
+        EngineeredWood.Expressions.Predicate? filter = null,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return ReadWithMetadataAsync(CurrentSnapshot, columns, filter, cancellationToken);
+    }
+
+    // Shared iterator. Everything the struct carries is ALREADY computed by the maintained read path — the
+    // absolute position and the resolved id/version arrive as ReadFileAsync out-params, and the path comes from
+    // the planned add — so this is pure assembly, and it inherits projection, column mapping, partition re-add,
+    // schema reconciliation and deletion-vector semantics for free.
+    private async IAsyncEnumerable<RecordBatch> ReadWithMetadataAsync(
+        Snapshot.Snapshot snapshot,
+        IReadOnlyList<string>? columns,
+        EngineeredWood.Expressions.Predicate? filter,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
+        foreach (var planned in PlanFiles(filter, snapshot))
+        {
+            var absOut = new List<Int64Array?>();
+            var idsOut = rowTracking ? new List<Int64Array?>() : null;
+            var versOut = rowTracking ? new List<Int64Array?>() : null;
+            int bi = -1;
+            await foreach (var batch in ReadFileAsync(planned.File, columns, snapshot, cancellationToken,
+                                                     strippedRowIdsOut: idsOut,
+                                                     strippedVersionsOut: versOut,
+                                                     strippedAbsPositionsOut: absOut).ConfigureAwait(false))
+            {
+                bi++;
+                yield return AppendMetadataColumn(
+                    batch, planned.File.Path,
+                    bi < absOut.Count ? absOut[bi] : null,
+                    idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null,
+                    versOut is not null && bi < versOut.Count ? versOut[bi] : null);
+            }
+        }
+    }
+
+    /// <summary>The <c>_metadata</c> struct type — fixed shape, so a consumer binds one schema whatever the
+    /// table's row-tracking configuration.</summary>
+    private static readonly Apache.Arrow.Types.StructType MetadataStructType =
+        new(new List<Field>
+        {
+            new("file_path", Apache.Arrow.Types.StringType.Default, false),
+            new("row_index", Apache.Arrow.Types.Int64Type.Default, false),
+            new("row_id", Apache.Arrow.Types.Int64Type.Default, true),
+            new("row_commit_version", Apache.Arrow.Types.Int64Type.Default, true),
+        });
+
+    // Appends the trailing `_metadata` struct. absPositions/ids/versions are row-aligned with `batch` when
+    // present; a null array (or a short one) yields nulls for the id members and falls back to the in-batch
+    // index for row_index — the same tolerance ReadWithTransientRowIdsAsync applies to its own out-param.
+    private static RecordBatch AppendMetadataColumn(
+        RecordBatch batch, string filePath,
+        Int64Array? absPositions, Int64Array? ids, Int64Array? versions)
+    {
+        var pathBuilder = new StringArray.Builder();
+        var idxBuilder = new Int64Array.Builder();
+        var idBuilder = new Int64Array.Builder();
+        var verBuilder = new Int64Array.Builder();
+        for (int i = 0; i < batch.Length; i++)
+        {
+            pathBuilder.Append(filePath);
+            idxBuilder.Append(absPositions is not null && i < absPositions.Length && !absPositions.IsNull(i)
+                ? absPositions.GetValue(i)!.Value : i);
+            if (ids is not null && i < ids.Length && !ids.IsNull(i))
+                idBuilder.Append(ids.GetValue(i)!.Value);
+            else
+                idBuilder.AppendNull();
+            if (versions is not null && i < versions.Length && !versions.IsNull(i))
+                verBuilder.Append(versions.GetValue(i)!.Value);
+            else
+                verBuilder.AppendNull();
+        }
+
+        var metadata = new StructArray(
+            MetadataStructType, batch.Length,
+            new IArrowArray[] { pathBuilder.Build(), idxBuilder.Build(), idBuilder.Build(), verBuilder.Build() },
+            ArrowBuffer.Empty, 0);
+
+        var schemaBuilder = new Apache.Arrow.Schema.Builder();
+        foreach (var f in batch.Schema.FieldsList)
+            schemaBuilder.Field(f);
+        schemaBuilder.Field(new Field(MetadataColumnName, MetadataStructType, false));
+
+        var arrays = new List<IArrowArray>(batch.ColumnCount + 1);
+        for (int c = 0; c < batch.ColumnCount; c++)
+            arrays.Add(batch.Column(c));
+        arrays.Add(metadata);
+
+        return new RecordBatch(schemaBuilder.Build(), arrays, batch.Length);
+    }
+
+    /// <summary>The trailing struct column <see cref="ReadAllWithMetadataAsync"/> appends.</summary>
+    public const string MetadataColumnName = "_metadata";
+
+    /// <summary>
     /// Time travel WITH the transient rowid column — the version analog of <see cref="ReadAllWithRowIdsAsync"/>.
     /// Each batch carries the trailing <c>_metadata.row_id</c> over the version's path-sorted active files.
     /// </summary>
