@@ -1,0 +1,298 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+
+using Apache.Arrow;
+using Apache.Arrow.Types;
+using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.IO.Local;
+
+namespace EngineeredWood.DeltaLake.Table.Tests;
+
+/// <summary>
+/// The PATH-KEYED row-level DML entry points (<see cref="FileRowSelection"/>) and their equivalence with —
+/// and improvement over — the ordinal-keyed overloads.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Every table here has AT LEAST TWO FILES on purpose. With one file the path-sorted ordinal is always 0, so
+/// an ordinal and a path carry the same information and any mis-resolution is invisible; a single-file fixture
+/// cannot fail these tests.
+/// </para>
+/// <para>
+/// The property that motivates the API is in <c>OrdinalKeyed_ResolvedAgainstAShrunkSnapshot_SilentlyDeletesNothing</c>:
+/// an ordinal that does not resolve is indistinguishable from a file with nothing to delete, so it is skipped,
+/// and a caller whose identifiers came from a different snapshot loses the delete WITHOUT AN ERROR. A path
+/// cannot be misread that way, so the path-keyed overload reports it.
+/// </para>
+/// </remarks>
+public class FileRowSelectionTests : IDisposable
+{
+    private readonly string _tempDir;
+
+    public FileRowSelectionTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), $"delta_frsel_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_tempDir);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempDir))
+        {
+            try { Directory.Delete(_tempDir, recursive: true); } catch { }
+        }
+    }
+
+    private static Apache.Arrow.Schema BuildSchema() => new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Build();
+
+    private static RecordBatch BuildBatch(long startId, int count)
+    {
+        var ids = new Int64Array.Builder();
+        for (int i = 0; i < count; i++)
+            ids.Append(startId + i);
+        return new RecordBatch(BuildSchema(), [ids.Build(), ], count);
+    }
+
+    /// <summary>A THREE-FILE DV-enabled table: one commit per file, ids 1..3 / 11..13 / 21..23.</summary>
+    private async Task<DeltaTable> CreateThreeFileTableAsync()
+    {
+        var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), BuildSchema(), enableDeletionVectors: true);
+        await table.WriteAsync([BuildBatch(1, 3)]);
+        await table.WriteAsync([BuildBatch(11, 3)]);
+        await table.WriteAsync([BuildBatch(21, 3)]);
+        return table;
+    }
+
+    private Task<DeltaTable> OpenAsync() => DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir)).AsTask();
+
+    private async Task<List<long>> ReadIdsFreshAsync()
+    {
+        await using var reader = await OpenAsync();
+        var ids = new List<long>();
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            var col = (Int64Array)batch.Column("id");
+            for (int i = 0; i < batch.Length; i++)
+                ids.Add(col.GetValue(i)!.Value);
+        }
+        ids.Sort();
+        return ids;
+    }
+
+    /// <summary>PlanFiles is the ordinal↔path dictionary a caller pairs with these overloads — the same
+    /// planner that produces the ordinals a positional row identifier packs.</summary>
+    private static Dictionary<int, string> PathsByOrdinal(DeltaTable table, Snapshot.Snapshot snapshot)
+        => table.PlanFiles(snapshot: snapshot).ToDictionary(p => p.Ordinal, p => p.File.Path);
+
+    /// <summary>The two keyings name the same rows: deleting via paths and via the ordinals those paths sit
+    /// at produces action sets that differ only in deletion-vector identity (each run writes a fresh DV
+    /// file), and the same row count. Two of the three files are touched, so an off-by-one in either
+    /// direction would show.</summary>
+    [Fact]
+    public async Task PathKeyed_AndOrdinalKeyed_NameTheSameRows()
+    {
+        await using var table = await CreateThreeFileTableAsync();
+        var snap = table.CurrentSnapshot;
+        Assert.Equal(3, snap.ActiveFiles.Count);
+        var paths = PathsByOrdinal(table, snap);
+
+        // second row of the files at ordinals 0 and 2
+        var byOrdinal = new Dictionary<int, IReadOnlyCollection<long>>
+        {
+            [0] = new long[] { 1 },
+            [2] = new long[] { 1 },
+        };
+        var byPath = new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            [paths[0]] = new long[] { 1 },
+            [paths[2]] = new long[] { 1 },
+        };
+
+        var (ordinalActions, ordinalRows) = await table.ComputeDeletionVectorActionsAsync(
+            byOrdinal, resolveAgainst: snap);
+        var (pathActions, pathRows) = await table.ComputeDeletionVectorActionsAsync(
+            new FileRowSelection(byPath), resolveAgainst: snap);
+
+        Assert.Equal(2, ordinalRows);
+        Assert.Equal(ordinalRows, pathRows);
+
+        // Same files touched, same remove/add shape. (DV uniqueIds differ — each call writes its own DV.)
+        static (List<string> Removes, List<string> Adds) Shape(IReadOnlyList<DeltaAction> actions)
+        {
+            var removes = actions.OfType<RemoveFile>().Select(r => r.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
+            var adds = actions.OfType<AddFile>().Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
+            return (removes, adds);
+        }
+        var (oRemoves, oAdds) = Shape(ordinalActions);
+        var (pRemoves, pAdds) = Shape(pathActions);
+        Assert.Equal(oRemoves, pRemoves);
+        Assert.Equal(oAdds, pAdds);
+        Assert.Equal(new[] { paths[0], paths[2] }.OrderBy(p => p, StringComparer.Ordinal).ToList(), pRemoves);
+        Assert.All(pathActions.OfType<AddFile>(), a => Assert.NotNull(a.DeletionVector));
+    }
+
+    /// <summary>End to end: a path-keyed selection committed as a fused DV DELETE removes exactly the named
+    /// rows across several files, and nothing else.</summary>
+    [Fact]
+    public async Task PathKeyed_Delete_RemovesExactlyTheSelectedRowsAcrossFiles()
+    {
+        await using var table = await CreateThreeFileTableAsync();
+        var snap = table.CurrentSnapshot;
+        var paths = PathsByOrdinal(table, snap);
+
+        // In each file, drop its FIRST row. Which ids those are depends on which commit sorted where, so
+        // assert on the count and on "one survivor pair per file" rather than on a fixed id list.
+        var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            [paths[0]] = new long[] { 0 },
+            [paths[1]] = new long[] { 0 },
+            [paths[2]] = new long[] { 0 },
+        });
+        var (actions, rows) = await table.ComputeDeletionVectorActionsAsync(selection, resolveAgainst: snap);
+        Assert.Equal(3, rows);
+
+        await table.CommitDataFilesAsync([], DeltaWriteMode.Append,
+            extraActions: actions, expectedVersion: snap.Version, operation: "DELETE");
+
+        var remaining = await ReadIdsFreshAsync();
+        Assert.Equal(6, remaining.Count);
+        // one row gone from each of the three id groups
+        Assert.Equal(2, remaining.Count(i => i is >= 1 and <= 3));
+        Assert.Equal(2, remaining.Count(i => i is >= 11 and <= 13));
+        Assert.Equal(2, remaining.Count(i => i is >= 21 and <= 23));
+    }
+
+    /// <summary>THE MOTIVATING CASE. Row identifiers captured against one snapshot, resolved against a
+    /// SHRUNK one (an overwrite/compaction replaced three files with one): ordinals 1 and 2 no longer
+    /// resolve, so the ordinal-keyed overload SKIPS them and reports zero rows deleted — a lost DELETE with
+    /// no error. The path-keyed overload names files that are demonstrably gone, so it THROWS.</summary>
+    [Fact]
+    public async Task OrdinalKeyed_ResolvedAgainstAShrunkSnapshot_SilentlyDeletesNothing()
+    {
+        await using var table = await CreateThreeFileTableAsync();
+        var stalePaths = PathsByOrdinal(table, table.CurrentSnapshot);
+
+        // Replace all three files with one (the shape a compaction / CREATE OR REPLACE leaves behind).
+        await table.WriteAsync([BuildBatch(100, 2)], DeltaWriteMode.Overwrite);
+        var shrunk = table.CurrentSnapshot;
+        Assert.Single(shrunk.ActiveFiles);
+
+        var staleOrdinals = new Dictionary<int, IReadOnlyCollection<long>>
+        {
+            [1] = new long[] { 0 },
+            [2] = new long[] { 0 },
+        };
+        var (actions, rows) = await table.ComputeDeletionVectorActionsAsync(
+            staleOrdinals, resolveAgainst: shrunk);
+        Assert.Empty(actions);
+        Assert.Equal(0, rows);   // silently nothing — the defect the path key removes
+
+        var staleSelection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            [stalePaths[1]] = new long[] { 0 },
+        });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await table.ComputeDeletionVectorActionsAsync(staleSelection, resolveAgainst: shrunk));
+        Assert.Contains(stalePaths[1], ex.Message);
+        Assert.Contains("not active", ex.Message);
+    }
+
+    /// <summary>A path that never existed is reported too — not silently ignored.</summary>
+    [Fact]
+    public async Task PathKeyed_UnknownPath_Throws()
+    {
+        await using var table = await CreateThreeFileTableAsync();
+        var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            ["part-does-not-exist.parquet"] = new long[] { 0 },
+        });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await table.ComputeDeletionVectorActionsAsync(selection));
+        Assert.Contains("part-does-not-exist.parquet", ex.Message);
+    }
+
+    /// <summary>The row-level rebase takes a selection too: positions captured on the pinned snapshot compose
+    /// with a concurrent DV delete of a DIFFERENT row of the SAME file (disjoint ⇒ re-union, not conflict) —
+    /// on a multi-file table, so the pinned ordinal of the touched file is not trivially 0.</summary>
+    [Fact]
+    public async Task PathKeyed_Rebase_ComposesWithAConcurrentDeleteOnTheSameFile()
+    {
+        await using var table = await CreateThreeFileTableAsync();
+        var pinned = table.CurrentSnapshot;
+        var paths = PathsByOrdinal(table, pinned);
+
+        // this transaction deletes row 0 of the file at ordinal 1
+        var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            [paths[1]] = new long[] { 0 },
+        });
+        var (actions, rows) = await table.ComputeDeletionVectorActionsAsync(selection, resolveAgainst: pinned);
+        Assert.Equal(1, rows);
+
+        // a concurrent writer deletes row 2 of the SAME file while the transaction is open
+        await using (var racer = await OpenAsync())
+        {
+            var racerPaths = PathsByOrdinal(racer, racer.CurrentSnapshot);
+            Assert.Equal(paths[1], racerPaths[1]);   // same file at the same ordinal — nothing moved yet
+            var racerSel = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+            {
+                [racerPaths[1]] = new long[] { 2 },
+            });
+            var (racerActions, racerRows) = await racer.ComputeDeletionVectorActionsAsync(racerSel);
+            Assert.Equal(1, racerRows);
+            await racer.CommitDataFilesAsync([], DeltaWriteMode.Append,
+                extraActions: racerActions, expectedVersion: racer.CurrentSnapshot.Version, operation: "DELETE");
+        }
+
+        await using var committer = await OpenAsync();
+        var rebased = await committer.RebaseDvDmlActionsAsync(
+            actions, selection, pinned, committer.CurrentSnapshot);
+        await committer.CheckLogicalRebaseAsync(pinned, rebased, rowLevelDml: true);
+        await committer.CommitDataFilesAsync([], DeltaWriteMode.Append,
+            extraActions: rebased, expectedVersion: committer.CurrentSnapshot.Version, operation: "DELETE");
+
+        // Both deletes composed rather than conflicting: 9 - 2 rows remain, and BOTH losses came out of the
+        // same file — so exactly one of the three consecutive id groups is down to a single row.
+        var remaining = await ReadIdsFreshAsync();
+        Assert.Equal(7, remaining.Count);
+        int[] groups =
+        [
+            remaining.Count(i => i is >= 1 and <= 3),
+            remaining.Count(i => i is >= 11 and <= 13),
+            remaining.Count(i => i is >= 21 and <= 23),
+        ];
+        Assert.Equal([1, 3, 3], groups.OrderBy(g => g).ToArray());
+    }
+
+    /// <summary>A selection naming a file that was not active in the snapshot it claims to come from is a
+    /// caller error, and the rebase says so — where an out-of-range ordinal was dropped in silence.</summary>
+    [Fact]
+    public async Task PathKeyed_Rebase_PathNotActiveInFrom_Throws()
+    {
+        await using var table = await CreateThreeFileTableAsync();
+        var pinned = table.CurrentSnapshot;
+        var paths = PathsByOrdinal(table, pinned);
+        var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            [paths[0]] = new long[] { 0 },
+        });
+        var (actions, _) = await table.ComputeDeletionVectorActionsAsync(selection, resolveAgainst: pinned);
+
+        // move the table forward so the rebase actually runs, then rebase a selection naming a bogus file
+        await using (var racer = await OpenAsync())
+        {
+            await racer.WriteAsync([BuildBatch(200, 1)]);
+        }
+        await using var committer = await OpenAsync();
+        var bogus = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            ["part-never-existed.parquet"] = new long[] { 0 },
+        });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await committer.RebaseDvDmlActionsAsync(actions, bogus, pinned, committer.CurrentSnapshot));
+        Assert.Contains("part-never-existed.parquet", ex.Message);
+    }
+}

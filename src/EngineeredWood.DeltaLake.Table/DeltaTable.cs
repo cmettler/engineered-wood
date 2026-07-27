@@ -4452,9 +4452,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // ── Buffered-transaction DML seam ──────────────────────────────────────────────────────────────────
     //
     // The deferred half of a deletion-vector DELETE + the exact-row read-back an UPDATE post-image is built
-    // from. Positions and transient rowids are addressed by a file's PATH-SORTED ordinal in the snapshot's
-    // active set (OrderedActiveFiles) — stable within one snapshot, which is why a buffered transaction pins the
-    // version its ordinals were captured against (atVersion / resolveAgainst) and re-validates before committing.
+    // from. Rows are addressed by (file, absolute in-file position) in TWO equivalent keyings:
+    //
+    //   * BY PATH — a FileRowSelection, the PREFERRED form: self-describing, so no convention is shared with
+    //     the caller, and a stale selection is a loud error rather than a silently dropped row.
+    //   * BY PATH-SORTED ORDINAL in the snapshot's active set (OrderedActiveFiles) — what a positional row
+    //     identifier packs. Stable only within one snapshot, which is why a buffered transaction pins the
+    //     version its ordinals were captured against (atVersion / resolveAgainst) and re-validates before
+    //     committing. These overloads resolve to a FileRowSelection and delegate.
 
     // The transient rowid packs (path-sorted file ordinal &lt;&lt; RowIdPositionBits) | absolute-in-file position.
     private const int RowIdPositionBits = 40;
@@ -4467,36 +4472,92 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Indexes a snapshot's active files by their log <c>add.path</c>, for the path-keyed
+    /// (<see cref="FileRowSelection"/>) DML entry points. <c>ActiveFiles</c> is keyed by the reconciliation
+    /// key <c>(path, deletionVector.uniqueId)</c>, so this collapses that to the path — legitimate because a
+    /// well-formed log has AT MOST ONE active add per path (a DV update is <c>remove</c>(path, old DV) +
+    /// <c>add</c>(path, new DV), which leaves one survivor). Two active adds for one path is a log
+    /// inconsistency AND unaddressable by path, so it throws rather than silently picking one.
+    /// </summary>
+    private static Dictionary<string, Actions.AddFile> ActiveFilesByPath(Snapshot.Snapshot snapshot)
+    {
+        var byPath = new Dictionary<string, Actions.AddFile>(snapshot.ActiveFiles.Count, StringComparer.Ordinal);
+        foreach (var f in snapshot.ActiveFiles.Values)
+        {
+            // Dictionary.TryAdd does not exist on netstandard2.0 (this library targets it for net472).
+            if (byPath.ContainsKey(f.Path))
+            {
+                throw new DeltaFormatException(
+                    $"the active file set of version {snapshot.Version} contains more than one add for path "
+                    + $"'{f.Path}' — the log is inconsistent (a deletion-vector update must be a remove+add "
+                    + "pair, leaving one active add per path)");
+            }
+            byPath.Add(f.Path, f);
+        }
+        return byPath;
+    }
+
+    /// <summary>
+    /// Resolves ordinal-keyed positions into a path-keyed <see cref="FileRowSelection"/> against the snapshot
+    /// the ordinals were captured on. Out-of-range ordinals are SKIPPED, preserving the historical leniency of
+    /// the ordinal-keyed overloads that call this; the path-keyed overloads themselves are STRICT (an unknown
+    /// path throws) — see the remarks on <see cref="FileRowSelection"/> for why that distinction matters.
+    /// </summary>
+    private static FileRowSelection SelectionFromOrdinals(
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal, Snapshot.Snapshot snapshot)
+    {
+        var ordered = OrderedActiveFiles(snapshot);
+        var byFile = new Dictionary<string, IReadOnlyCollection<long>>(
+            positionsByOrdinal.Count, StringComparer.Ordinal);
+        foreach (var kvp in positionsByOrdinal)
+        {
+            if (kvp.Key < 0 || kvp.Key >= ordered.Count)
+                continue;
+            string path = ordered[kvp.Key].Path;
+            // Distinct ordinals can only share a path on an inconsistent log (see ActiveFilesByPath); MERGE
+            // rather than overwrite so that case cannot silently drop positions here either.
+            byFile[path] = byFile.TryGetValue(path, out var existing)
+                ? existing.Concat(kvp.Value).ToList()
+                : kvp.Value;
+        }
+        return new FileRowSelection(byFile);
+    }
+
+    /// <summary>
     /// Computes the deletion-vector actions for the given deleted positions WITHOUT committing — the deferred
     /// half of a DV DELETE, for a buffered (multi-statement) transaction that fuses its DML + appends into one
-    /// commit via <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>. Positions are keyed by the
-    /// path-sorted file ordinal and are ABSOLUTE in-file row positions; each touched file's existing DV is
+    /// commit via <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>. Each selected file's existing DV is
     /// unioned with the new positions and the result is a <c>remove</c>(old path+DV) + <c>add</c>(same path, new
     /// DV) pair. Change Data Feed is NOT captured here (the caller must gate CDF tables to the committing path).
     /// Returns the actions + the count of NEWLY deleted rows.
     /// </summary>
-    /// <param name="resolveAgainst">Rebase support: the ordinals + old DVs were captured against the
-    /// transaction's PINNED snapshot — resolve there, not against a possibly-advanced current snapshot (whose
-    /// path-sorted ordering may differ after concurrent appends). The caller runs
-    /// <see cref="CheckLogicalRebaseAsync"/> before committing the result on a newer snapshot.</param>
+    /// <param name="selection">The rows to delete, keyed by log <c>add.path</c> with ABSOLUTE in-file
+    /// positions. A path that is not active in the resolved snapshot THROWS — unlike an unresolvable ordinal,
+    /// it is recognisably a caller error rather than a file with nothing to delete.</param>
+    /// <param name="resolveAgainst">Rebase support: the paths + old DVs were captured against the
+    /// transaction's PINNED snapshot — resolve there, not against a possibly-advanced current snapshot. The
+    /// caller runs <see cref="CheckLogicalRebaseAsync"/> before committing the result on a newer snapshot.</param>
     public async ValueTask<(IReadOnlyList<DeltaAction> Actions, long RowsDeleted)> ComputeDeletionVectorActionsAsync(
-        IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal,
+        FileRowSelection selection,
         CancellationToken cancellationToken = default,
         Snapshot.Snapshot? resolveAgainst = null)
     {
         ThrowIfDisposed();
         var snapshot = resolveAgainst ?? CurrentSnapshot;
-        var ordered = OrderedActiveFiles(snapshot);
+        var byPath = ActiveFilesByPath(snapshot);
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var actions = new List<DeltaAction>();
         long totalDeleted = 0;
 
-        foreach (var kvp in positionsByOrdinal)
+        foreach (var kvp in selection.RowsByFile)
         {
-            int ordinal = kvp.Key;
-            if (ordinal < 0 || ordinal >= ordered.Count)
-                continue;
-            var addFile = ordered[ordinal];
+            if (!byPath.TryGetValue(kvp.Key, out var addFile))
+            {
+                throw new InvalidOperationException(
+                    $"file '{kvp.Key}' is not active in version {snapshot.Version} of the table — it was "
+                    + "removed or rewritten (compaction, copy-on-write) since the selection was captured; "
+                    + "re-read the rows to delete");
+            }
 
             var allDeleted = addFile.DeletionVector is not null
                 ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
@@ -4530,6 +4591,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         return (actions, totalDeleted);
+    }
+
+    /// <summary>
+    /// Ordinal-keyed form of
+    /// <see cref="ComputeDeletionVectorActionsAsync(FileRowSelection, CancellationToken, Snapshot.Snapshot?)"/>:
+    /// positions keyed by a file's PATH-SORTED ordinal in the resolved snapshot's active set. Resolves the
+    /// ordinals to paths and delegates. Out-of-range ordinals are skipped (an unresolvable ordinal is
+    /// indistinguishable from a file with nothing to delete); prefer the path-keyed overload, which reports a
+    /// stale selection instead.
+    /// </summary>
+    public ValueTask<(IReadOnlyList<DeltaAction> Actions, long RowsDeleted)> ComputeDeletionVectorActionsAsync(
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal,
+        CancellationToken cancellationToken = default,
+        Snapshot.Snapshot? resolveAgainst = null)
+    {
+        ThrowIfDisposed();
+        return ComputeDeletionVectorActionsAsync(
+            SelectionFromOrdinals(positionsByOrdinal, resolveAgainst ?? CurrentSnapshot),
+            cancellationToken, resolveAgainst);
     }
 
     /// <summary>
@@ -5366,7 +5446,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     public async ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsAsync(
         IReadOnlyList<DeltaAction> actions,
-        IReadOnlyDictionary<int, IReadOnlyCollection<long>> newPositionsByOrdinal,
+        FileRowSelection newRows,
         Snapshot.Snapshot from,
         Snapshot.Snapshot to,
         CancellationToken cancellationToken = default)
@@ -5387,17 +5467,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 "concurrent protocol change — cannot rebase the transaction");
         }
 
-        // Our newly-deleted positions per path (ordinals resolve against `from` — what they were captured on).
-        var fromOrdered = OrderedActiveFiles(from);
-        var oursByPath = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
-        foreach (var kvp in newPositionsByOrdinal)
-        {
-            if (kvp.Key >= 0 && kvp.Key < fromOrdered.Count)
-                oursByPath[fromOrdered[kvp.Key].Path] = kvp.Value;
-        }
+        var oursByPath = newRows.RowsByFile;
         var fromByPath = new HashSet<string>(StringComparer.Ordinal);
         foreach (var f in from.ActiveFiles.Values)
             fromByPath.Add(f.Path);
+        // A selected path must have been active in `from` — that is the snapshot the selection was captured
+        // against, so anything else is a caller error (an ordinal-keyed caller that resolved against the wrong
+        // snapshot used to reach here silently, having simply dropped the row).
+        foreach (var path in oursByPath.Keys)
+        {
+            if (!fromByPath.Contains(path))
+            {
+                throw new InvalidOperationException(
+                    $"file '{path}' was not active in version {from.Version}, the version this transaction's "
+                    + "row selection was captured against — cannot rebase it onto a newer snapshot");
+            }
+        }
         var toByPath = new Dictionary<string, AddFile>(to.ActiveFiles.Count, StringComparer.Ordinal);
         foreach (var f in to.ActiveFiles.Values)
             toByPath[f.Path] = f;
@@ -5530,6 +5615,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             rebased.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
         }
         return rebased;
+    }
+
+    /// <summary>
+    /// Ordinal-keyed form of
+    /// <see cref="RebaseDvDmlActionsAsync(IReadOnlyList{DeltaAction}, FileRowSelection, Snapshot.Snapshot, Snapshot.Snapshot, CancellationToken)"/>:
+    /// this transaction's newly-deleted positions keyed by <paramref name="from"/>'s path-sorted ordinals.
+    /// Resolves them to paths and delegates. Out-of-range ordinals are skipped; prefer the path-keyed overload,
+    /// which reports a selection captured against the wrong snapshot instead of silently dropping its rows.
+    /// </summary>
+    public ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsAsync(
+        IReadOnlyList<DeltaAction> actions,
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> newPositionsByOrdinal,
+        Snapshot.Snapshot from,
+        Snapshot.Snapshot to,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return RebaseDvDmlActionsAsync(
+            actions, SelectionFromOrdinals(newPositionsByOrdinal, from), from, to, cancellationToken);
     }
 
     /// <summary>
