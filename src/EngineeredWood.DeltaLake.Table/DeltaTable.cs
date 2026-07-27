@@ -4524,6 +4524,58 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Decodes TRANSIENT rowids — <c>(path-sorted file ordinal &lt;&lt; RowIdPositionBits) | absolute position</c>
+    /// — into a path-keyed <see cref="FileRowSelection"/> against the snapshot they were minted on. The bridge
+    /// between the positional identifier an engine carries per row and the self-describing key the DML entry
+    /// points prefer.
+    /// </summary>
+    private static FileRowSelection SelectionFromRowIds(
+        IReadOnlyCollection<long> rowIds, Snapshot.Snapshot snapshot)
+    {
+        long posMask = (1L << RowIdPositionBits) - 1;
+        var byOrdinal = new Dictionary<int, IReadOnlyCollection<long>>();
+        foreach (var rid in rowIds)
+        {
+            int ordinal = (int)(rid >> RowIdPositionBits);
+            if (!byOrdinal.TryGetValue(ordinal, out var set))
+                byOrdinal[ordinal] = set = new HashSet<long>();
+            ((HashSet<long>)set).Add(rid & posMask);
+        }
+        return SelectionFromOrdinals(byOrdinal, snapshot);
+    }
+
+    /// <summary>
+    /// Resolves a <see cref="FileRowSelection"/> against a snapshot's active files, THROWING on a path that is
+    /// not active there. Returned PATH-SORTED, so a commit's action order does not depend on hash iteration
+    /// order — the same order the ordinal-keyed loops produced when they walked ordinals ascending.
+    /// </summary>
+    /// <remarks>
+    /// Positions are materialised into a <see cref="HashSet{T}"/> per file, which is load-bearing rather than
+    /// incidental: the copy-on-write paths probe them ONCE PER ROW of the file being rewritten, so handing the
+    /// caller's <c>IReadOnlyCollection</c> through would bind those probes to LINQ's O(n) <c>Contains</c> and
+    /// make a rewrite O(rows × selected). One set per file also matches what the rowid decode always built.
+    /// </remarks>
+    private static List<(Actions.AddFile File, HashSet<long> Positions)> ResolveSelection(
+        FileRowSelection selection, Snapshot.Snapshot snapshot, string op)
+    {
+        var byPath = ActiveFilesByPath(snapshot);
+        var resolved = new List<(Actions.AddFile, HashSet<long>)>(selection.RowsByFile.Count);
+        foreach (var kvp in selection.RowsByFile)
+        {
+            if (!byPath.TryGetValue(kvp.Key, out var addFile))
+            {
+                throw new InvalidOperationException(
+                    $"{op}: file '{kvp.Key}' is not active in version {snapshot.Version} of the table — it was "
+                    + "removed or rewritten (compaction, copy-on-write) since the selection was captured; "
+                    + "re-read the rows to act on");
+            }
+            resolved.Add((addFile, kvp.Value as HashSet<long> ?? new HashSet<long>(kvp.Value)));
+        }
+        resolved.Sort((a, b) => string.CompareOrdinal(a.Item1.Path, b.Item1.Path));
+        return resolved;
+    }
+
+    /// <summary>
     /// Computes the deletion-vector actions for the given deleted positions WITHOUT committing — the deferred
     /// half of a DV DELETE, for a buffered (multi-statement) transaction that fuses its DML + appends into one
     /// commit via <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>. Each selected file's existing DV is
@@ -4544,28 +4596,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         var snapshot = resolveAgainst ?? CurrentSnapshot;
-        var byPath = ActiveFilesByPath(snapshot);
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var actions = new List<DeltaAction>();
         long totalDeleted = 0;
 
-        foreach (var kvp in selection.RowsByFile)
+        foreach (var (addFile, positions) in
+                 ResolveSelection(selection, snapshot, "deletion-vector DML"))
         {
-            if (!byPath.TryGetValue(kvp.Key, out var addFile))
-            {
-                throw new InvalidOperationException(
-                    $"file '{kvp.Key}' is not active in version {snapshot.Version} of the table — it was "
-                    + "removed or rewritten (compaction, copy-on-write) since the selection was captured; "
-                    + "re-read the rows to delete");
-            }
-
             var allDeleted = addFile.DeletionVector is not null
                 ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
                     .ConfigureAwait(false))
                 : new HashSet<long>();
 
             long newlyDeleted = 0;
-            foreach (long p in kvp.Value)
+            foreach (long p in positions)
                 if (allDeleted.Add(p))
                     newlyDeleted++;
             if (newlyDeleted == 0)
@@ -4622,8 +4666,31 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="CommitOccAsync"/>'s row-level path) instead of aborting. Returns the rows newly deleted and the
     /// committed version. The committing, DV-based sibling of <see cref="ComputeDeletionVectorActionsAsync"/>.
     /// </summary>
-    public async ValueTask<(long RowsDeleted, long Version)> DeleteByRowIdsViaVectorsAsync(
+    public ValueTask<(long RowsDeleted, long Version)> DeleteByRowIdsViaVectorsAsync(
         IReadOnlyCollection<long> rowIds,
+        CancellationToken cancellationToken = default,
+        bool rowLevelRetry = false)
+    {
+        ThrowIfDisposed();
+        if (rowIds.Count == 0)
+            return new ValueTask<(long, long)>((0L, CurrentSnapshot.Version));
+        return DeleteBySelectionViaVectorsAsync(
+            SelectionFromRowIds(rowIds, CurrentSnapshot), cancellationToken, rowLevelRetry);
+    }
+
+    /// <summary>
+    /// DELETE the rows named by a <see cref="FileRowSelection"/> using DELETION VECTORS (no file rewrite): each
+    /// selected file's existing DV is unioned with the new absolute in-file positions and a fresh DV written; the
+    /// commit is <c>remove</c>(old file+DV) + <c>add</c>(same file, new DV). Positions must count rows already
+    /// masked by the file's DV (Spark's <c>_metadata.row_index</c> semantics) so repeated DV deletes compose.
+    /// Requires <c>delta.enableDeletionVectors</c>. With <paramref name="rowLevelRetry"/>, a concurrent DV-delete
+    /// of the SAME file re-unions when the touched rows are disjoint (row-level concurrency) instead of aborting.
+    /// A path that is not active THROWS. The self-describing sibling of
+    /// <see cref="DeleteByRowIdsViaVectorsAsync"/>; prefer it — it carries no assumption that the caller
+    /// reproduces this library's file ordering, and no 64-bit packing limit.
+    /// </summary>
+    public async ValueTask<(long RowsDeleted, long Version)> DeleteBySelectionViaVectorsAsync(
+        FileRowSelection selection,
         CancellationToken cancellationToken = default,
         bool rowLevelRetry = false)
     {
@@ -4631,7 +4698,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
 
         var snapshot = CurrentSnapshot;
-        if (rowIds.Count == 0)
+        if (selection.RowsByFile.Count == 0)
             return (0, snapshot.Version);
 
         HonorWriterFeatures(snapshot, isAppend: false);
@@ -4639,19 +4706,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             throw new InvalidOperationException(
                 "DeleteByRowIdsViaVectorsAsync requires deletion vectors — create the table with "
                 + "DeltaTable.CreateAsync(..., enableDeletionVectors: true), or use the copy-on-write "
-                + "DeleteByRowIdsAsync.");
+                + "DeleteBySelectionAsync.");
 
-        long posMask = (1L << RowIdPositionBits) - 1;
-        var positionsByFile = new Dictionary<int, HashSet<long>>();
-        foreach (var rid in rowIds)
-        {
-            int ordinal = (int)(rid >> RowIdPositionBits);
-            if (!positionsByFile.TryGetValue(ordinal, out var set))
-                positionsByFile[ordinal] = set = new HashSet<long>();
-            set.Add(rid & posMask);
-        }
-
-        var ordered = OrderedActiveFiles(snapshot);
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         var actions = new List<DeltaAction>();
@@ -4659,19 +4715,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var dvEdits = new List<DeleteDvEdit>();
         long totalDeleted = 0;
 
-        foreach (var kvp in positionsByFile)
+        foreach (var (addFile, targets) in
+                 ResolveSelection(selection, snapshot, "deletion-vector DELETE"))
         {
-            int ordinal = kvp.Key;
-            if (ordinal < 0 || ordinal >= ordered.Count)
-                continue;
-            var addFile = ordered[ordinal];
-
             var allDeleted = addFile.DeletionVector is not null
                 ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
                     .ConfigureAwait(false))
                 : new HashSet<long>();
             var newPositions = new List<long>();
-            foreach (long p in kvp.Value)
+            foreach (long p in targets)
                 if (allDeleted.Add(p))
                     newPositions.Add(p);
             if (newPositions.Count == 0)
@@ -4750,22 +4802,39 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// reports exactly them rather than inferring the whole rewritten file. IcebergCompat is not yet supported on
     /// this path. Returns the rows deleted and the committed version.
     /// </summary>
-    public async ValueTask<(long RowsDeleted, long Version)> DeleteByRowIdsAsync(
+    public ValueTask<(long RowsDeleted, long Version)> DeleteByRowIdsAsync(
         IReadOnlyCollection<long> rowIds,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (rowIds.Count == 0)
+            return new ValueTask<(long, long)>((0L, CurrentSnapshot.Version));
+        return DeleteBySelectionAsync(SelectionFromRowIds(rowIds, CurrentSnapshot), cancellationToken);
+    }
+
+    /// <summary>
+    /// DELETE the rows named by a <see cref="FileRowSelection"/> using <b>copy-on-write</b>: each selected file is
+    /// rewritten without those rows and committed as plain <c>remove</c>/<c>add</c> — NO deletion vectors, NO
+    /// row-tracking feature needed, so the result is maximally reader-compatible (Fabric OneLake, Spark,
+    /// delta-kernel). Row tracking, when enabled, is preserved (survivors keep their materialized id + commit
+    /// version). With <c>delta.enableChangeDataFeed</c> the deleted rows are written as <c>delete</c> change files.
+    /// IcebergCompat is not supported on this path. A path that is not active THROWS. The self-describing sibling
+    /// of <see cref="DeleteByRowIdsAsync"/>; prefer it.
+    /// </summary>
+    public async ValueTask<(long RowsDeleted, long Version)> DeleteBySelectionAsync(
+        FileRowSelection selection,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
 
         var snapshot = CurrentSnapshot;
-        if (rowIds.Count == 0)
+        if (selection.RowsByFile.Count == 0)
             return (0, snapshot.Version);
 
         HonorWriterFeatures(snapshot, isAppend: false);
         RejectCopyOnWriteRowIdUnsupported("copy-on-write DELETE");
 
-        var positionsByFile = DecodeRowIdPositions(rowIds);
-        var ordered = OrderedActiveFiles(snapshot);
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             snapshot.Metadata.Configuration);
@@ -4780,14 +4849,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         long totalDeleted = 0;
 
-        foreach (var kvp in positionsByFile)
+        foreach (var (addFile, targets) in
+                 ResolveSelection(selection, snapshot, "copy-on-write DELETE"))
         {
-            int ordinal = kvp.Key;
-            if (ordinal < 0 || ordinal >= ordered.Count)
-                continue;
-            var addFile = ordered[ordinal];
-            var targets = kvp.Value;
-
             // Read the file (logical), keeping only rows whose ABSOLUTE position is NOT targeted; materialize
             // each survivor's original id + version so the rewrite preserves row identity.
             var srcIds = materializeIds ? new List<Int64Array?>() : null;

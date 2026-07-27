@@ -267,6 +267,118 @@ public class FileRowSelectionTests : IDisposable
         Assert.Equal([1, 3, 3], groups.OrderBy(g => g).ToArray());
     }
 
+    /// <summary>The COMMITTING deletion-vector DELETE takes a selection too, and agrees row-for-row with the
+    /// rowid form: deleting the same two rows via paths leaves exactly what the rowid form leaves.</summary>
+    [Fact]
+    public async Task DeleteBySelectionViaVectors_MatchesTheRowIdForm()
+    {
+        // rowid form, on its own table
+        long[] viaRowIds;
+        await using (var table = await CreateThreeFileTableAsync())
+        {
+            var rowIds = await CollectRowIdsAsync(table, id => id is 2 or 22);
+            var (deleted, _) = await table.DeleteByRowIdsViaVectorsAsync(rowIds);
+            Assert.Equal(2, deleted);
+        }
+        viaRowIds = [.. await ReadIdsFreshAsync()];
+
+        // path form, on a fresh table built identically
+        Directory.Delete(_tempDir, recursive: true);
+        Directory.CreateDirectory(_tempDir);
+        await using (var table = await CreateThreeFileTableAsync())
+        {
+            var selection = await SelectionForIdsAsync(table, id => id is 2 or 22);
+            var (deleted, _) = await table.DeleteBySelectionViaVectorsAsync(selection);
+            Assert.Equal(2, deleted);
+        }
+        Assert.Equal(viaRowIds, await ReadIdsFreshAsync());
+        Assert.DoesNotContain(2L, viaRowIds);
+        Assert.DoesNotContain(22L, viaRowIds);
+    }
+
+    /// <summary>The COPY-ON-WRITE DELETE likewise: the file is rewritten (no deletion vector) and the surviving
+    /// rows match the rowid form. Runs on a DV-DISABLED table, which is what forces the rewrite path.</summary>
+    [Fact]
+    public async Task DeleteBySelection_CopyOnWrite_MatchesTheRowIdForm()
+    {
+        async Task<DeltaTable> PlainTableAsync()
+        {
+            var t = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), BuildSchema());
+            await t.WriteAsync([BuildBatch(1, 3)]);
+            await t.WriteAsync([BuildBatch(11, 3)]);
+            return t;
+        }
+
+        long[] viaRowIds;
+        await using (var table = await PlainTableAsync())
+        {
+            var rowIds = await CollectRowIdsAsync(table, id => id is 1 or 12);
+            var (deleted, _) = await table.DeleteByRowIdsAsync(rowIds);
+            Assert.Equal(2, deleted);
+        }
+        viaRowIds = [.. await ReadIdsFreshAsync()];
+
+        Directory.Delete(_tempDir, recursive: true);
+        Directory.CreateDirectory(_tempDir);
+        await using (var table = await PlainTableAsync())
+        {
+            var selection = await SelectionForIdsAsync(table, id => id is 1 or 12);
+            var (deleted, _) = await table.DeleteBySelectionAsync(selection);
+            Assert.Equal(2, deleted);
+            // copy-on-write: rewritten adds, no deletion vector anywhere
+            Assert.All(table.CurrentSnapshot.ActiveFiles.Values, f => Assert.Null(f.DeletionVector));
+        }
+        Assert.Equal(viaRowIds, await ReadIdsFreshAsync());
+    }
+
+    /// <summary>A stale path reaches the committing DELETE paths as an error too, not a silent no-op.</summary>
+    [Fact]
+    public async Task DeleteBySelection_UnknownPath_Throws()
+    {
+        await using var table = await CreateThreeFileTableAsync();
+        var bogus = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            ["part-gone.parquet"] = new long[] { 0 },
+        });
+        var dv = await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await table.DeleteBySelectionViaVectorsAsync(bogus));
+        Assert.Contains("part-gone.parquet", dv.Message);
+        var cow = await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await table.DeleteBySelectionAsync(bogus));
+        Assert.Contains("part-gone.parquet", cow.Message);
+    }
+
+    /// <summary>Reads the transient rowids of the rows whose id matches, via the same path an engine uses.</summary>
+    private static async Task<List<long>> CollectRowIdsAsync(DeltaTable table, Func<long, bool> match)
+    {
+        var rowIds = new List<long>();
+        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        {
+            var ids = (Int64Array)batch.Column("id");
+            var rids = (Int64Array)batch.Column(batch.ColumnCount - 1);
+            for (int i = 0; i < batch.Length; i++)
+                if (match(ids.GetValue(i)!.Value))
+                    rowIds.Add(rids.GetValue(i)!.Value);
+        }
+        return rowIds;
+    }
+
+    /// <summary>The same rows as a path-keyed selection — decoded exactly as an engine that owns the rowid
+    /// encoding would: ordinal -> PlanFiles -> add.path, position = the low bits.</summary>
+    private static async Task<FileRowSelection> SelectionForIdsAsync(DeltaTable table, Func<long, bool> match)
+    {
+        var paths = PathsByOrdinal(table, table.CurrentSnapshot);
+        var byFile = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
+        foreach (long rid in await CollectRowIdsAsync(table, match))
+        {
+            string path = paths[(int)(rid >> 40)];
+            if (!byFile.TryGetValue(path, out var set))
+                byFile[path] = set = new HashSet<long>();
+            ((HashSet<long>)set).Add(rid & ((1L << 40) - 1));
+        }
+        return new FileRowSelection(byFile);
+    }
+
     /// <summary>A selection naming a file that was not active in the snapshot it claims to come from is a
     /// caller error, and the rebase says so — where an out-of-range ordinal was dropped in silence.</summary>
     [Fact]
