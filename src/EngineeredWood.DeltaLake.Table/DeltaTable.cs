@@ -6562,18 +6562,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     for (int k = 0; k < rows.Count; k++)
                     {
                         int i = rows[k];
-                        // The row's ORIGINAL stable id/commit version: the source file's materialized value
-                        // where present (a rewritten/compacted source) else the spec derivation —
-                        // baseRowId + absolute position / the file's defaultRowCommitVersion. NULL only
-                        // when the source predates row tracking (no baseRowId to derive from).
-                        ids[k] = matI is not null && !matI.IsNull(i)
-                            ? matI.GetValue(i)
-                            : addFile.BaseRowId is { } baseId && !absPos.IsNull(i)
-                                ? baseId + absPos.GetValue(i)!.Value
-                                : null;
-                        vers[k] = matV is not null && !matV.IsNull(i)
-                            ? matV.GetValue(i)
-                            : addFile.DefaultRowCommitVersion;
+                        ids[k] = matI is not null && !matI.IsNull(i) ? matI.GetValue(i) : null;
+                        vers[k] = matV is not null && !matV.IsNull(i) ? matV.GetValue(i) : null;
                     }
                     sourceRowTrackingOut.Add((ids, vers));
                 }
