@@ -3518,8 +3518,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <remarks>
     /// <list type="table">
     ///   <item><term><c>_metadata.file_path</c> (string, non-null)</term><description>the log <c>add.path</c>,
-    ///     URL-encoded exactly as stored — pair it with the row index to build a
-    ///     <see cref="FileRowSelection"/>.</description></item>
+    ///     URL-encoded exactly as stored — pair it with the row index to name the row at a DML
+    ///     boundary.</description></item>
     ///   <item><term><c>_metadata.row_index</c> (int64, non-null)</term><description>the row's ABSOLUTE physical
     ///     position in its file, COUNTING rows masked by the deletion vector (Spark's
     ///     <c>_metadata.row_index</c> semantics), which is what makes repeated DV deletes compose.</description></item>
@@ -3574,6 +3574,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    /// <summary>The row's file, as the log's <c>add.path</c> — emitted by
+    /// <see cref="ReadAllWithMetadataAsync"/>. Flat and dot-named, matching the spelling
+    /// <see cref="ReadAllWithRowTrackingAsync"/> uses for the identity pair, so the whole
+    /// <c>_metadata.*</c> family is one convention.</summary>
+    public const string MetadataFilePathColumn = "_metadata.file_path";
+
+    /// <summary>The row's ABSOLUTE physical position in its file, COUNTING rows masked by the deletion vector
+    /// (Spark's <c>_metadata.row_index</c> semantics) — emitted by
+    /// <see cref="ReadAllWithMetadataAsync"/>.</summary>
+    public const string MetadataRowIndexColumn = "_metadata.row_index";
+
     // Appends the two trailing LOCATOR columns, FLAT and dot-named — the same spelling
     // ReadAllWithRowTrackingAsync uses for the identity pair (RowTrackingConfig.RowIdColumnName), so the whole
     // `_metadata.*` family is one convention rather than two encodings of one namespace. absPositions is
@@ -3595,9 +3606,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         foreach (var f in batch.Schema.FieldsList)
             schemaBuilder.Field(f);
         schemaBuilder.Field(new Field(
-            MetadataPredicate.FilePathColumn, Apache.Arrow.Types.StringType.Default, false));
+            MetadataFilePathColumn, Apache.Arrow.Types.StringType.Default, false));
         schemaBuilder.Field(new Field(
-            MetadataPredicate.RowIndexColumn, Apache.Arrow.Types.Int64Type.Default, false));
+            MetadataRowIndexColumn, Apache.Arrow.Types.Int64Type.Default, false));
 
         var arrays = new List<IArrowArray>(batch.ColumnCount + 2);
         for (int c = 0; c < batch.ColumnCount; c++)
@@ -6167,19 +6178,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (updates is null)
             throw new ArgumentNullException(nameof(updates));
 
-        int pathIdx = updates.Schema.GetFieldIndex(MetadataPredicate.FilePathColumn);
-        int rowIdxIdx = updates.Schema.GetFieldIndex(MetadataPredicate.RowIndexColumn);
+        int pathIdx = updates.Schema.GetFieldIndex(MetadataFilePathColumn);
+        int rowIdxIdx = updates.Schema.GetFieldIndex(MetadataRowIndexColumn);
         if (pathIdx < 0 || rowIdxIdx < 0)
             throw new ArgumentException(
-                $"updates has no '{MetadataPredicate.FilePathColumn}' / "
-                + $"'{MetadataPredicate.RowIndexColumn}' columns — read the rows with "
+                $"updates has no '{MetadataFilePathColumn}' / "
+                + $"'{MetadataRowIndexColumn}' columns — read the rows with "
                 + $"{nameof(ReadAllWithMetadataAsync)} so each carries its location.", nameof(updates));
         if (updates.Column(pathIdx) is not StringArray paths
             || updates.Column(rowIdxIdx) is not Int64Array indexes)
         {
             throw new ArgumentException(
-                $"updates '{MetadataPredicate.FilePathColumn}' must be a string column and "
-                + $"'{MetadataPredicate.RowIndexColumn}' an int64 column.", nameof(updates));
+                $"updates '{MetadataFilePathColumn}' must be a string column and "
+                + $"'{MetadataRowIndexColumn}' an int64 column.", nameof(updates));
         }
 
         // (file_path -> (row_index -> row in `updates`)). Per FILE the position alone is a unique key, which is

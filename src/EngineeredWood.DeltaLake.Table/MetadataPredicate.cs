@@ -16,8 +16,11 @@ namespace EngineeredWood.DeltaLake.Table;
 /// </summary>
 public static class MetadataPredicate
 {
-    public const string FilePathColumn = "_metadata.file_path";
-    public const string RowIndexColumn = "_metadata.row_index";
+    /// <summary>The locator column names, CONSUMED here and DEFINED by the read surface that emits them
+    /// (<see cref="DeltaTable.MetadataFilePathColumn"/>) — so the dependency runs predicate → reader, not the
+    /// reverse. Kept as aliases because this type's callers read as predicate code.</summary>
+    public const string FilePathColumn = DeltaTable.MetadataFilePathColumn;
+    public const string RowIndexColumn = DeltaTable.MetadataRowIndexColumn;
 
     /// <summary>Attempts the symbolic lowering. False = the shape is not (purely) a metadata selection.</summary>
     public static bool TryLower(Predicate predicate, out FileRowSelection selection)
