@@ -67,45 +67,83 @@ public class MetadataColumnTests : IDisposable
 
     private readonly record struct MetaRow(long Id, string FilePath, long RowIndex, long? RowId, long? Version);
 
-    private static async Task<List<MetaRow>> ReadMetaAsync(DeltaTable table)
+    /// <summary>
+    /// Reads the LOCATOR pair from <see cref="DeltaTable.ReadAllWithMetadataAsync"/> and, when
+    /// <paramref name="withIdentity"/>, the IDENTITY pair from
+    /// <see cref="DeltaTable.ReadAllWithRowTrackingAsync"/> — two reads, because the two surfaces own
+    /// different columns. They stream the same snapshot's files in the same path-sorted order with no filter,
+    /// so row N of one is row N of the other; that alignment is ASSERTED below rather than assumed, since it
+    /// is the only thing making a zip legitimate.
+    /// </summary>
+    private static async Task<List<MetaRow>> ReadMetaAsync(DeltaTable table, bool withIdentity = true)
     {
-        var rows = new List<MetaRow>();
+        var locators = new List<(long Id, string FilePath, long RowIndex)>();
         await foreach (var batch in table.ReadAllWithMetadataAsync())
         {
             var ids = (Int64Array)batch.Column("id");
-            var meta = (StructArray)batch.Column(DeltaTable.MetadataColumnName);
-            var path = (StringArray)meta.Fields[0];
-            var idx = (Int64Array)meta.Fields[1];
-            var rid = (Int64Array)meta.Fields[2];
-            var ver = (Int64Array)meta.Fields[3];
+            var path = (StringArray)batch.Column(MetadataPredicate.FilePathColumn);
+            var idx = (Int64Array)batch.Column(MetadataPredicate.RowIndexColumn);
+            for (int i = 0; i < batch.Length; i++)
+                locators.Add((ids.GetValue(i)!.Value, path.GetString(i), idx.GetValue(i)!.Value));
+        }
+
+        // A table that does not track row identity has no identity surface to read — it REFUSES rather than
+        // serving all-null columns — so report the locator alone and leave the id members null, which is what
+        // a caller can actually learn about such a table.
+        bool tracked = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+            table.CurrentSnapshot.Metadata.Configuration);
+        if (!withIdentity || !tracked)
+            return locators.Select(l => new MetaRow(l.Id, l.FilePath, l.RowIndex, null, null)).ToList();
+
+        var identity = new List<(long Id, long? RowId, long? Version)>();
+        await foreach (var batch in table.ReadAllWithRowTrackingAsync(columns: null, filter: null))
+        {
+            var ids = (Int64Array)batch.Column("id");
+            var rid = (Int64Array)batch.Column(
+                EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName);
+            var ver = (Int64Array)batch.Column(
+                EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName);
             for (int i = 0; i < batch.Length; i++)
             {
-                rows.Add(new MetaRow(
-                    ids.GetValue(i)!.Value, path.GetString(i), idx.GetValue(i)!.Value,
-                    rid.IsNull(i) ? null : rid.GetValue(i), ver.IsNull(i) ? null : ver.GetValue(i)));
+                identity.Add((ids.GetValue(i)!.Value,
+                    rid.IsNull(i) ? null : rid.GetValue(i),
+                    ver.IsNull(i) ? null : ver.GetValue(i)));
             }
+        }
+
+        Assert.Equal(locators.Count, identity.Count);
+        var rows = new List<MetaRow>(locators.Count);
+        for (int i = 0; i < locators.Count; i++)
+        {
+            // The zip is only meaningful if both surfaces emitted the same row at the same offset.
+            Assert.Equal(locators[i].Id, identity[i].Id);
+            rows.Add(new MetaRow(
+                locators[i].Id, locators[i].FilePath, locators[i].RowIndex,
+                identity[i].RowId, identity[i].Version));
         }
         return rows;
     }
 
-    /// <summary>The struct has exactly the four documented members, in order, with the nullability split that
-    /// distinguishes locator from identity.</summary>
+    /// <summary>The locator arrives as two FLAT dot-named columns — the same `_metadata.*` spelling
+    /// ReadAllWithRowTrackingAsync uses for identity — and both are non-null, because a row always has a
+    /// physical location even when its identity is underivable.</summary>
     [Fact]
-    public async Task Metadata_HasFourMembers_WithTheLocatorNonNullAndTheIdsNullable()
+    public async Task Metadata_EmitsTheTwoFlatLocatorColumns_BothNonNull()
     {
         await using var table = await CreateTrackedAsync();
         await foreach (var batch in table.ReadAllWithMetadataAsync())
         {
-            var f = batch.Schema.GetFieldByName(DeltaTable.MetadataColumnName);
-            Assert.NotNull(f);
-            var st = (StructType)f!.DataType;
-            Assert.Equal(
-                new[] { "file_path", "row_index", "row_id", "row_commit_version" },
-                st.Fields.Select(x => x.Name).ToArray());
-            Assert.False(st.Fields[0].IsNullable);   // locator
-            Assert.False(st.Fields[1].IsNullable);   // locator
-            Assert.True(st.Fields[2].IsNullable);    // identity — NULL when underivable
-            Assert.True(st.Fields[3].IsNullable);
+            var path = batch.Schema.GetFieldByName(MetadataPredicate.FilePathColumn);
+            var idx = batch.Schema.GetFieldByName(MetadataPredicate.RowIndexColumn);
+            Assert.NotNull(path);
+            Assert.NotNull(idx);
+            Assert.IsType<StringType>(path!.DataType);
+            Assert.IsType<Int64Type>(idx!.DataType);
+            Assert.False(path.IsNullable);
+            Assert.False(idx.IsNullable);
+            // The identity pair is NOT ours to emit — one concept, one owner.
+            Assert.Null(batch.Schema.GetFieldByName(
+                EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName));
             break;
         }
     }
@@ -205,23 +243,28 @@ public class MetadataColumnTests : IDisposable
         }
     }
 
-    /// <summary>Without row tracking the SHAPE is unchanged — still four members — and the identity half is
-    /// simply all-null, so a consumer binds one schema regardless of table configuration.</summary>
+    /// <summary>Without row tracking the LOCATOR is unaffected — a row always has a physical location — while
+    /// the IDENTITY surface REFUSES the table rather than serving all-null columns, which would claim these
+    /// rows have no identity when the truth is that this table does not track it.</summary>
     [Fact]
-    public async Task WithoutRowTracking_ShapeIsUnchanged_AndTheIdsAreNull()
+    public async Task WithoutRowTracking_TheLocatorStillWorks_AndTheIdentitySurfaceRefuses()
     {
         await using var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(_tempDir), BuildSchema());
         await table.WriteAsync([BuildBatch(1, 2)]);
         await table.WriteAsync([BuildBatch(11, 2)]);
 
-        var rows = await ReadMetaAsync(table);
+        var rows = await ReadMetaAsync(table, withIdentity: false);
         Assert.Equal(4, rows.Count);
-        Assert.All(rows, r => Assert.Null(r.RowId));
-        Assert.All(rows, r => Assert.Null(r.Version));
-        // the locator half is still fully populated and usable
         Assert.All(rows, r => Assert.False(string.IsNullOrEmpty(r.FilePath)));
         Assert.Equal(2, rows.Select(r => r.FilePath).Distinct().Count());
+
+        await Assert.ThrowsAnyAsync<Exception>(async () =>
+        {
+            await foreach (var _ in table.ReadAllWithRowTrackingAsync(columns: null, filter: null))
+            {
+            }
+        });
     }
 
     /// <summary>THE ROUND TRIP, and the point of the whole surface: read with <c>_metadata</c>, change values,
@@ -241,33 +284,20 @@ public class MetadataColumnTests : IDisposable
 
             var pathB = new StringArray.Builder();
             var idxB = new Int64Array.Builder();
-            var ridB = new Int64Array.Builder();
-            var verB = new Int64Array.Builder();
             var newIds = new Int64Array.Builder();
             foreach (var r in rows)
             {
                 pathB.Append(r.FilePath);
                 idxB.Append(r.RowIndex);
-                ridB.AppendNull();          // identity members are ignored by the update — physical addressing
-                verB.AppendNull();
                 newIds.Append(r.Id + 1000);
             }
-            var metaType = new StructType(new List<Field>
-            {
-                new("file_path", StringType.Default, false),
-                new("row_index", Int64Type.Default, false),
-                new("row_id", Int64Type.Default, true),
-                new("row_commit_version", Int64Type.Default, true),
-            });
-            var metaArr = new StructArray(metaType, rows.Count,
-                new IArrowArray[] { pathB.Build(), idxB.Build(), ridB.Build(), verB.Build() },
-                ArrowBuffer.Empty, 0);
             var updSchema = new Apache.Arrow.Schema.Builder()
-                .Field(new Field(DeltaTable.MetadataColumnName, metaType, false))
+                .Field(new Field(MetadataPredicate.FilePathColumn, StringType.Default, false))
+                .Field(new Field(MetadataPredicate.RowIndexColumn, Int64Type.Default, false))
                 .Field(new Field("id", Int64Type.Default, false))
                 .Build();
             var updates = new RecordBatch(updSchema,
-                new IArrowArray[] { metaArr, newIds.Build() }, rows.Count);
+                new IArrowArray[] { pathB.Build(), idxB.Build(), newIds.Build() }, rows.Count);
 
             await table.UpdateBySelectionAsync(updates);
         }
@@ -411,18 +441,22 @@ public class MetadataColumnTests : IDisposable
                 if (keep.Count == 0)
                     continue;
 
-                // carry _metadata through untouched; rewrite the value column
-                var meta = EngineeredWood.Arrow.ArrowCompute.Take(batch.Column(DeltaTable.MetadataColumnName), keep);
+                // carry the locator columns through untouched; rewrite the value column
+                var metaPath = EngineeredWood.Arrow.ArrowCompute.Take(
+                    batch.Column(MetadataPredicate.FilePathColumn), keep);
+                var metaIdx = EngineeredWood.Arrow.ArrowCompute.Take(
+                    batch.Column(MetadataPredicate.RowIndexColumn), keep);
                 var newIds = new Int64Array.Builder();
                 foreach (int i in keep)
                     newIds.Append(ids.GetValue(i)!.Value * 10);
 
                 updateBatches.Add(new RecordBatch(
                     new Apache.Arrow.Schema.Builder()
-                        .Field(batch.Schema.GetFieldByName(DeltaTable.MetadataColumnName)!)
+                        .Field(batch.Schema.GetFieldByName(MetadataPredicate.FilePathColumn)!)
+                        .Field(batch.Schema.GetFieldByName(MetadataPredicate.RowIndexColumn)!)
                         .Field(new Field("id", Int64Type.Default, false))
                         .Build(),
-                    new IArrowArray[] { meta, newIds.Build() }, keep.Count));
+                    new IArrowArray[] { metaPath, metaIdx, newIds.Build() }, keep.Count));
             }
 
             // one call per batch of changes; each addresses exactly its own rows
@@ -628,24 +662,18 @@ public class MetadataColumnTests : IDisposable
     public async Task UpdateBySelection_StalePath_Throws()
     {
         await using var table = await CreateTrackedAsync();
-        var metaType = new StructType(new List<Field>
-        {
-            new("file_path", StringType.Default, false),
-            new("row_index", Int64Type.Default, false),
-        });
-        var metaArr = new StructArray(metaType, 1,
+        var updates = new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field(MetadataPredicate.FilePathColumn, StringType.Default, false))
+                .Field(new Field(MetadataPredicate.RowIndexColumn, Int64Type.Default, false))
+                .Field(new Field("id", Int64Type.Default, false))
+                .Build(),
             new IArrowArray[]
             {
                 new StringArray.Builder().Append("part-not-here.parquet").Build(),
                 new Int64Array.Builder().Append(0L).Build(),
-            },
-            ArrowBuffer.Empty, 0);
-        var updates = new RecordBatch(
-            new Apache.Arrow.Schema.Builder()
-                .Field(new Field(DeltaTable.MetadataColumnName, metaType, false))
-                .Field(new Field("id", Int64Type.Default, false))
-                .Build(),
-            new IArrowArray[] { metaArr, new Int64Array.Builder().Append(99L).Build() }, 1);
+                new Int64Array.Builder().Append(99L).Build(),
+            }, 1);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             async () => await table.UpdateBySelectionAsync(updates));
@@ -932,8 +960,7 @@ public class MetadataColumnTests : IDisposable
         await foreach (var batch in table.ReadAllWithMetadataAsync(null, pred))
         {
             var ids = (Int64Array)batch.Column("id");
-            var meta = (StructArray)batch.Column(DeltaTable.MetadataColumnName);
-            var path = (StringArray)meta.Fields[0];
+            var path = (StringArray)batch.Column(MetadataPredicate.FilePathColumn);
             for (int i = 0; i < batch.Length; i++)
                 filtered.Add(new MetaRow(ids.GetValue(i)!.Value, path.GetString(i), 0, null, null));
         }
