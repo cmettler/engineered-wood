@@ -100,6 +100,14 @@ public class StagedDataFileParityTests : IDisposable
         var withDv = check.CurrentSnapshot.ActiveFiles.Values.Where(f => f.DeletionVector is not null).ToList();
         Assert.Single(withDv);
         Assert.Equal(2L, withDv[0].DeletionVector!.Cardinality);
+
+        // And its stats are marked tightBounds=false: they still describe the PHYSICAL rows, which are a
+        // loose superset once a vector hides some, so a reader must not treat min/max as exact. Asserted
+        // because nothing else would notice it going missing — the rows read correctly either way, and a
+        // pruner trusting tight bounds on a loose file skips files that do hold matching rows. (Found by
+        // mutation-testing this suite while extracting the upstream offer: the mutant SURVIVED.)
+        Assert.NotNull(withDv[0].Stats);
+        Assert.Contains("\"tightBounds\":false", withDv[0].Stats!.Replace(" ", string.Empty));
     }
 
     /// <summary>No positions supplied is exactly the synchronous overload — no vector, no loosened stats.</summary>
