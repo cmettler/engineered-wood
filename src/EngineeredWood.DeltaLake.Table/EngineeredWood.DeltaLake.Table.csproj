@@ -25,10 +25,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Apache.Arrow brings Apache.Arrow.Scalars transitively, which is where the variant scalar toolkit
+         (VariantValue / VariantReader / VariantBuilder) lives — so decoding and encoding a variant blob
+         needs no further package. The SHREDDING toolkit (Apache.Arrow.Operations) is deliberately NOT
+         referenced here: shredding is a physical-layout concern owned by EngineeredWood.Parquet's
+         VariantShredding, which this project calls in both directions. -->
     <PackageReference Include="Apache.Arrow" Version="23.0.0" />
-    <!-- The variant shredding toolkit (ShredSchemaInferer / VariantShredder / ShreddedVariantArrayBuilder /
-         GetLogicalVariantValue) used by VariantTransport — the blob⇄VariantArray host-boundary form. -->
-    <PackageReference Include="Apache.Arrow.Operations" Version="23.0.0" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
