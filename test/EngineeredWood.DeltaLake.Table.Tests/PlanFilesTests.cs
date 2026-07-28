@@ -3,16 +3,21 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
-using EngineeredWood.DeltaLake.Table;
+using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.IO.Local;
+using Ex = EngineeredWood.Expressions.Expressions;
 
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// <see cref="DeltaTable.PlanFiles"/> — the scan-planning API a host uses when it reads the active set
-/// through its own reader. The properties under test are the ones that make the returned ordinal usable
-/// as a row address: it is assigned BEFORE pruning, it is stable across filters, and it is the SAME
-/// ordinal the transient row id encodes and the DML paths decode.
+/// <see cref="DeltaTable.PlanFiles"/> — the scan-planning surface a host uses when it assembles its own
+/// read. The verdict half is the same evaluator the read paths use (covered by
+/// <see cref="PredicatePushdownTests"/>); what is pinned HERE is the ordinal contract, because that is what
+/// makes a planned file composable with the row-level seam: ordinals are the path-sorted position in the
+/// FULL active set, they agree with the transient-rowid encoding, they survive pruning ungapped-renumbered,
+/// and they address <see cref="DeltaTable.ComputeDeletionVectorActionsAsync"/>. A renumbering bug here is
+/// silent — a position fed back under the wrong ordinal deletes the wrong file's row.
 /// </summary>
 public class PlanFilesTests : IDisposable
 {
@@ -20,7 +25,7 @@ public class PlanFilesTests : IDisposable
 
     public PlanFilesTests()
     {
-        _tempDir = Path.Combine(Path.GetTempPath(), $"delta_planfiles_{Guid.NewGuid():N}");
+        _tempDir = Path.Combine(Path.GetTempPath(), $"delta_plan_{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
     }
 
@@ -31,6 +36,7 @@ public class PlanFilesTests : IDisposable
             try { Directory.Delete(_tempDir, recursive: true); } catch { }
         }
     }
+
 
     private static Apache.Arrow.Schema IdSchema { get; } = new Apache.Arrow.Schema.Builder()
         .Field(new Field("id", Int64Type.Default, false))
@@ -44,176 +50,240 @@ public class PlanFilesTests : IDisposable
         return new RecordBatch(IdSchema, [ids.Build()], count);
     }
 
-    private Task<DeltaTable> OpenAsync() => DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir)).AsTask();
+    private LocalTableFileSystem Fs => new(_tempDir);
 
-    /// <summary>Three commits => three files with disjoint id ranges: 0-9, 100-109, 200-209. Disjoint so a
-    /// range predicate prunes on min/max stats alone, and spread so exactly one file survives each bound.</summary>
-    private async Task WriteThreeFilesAsync()
+    /// <summary>
+    /// Three files with disjoint id ranges. Data files are named by GUID, so the PATH sort that assigns
+    /// ordinals is uncorrelated with write order — a test must never assume "written third == ordinal 2".
+    /// </summary>
+    private static async Task<DeltaTable> ThreeFileTableAsync(
+        LocalTableFileSystem fs, bool enableDeletionVectors = false)
     {
-        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema);
-        await table.WriteAsync([Batch(0, 10)]);
-        await table.WriteAsync([Batch(100, 10)]);
-        await table.WriteAsync([Batch(200, 10)]);
+        var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: enableDeletionVectors);
+        for (int i = 0; i < 3; i++)
+            await table.WriteAsync([Batch(i * 100, 10)]); // 0..9, 100..109, 200..209
+        return table;
     }
 
-    [Fact]
-    public async Task PlanFiles_NoFilter_ReturnsEveryActiveFileInPathSortedOrderWithDenseOrdinals()
+    /// <summary>
+    /// The ids living in each file, keyed by the file's ordinal — read out of the transient rowid encoding
+    /// rather than assumed, so the ordinal→content mapping under test comes from the read path itself.
+    /// </summary>
+    private static async Task<Dictionary<int, List<long>>> IdsByOrdinalAsync(DeltaTable table)
     {
-        await WriteThreeFilesAsync();
-        await using var table = await OpenAsync();
-
-        var plan = table.PlanFiles();
-
-        Assert.Equal(3, plan.Count);
-        // Ordinals are dense 0..n-1 when nothing is pruned, and the paths ascend ordinally — the sort
-        // the row-id contract depends on.
-        Assert.Equal([0, 1, 2], plan.Select(p => p.Ordinal).ToArray());
-        var paths = plan.Select(p => p.File.Path).ToArray();
-        Assert.Equal(paths.OrderBy(p => p, StringComparer.Ordinal).ToArray(), paths);
-    }
-
-    [Fact]
-    public async Task PlanFiles_Pruned_KeepsThePrePruneOrdinalAndLeavesAGap()
-    {
-        await WriteThreeFilesAsync();
-        await using var table = await OpenAsync();
-
-        var all = table.PlanFiles();
-        // Which file holds ids >= 200 is layout-dependent (the paths are uuids, so the path sort is not
-        // the write order) — so find it in the unfiltered plan rather than assuming an ordinal.
-        var expected = await OrdinalHoldingAsync(table, 200);
-
-        var plan = table.PlanFiles(EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", 200L));
-
-        var single = Assert.Single(plan);
-        // THE property: the ordinal is a position in the full active set, not an index into this list.
-        // Were it post-prune it would be 0 whenever exactly one file survives.
-        Assert.Equal(expected, single.Ordinal);
-        Assert.Equal(3, all.Count);
-    }
-
-    [Fact]
-    public async Task PlanFiles_OrdinalsAgreeAcrossFilters()
-    {
-        await WriteThreeFilesAsync();
-        await using var table = await OpenAsync();
-
-        var unfiltered = table.PlanFiles().ToDictionary(p => p.File.Path, p => p.Ordinal);
-
-        // Every filter that keeps a file must report that file's SAME ordinal — otherwise adding a
-        // predicate would silently change what a row id means.
-        foreach (long lowerBound in new long[] { 0, 100, 200 })
-        {
-            var filtered = table.PlanFiles(
-                EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", lowerBound));
-            Assert.NotEmpty(filtered);
-            foreach (var (file, ordinal) in filtered)
-                Assert.Equal(unfiltered[file.Path], ordinal);
-        }
-    }
-
-    [Fact]
-    public async Task PlanFiles_OrdinalDecodedFromARowIdIdentifiesTheFileThatHoldsTheRow()
-    {
-        await WriteThreeFilesAsync();
-        await using var table = await OpenAsync();
-
-        // The contract a host reading the active set itself must reproduce: `rowid >> 40` names a file in
-        // the plan, and it is the file the row actually LIVES in. Checked against file CONTENT (each
-        // file's recorded min/max must bracket the row's id) rather than against another ordinal, so the
-        // assertion does not just compare PlanFiles with itself — the three id ranges are disjoint, so
-        // exactly one file can bracket each row and an off-by-one ordinal cannot pass.
-        var byOrdinal = table.PlanFiles().ToDictionary(p => p.Ordinal, p => p.File);
-        int rowsChecked = 0;
-
+        var byOrdinal = new Dictionary<int, List<long>>();
         await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
         {
             var ids = (Int64Array)batch.Column("id");
-            var rids = (Int64Array)batch.Column("_metadata.row_id");
+            var rids = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
             for (int i = 0; i < batch.Length; i++)
             {
-                long id = ids.GetValue(i)!.Value;
-                int ordinal = (int)(rids.GetValue(i)!.Value >> 40);
-
-                Assert.True(byOrdinal.ContainsKey(ordinal), $"rowid decoded ordinal {ordinal} is not in the plan");
-                var stats = EngineeredWood.DeltaLake.Actions.ColumnStats.Parse(byOrdinal[ordinal].Stats);
-                Assert.NotNull(stats);
-                Assert.Equal(id / 100 * 100, stats!.MinValues!["id"].GetInt64());   // 0, 100 or 200
-                rowsChecked++;
+                int ordinal = TransientRowAddress.FileOrdinal(rids.GetValue(i)!.Value);
+                if (!byOrdinal.TryGetValue(ordinal, out var list))
+                    byOrdinal[ordinal] = list = [];
+                list.Add(ids.GetValue(i)!.Value);
             }
         }
-
-        Assert.Equal(30, rowsChecked);
+        return byOrdinal;
     }
 
     [Fact]
-    public async Task PlanFiles_CallerSuppliedSnapshot_PlansThatVersionsFileSet()
+    public async Task NoFilter_ReturnsEveryActiveFile_OrdinalsAscendingFromZero()
     {
-        await WriteThreeFilesAsync();
-        await using var table = await OpenAsync();
+        await using var table = await ThreeFileTableAsync(Fs);
 
-        // Commit 0 is CreateAsync's schema-only commit, so the three appends are versions 1..3 and each
-        // adds one file. Planning against a caller-supplied snapshot is what lets a rewrite list and
-        // commit against ONE version, so a writer landing between two opens cannot manufacture a conflict.
-        Assert.Empty(table.PlanFiles(snapshot: await table.GetSnapshotAtVersionAsync(0)));
-        Assert.Single(table.PlanFiles(snapshot: await table.GetSnapshotAtVersionAsync(1)));
-        Assert.Equal(2, table.PlanFiles(snapshot: await table.GetSnapshotAtVersionAsync(2)).Count);
-        Assert.Equal(3, table.PlanFiles().Count);   // no snapshot => CurrentSnapshot
+        var planned = table.PlanFiles();
+
+        Assert.Equal(3, planned.Count);
+        Assert.Equal(new[] { 0, 1, 2 }, planned.Select(p => p.FileOrdinal).ToArray());
+        // A null filter is how a caller enumerates the addressing domain — every active file must be there.
+        Assert.Equal(
+            table.CurrentSnapshot.ActiveFiles.Values.Select(f => f.Path).OrderBy(p => p, StringComparer.Ordinal),
+            planned.Select(p => p.File.Path));
     }
 
     [Fact]
-    public async Task PlanFiles_PruneSchemaOverride_DecidesWhetherAReferenceResolves()
+    public async Task Ordinals_ArePathSorted()
     {
-        await WriteThreeFilesAsync();
-        await using var table = await OpenAsync();
+        await using var table = await ThreeFileTableAsync(Fs);
 
-        var filter = EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", 200L);
+        var paths = table.PlanFiles().Select(p => p.File.Path).ToList();
 
-        // Against the real schema the predicate resolves and two of three files prune away.
-        Assert.Single(table.PlanFiles(filter));
+        // string.CompareOrdinal, matching OrderedActiveFiles — not culture-aware, not StringComparer default.
+        var expected = paths.OrderBy(p => p, StringComparer.Ordinal).ToList();
+        Assert.Equal(expected, paths);
+    }
 
-        // Against a schema in which "id" does not exist the reference is unresolvable, so pruning must
-        // keep every file — pruning never guesses. That the count changes is the proof the parameter is
-        // consulted rather than ignored.
-        var unrelated = new EngineeredWood.DeltaLake.Schema.StructType
+    [Fact]
+    public async Task Ordinals_AgreeWithTheTransientRowIdEncoding()
+    {
+        await using var table = await ThreeFileTableAsync(Fs);
+
+        var planned = table.PlanFiles();
+        var idsByOrdinal = await IdsByOrdinalAsync(table);
+
+        // The ordinal PlanFiles reports for a file must be the ordinal the read path packs into that file's
+        // rowids — otherwise a host correlating planned files with rowids silently crosses files. Tie the
+        // two together through the file's OWN statistics: the min id in the planned file's stats must be the
+        // min id the rowid encoding attributes to that ordinal.
+        Assert.Equal(3, idsByOrdinal.Count);
+        foreach (var p in planned)
         {
-            Fields =
-            [
-                new EngineeredWood.DeltaLake.Schema.StructField
-                {
-                    Name = "other",
-                    Type = new EngineeredWood.DeltaLake.Schema.PrimitiveType { TypeName = "long" },
-                    Nullable = true,
-                },
-            ],
-        };
-        Assert.Equal(3, table.PlanFiles(filter, pruneSchema: unrelated).Count);
-    }
-
-    [Fact]
-    public async Task PlanFiles_TableWithNoActiveFiles_ReturnsEmpty()
-    {
-        await using (var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema))
-        {
-            await table.WriteAsync([Batch(0, 10)]);
-            await table.DeleteAsync(EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", 0L));
+            Assert.True(idsByOrdinal.ContainsKey(p.FileOrdinal),
+                $"ordinal {p.FileOrdinal} has no rows in the rowid encoding");
+            long statsMin = System.Text.Json.JsonDocument.Parse(p.File.Stats!)
+                .RootElement.GetProperty("minValues").GetProperty("id").GetInt64();
+            Assert.Equal(idsByOrdinal[p.FileOrdinal].Min(), statsMin);
         }
 
-        await using var reader = await OpenAsync();
-        Assert.Empty(reader.PlanFiles());
+        // Each file holds exactly one of the three ranges, and each range appears once.
+        var ranges = idsByOrdinal.Values.Select(v => v.Min()).OrderBy(v => v).ToArray();
+        Assert.Equal([0L, 100L, 200L], ranges);
     }
 
-    /// <summary>The ordinal encoded in the transient rowids of the rows whose id is <paramref name="id"/>.</summary>
-    private static async Task<int> OrdinalHoldingAsync(DeltaTable table, long id)
+    [Fact]
+    public async Task PrunedFile_StillConsumesItsOrdinal()
     {
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await using var table = await ThreeFileTableAsync(Fs);
+
+        // Target whichever file happens to sort LAST, so a renumbering bug is visible: the survivor's
+        // ordinal must stay 2, not collapse to 0.
+        var idsByOrdinal = await IdsByOrdinalAsync(table);
+        long targetId = idsByOrdinal[2][0];
+
+        var planned = table.PlanFiles(Ex.Equal("id", targetId));
+
+        var survivor = Assert.Single(planned);
+        Assert.Equal(2, survivor.FileOrdinal);
+    }
+
+    [Fact]
+    public async Task PruningTheFirstFile_LeavesTheSequenceGapped()
+    {
+        await using var table = await ThreeFileTableAsync(Fs);
+        var idsByOrdinal = await IdsByOrdinalAsync(table);
+
+        // Everything except ordinal 0's range: the result must be [1, 2], never [0, 1].
+        var keep = new[] { idsByOrdinal[1][0], idsByOrdinal[2][0] };
+        var planned = table.PlanFiles(Ex.In("id", keep[0], keep[1]));
+
+        Assert.Equal(new[] { 1, 2 }, planned.Select(p => p.FileOrdinal).ToArray());
+    }
+
+    [Fact]
+    public async Task PlannedOrdinal_AddressesComputeDeletionVectorActions()
+    {
+        // The contract that matters end-to-end: plan → feed the ordinal into the DV seam → the row that
+        // disappears is the one the plan pointed at.
+        await using var table = await ThreeFileTableAsync(Fs, enableDeletionVectors: true);
+        var idsByOrdinal = await IdsByOrdinalAsync(table);
+
+        long targetId = idsByOrdinal[2][0];
+        var planned = table.PlanFiles(Ex.Equal("id", targetId));
+        var survivor = Assert.Single(planned);
+
+        // Delete the target row by its absolute in-file position, keyed by the PLANNED ordinal.
+        int position = idsByOrdinal[survivor.FileOrdinal].IndexOf(targetId);
+        var (dvActions, rowsDeleted) = await table.ComputeDeletionVectorActionsAsync(
+            new Dictionary<int, IReadOnlyCollection<long>> { [survivor.FileOrdinal] = new long[] { position } });
+        Assert.Equal(1, rowsDeleted);
+
+        await table.CommitDataFilesAsync([], DeltaWriteMode.Append, extraActions: dvActions, operation: "DELETE");
+
+        await using var check = await DeltaTable.OpenAsync(Fs);
+        var remaining = new List<long>();
+        await foreach (var batch in check.ReadAllAsync())
         {
             var ids = (Int64Array)batch.Column("id");
-            var rids = (Int64Array)batch.Column("_metadata.row_id");
             for (int i = 0; i < batch.Length; i++)
-                if (ids.GetValue(i)!.Value == id)
-                    return (int)(rids.GetValue(i)!.Value >> 40);
+                remaining.Add(ids.GetValue(i)!.Value);
         }
-        throw new InvalidOperationException($"no row with id {id}");
+
+        Assert.Equal(29, remaining.Count);
+        Assert.DoesNotContain(targetId, remaining);
+    }
+
+    [Fact]
+    public async Task Snapshot_PlansAgainstThePinnedVersion_NotCurrent()
+    {
+        await using var table = await ThreeFileTableAsync(Fs);
+        var pinned = table.CurrentSnapshot;
+        // Captured BEFORE the append: identify the pinned set by path identity. Matching a filename against
+        // the row range it holds does not work — data files are GUID-named, and a GUID contains any given
+        // 3-hex-digit string often enough to fail in CI (7c7e889d3007… contains "300").
+        var pinnedPaths = pinned.ActiveFiles.Values
+            .Select(f => f.Path).OrderBy(p => p, StringComparer.Ordinal).ToArray();
+
+        await table.WriteAsync([Batch(300, 10)]); // a fourth file lands
+
+        Assert.Equal(4, table.PlanFiles().Count);
+        // Planning against the pinned snapshot must not see it — this is what lets a rewrite list and commit
+        // against one version without a concurrent writer manufacturing a conflict.
+        var atPinned = table.PlanFiles(filter: null, snapshot: pinned);
+        Assert.Equal(3, atPinned.Count);
+        Assert.Equal(new[] { 0, 1, 2 }, atPinned.Select(p => p.FileOrdinal).ToArray());
+        // PlanFiles returns path-sorted, so this is an exact set comparison: the pinned plan is the
+        // pre-append active set and nothing else.
+        Assert.Equal(pinnedPaths, atPinned.Select(p => p.File.Path).ToArray());
+    }
+
+    [Fact]
+    public async Task DeletionVector_IsReportedNotResolved()
+    {
+        await using var table = await ThreeFileTableAsync(Fs, enableDeletionVectors: true);
+        var idsByOrdinal = await IdsByOrdinalAsync(table);
+
+        long targetId = idsByOrdinal[0][0];
+        await table.DeleteAsync(Ex.Equal("id", targetId));
+
+        var planned = table.PlanFiles();
+        var withDv = planned.Where(p => p.File.DeletionVector is not null).ToList();
+
+        // PlanFiles hands the DV back untouched — it does not filter rows and does not drop the file.
+        var dvFile = Assert.Single(withDv);
+        Assert.NotNull(dvFile.File.DeletionVector);
+        Assert.Equal(3, planned.Count);
+    }
+
+    [Fact]
+    public async Task SchemaOverride_PendingRename_RestoresPruneQuality()
+    {
+        var fs = Fs;
+        await using var table = await DeltaTable.CreateAsync(
+            fs, IdSchema, columnMappingMode: ColumnMappingMode.Name);
+        for (int i = 0; i < 3; i++)
+            await table.WriteAsync([Batch(i * 100, 10)]);
+
+        // "ALTER TABLE RENAME COLUMN id TO key" — computed, NOT committed.
+        var pendingRename = table.ComputeRenameColumn("id", "key");
+
+        // Against the snapshot's schema the new name resolves to nothing: Unknown keeps every file. Correct,
+        // but useless — this is the prune quality the override exists to restore.
+        Assert.Equal(3, table.PlanFiles(Ex.Equal("key", 105L)).Count);
+
+        // With the pending schema the name resolves through the field's unchanged PHYSICAL name and prunes.
+        var planned = table.PlanFiles(Ex.Equal("key", 105L), schemaOverride: pendingRename.NewSchema);
+        var survivor = Assert.Single(planned);
+
+        var idsByOrdinal = await IdsByOrdinalAsync(table);
+        Assert.Contains(105L, idsByOrdinal[survivor.FileOrdinal]);
+    }
+
+    [Fact]
+    public async Task UnknownColumn_KeepsEveryFile()
+    {
+        await using var table = await ThreeFileTableAsync(Fs);
+
+        // An unresolvable reference evaluates Unknown — pruning must never guess, so nothing is dropped.
+        Assert.Equal(3, table.PlanFiles(Ex.Equal("no_such_column", 1L)).Count);
+    }
+
+    [Fact]
+    public async Task AfterDispose_Throws()
+    {
+        var table = await ThreeFileTableAsync(Fs);
+        await table.DisposeAsync();
+
+        Assert.Throws<ObjectDisposedException>(() => table.PlanFiles());
     }
 }

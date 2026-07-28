@@ -85,7 +85,7 @@ public class FileRowSelectionTests : IDisposable
     /// <summary>PlanFiles is the ordinal↔path dictionary a caller pairs with these overloads — the same
     /// planner that produces the ordinals a positional row identifier packs.</summary>
     private static Dictionary<int, string> PathsByOrdinal(DeltaTable table, Snapshot.Snapshot snapshot)
-        => table.PlanFiles(snapshot: snapshot).ToDictionary(p => p.Ordinal, p => p.File.Path);
+        => table.PlanFiles(snapshot: snapshot).ToDictionary(p => p.FileOrdinal, p => p.File.Path);
 
     /// <summary>The two keyings name the same rows: deleting via paths and via the ordinals those paths sit
     /// at produces action sets that differ only in deletion-vector identity (each run writes a fresh DV

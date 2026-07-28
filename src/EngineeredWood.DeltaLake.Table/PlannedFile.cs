@@ -6,19 +6,25 @@ using EngineeredWood.DeltaLake.Actions;
 namespace EngineeredWood.DeltaLake.Table;
 
 /// <summary>
-/// One file a scan has to read, as returned by
-/// <see cref="DeltaTable.PlanFiles(EngineeredWood.Expressions.Predicate, Snapshot.Snapshot, Schema.StructType)"/>:
-/// the <c>add</c> action, plus that file's ordinal in the snapshot's PATH-SORTED active set.
-///
-/// <para><see cref="Ordinal"/> is assigned BEFORE pruning, so it is a position in the FULL active set
-/// and not an index into the returned list. That is what makes it usable as a row address — the
-/// transient row id is <c>(Ordinal &lt;&lt; 40) | absolute-in-file position</c>, and adding a filter must
-/// not change what a row id means. Pruning therefore leaves GAPS in the ordinals of a plan, and the
-/// ordinals of two plans over the same snapshot agree regardless of their filters.</para>
-///
-/// <para>A struct rather than a class record (unlike Iceberg's <c>ScanResult</c>) because a plan holds
-/// one per file — thousands on a large table — and there is no identity to preserve.</para>
+/// One data file surviving <see cref="DeltaTable.PlanFiles"/>' prune, paired with its ordinal in the
+/// snapshot's file-addressing domain.
 /// </summary>
-/// <param name="File">The <c>add</c> action: path, partition values, stats, deletion vector, row-tracking ids.</param>
-/// <param name="Ordinal">Zero-based position in the snapshot's path-sorted active set, assigned before pruning.</param>
-public readonly record struct PlannedFile(AddFile File, int Ordinal);
+/// <param name="FileOrdinal">
+/// The file's position in the snapshot's PATH-SORTED active set — the coordinate the row-level seam is
+/// addressed by: the key of <see cref="DeltaTable.ComputeDeletionVectorActionsAsync"/>'
+/// <c>positionsByOrdinal</c>, of <see cref="DeltaTable.RebaseDvDmlActionsAsync"/>'
+/// <c>newPositionsByOrdinal</c>, and of <see cref="DeltaTable.CommitDataFilesAsync"/>'
+/// <c>deletedPositionsByFileIndex</c>; also the high bits of a transient rowid
+/// (<c>(fileOrdinal &lt;&lt; 40) | absolute-in-file position</c>).
+/// <para>
+/// Ordinals are assigned over the WHOLE active set BEFORE pruning, so a pruned file still consumes its
+/// ordinal and the returned sequence is ascending but gapped. They are meaningful only against the
+/// snapshot they were planned from: a concurrent append can insert a path anywhere in the sort order and
+/// renumber everything after it, so a caller holding ordinals across a version change must re-plan.
+/// </para>
+/// </param>
+/// <param name="File">The <c>add</c> action, carrying the path, partition values, statistics, deletion
+/// vector, and row-tracking fields.</param>
+public readonly record struct PlannedFile(
+    int FileOrdinal,
+    AddFile File);
