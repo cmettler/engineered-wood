@@ -82,6 +82,87 @@ public class FileRowSelectionTests : IDisposable
         return ids;
     }
 
+    /// <summary>
+    /// The case a range check CANNOT catch, and the reason a file ordinal is the wrong KEY for a DML boundary
+    /// even now that <see cref="TransientRowAddress"/> gives the encoding a name and a documented contract.
+    ///
+    /// <para>A concurrent commit that REMOVES an earlier file renumbers the path-sorted set, so an ordinal
+    /// captured before it stays perfectly IN RANGE and silently names a DIFFERENT file. The ordinal form
+    /// therefore does not fail, and does not merely delete nothing — it deletes THE WRONG ROW. Validating an
+    /// ordinal against the active count cannot tell that case from a correct one; only a key that says WHICH
+    /// FILE can. Given the same intent, the path-keyed form deletes exactly the row that was selected.</para>
+    /// </summary>
+    [Fact]
+    public async Task OrdinalKeyed_AfterAConcurrentRemoveRenumbersTheSet_DeletesTheWRONGRow()
+    {
+        await using var created = await CreateThreeFileTableAsync();
+        var pinned = created.CurrentSnapshot;
+        var pathsAtPin = PathsByOrdinal(created, pinned);
+        var idsAtPin = await FirstIdByOrdinalAsync();
+
+        // The row we intend to delete: position 0 of the file at ordinal 1, identified BOTH ways at the pin.
+        // Ordinal 1 is the interesting choice — after an earlier file is removed it still EXISTS, so nothing
+        // can reject it, but it has come to mean the file that was at ordinal 2.
+        string intendedPath = pathsAtPin[1];
+        long intendedId = idsAtPin[1];
+
+        // A concurrent writer removes the file at ordinal 0 outright (copy-on-write delete of all its rows).
+        await using (var other = await OpenAsync())
+        {
+            await other.DeleteBySelectionAsync(new FileRowSelection(
+                new Dictionary<string, IReadOnlyCollection<long>>
+                {
+                    [pathsAtPin[0]] = new long[] { 0, 1, 2 },
+                }));
+        }
+
+        await using var table = await OpenAsync();
+        var pathsNow = PathsByOrdinal(table, table.CurrentSnapshot);
+        // Ordinal 1 still EXISTS — so a range check passes — but it no longer means the same file.
+        Assert.True(pathsNow.ContainsKey(1));
+        Assert.NotEqual(pathsAtPin[1], pathsNow[1]);
+
+        long idNowAtOrdinal1 = (await FirstIdByOrdinalAsync())[1];
+        Assert.NotEqual(intendedId, idNowAtOrdinal1);
+
+        // Reuse the captured ordinal, exactly as a caller holding a stale row identifier would. It resolves,
+        // and it removes a row nobody selected.
+        await table.DeleteByRowIdsViaVectorsAsync(new[] { TransientRowAddress.Pack(1, 0) });
+        var survivors = await ReadIdsFreshAsync();
+        Assert.DoesNotContain(idNowAtOrdinal1, survivors);
+        Assert.Contains(intendedId, survivors);
+
+        // The path did not change meaning, so the path-keyed form hits the row that was actually selected.
+        await table.DeleteBySelectionViaVectorsAsync(new FileRowSelection(
+            new Dictionary<string, IReadOnlyCollection<long>> { [intendedPath] = new long[] { 0 } }));
+        Assert.DoesNotContain(intendedId, await ReadIdsFreshAsync());
+    }
+
+    /// <summary>
+    /// The lowest id held by each file, keyed by that file's CURRENT path-sorted ordinal — read through
+    /// <see cref="DeltaTable.ReadAllWithRowIdsAsync"/>, whose trailing address column carries the very ordinal
+    /// the DML overloads are keyed by, so the mapping comes from the library rather than from an assumption
+    /// about write order (data files are GUID-named, so path order is uncorrelated with it).
+    /// </summary>
+    private async Task<Dictionary<int, long>> FirstIdByOrdinalAsync()
+    {
+        await using var table = await OpenAsync();
+        var lowest = new Dictionary<int, long>();
+        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        {
+            var ids = (Int64Array)batch.Column("id");
+            var addr = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
+            for (int i = 0; i < batch.Length; i++)
+            {
+                int ordinal = TransientRowAddress.FileOrdinal(addr.GetValue(i)!.Value);
+                long id = ids.GetValue(i)!.Value;
+                if (!lowest.TryGetValue(ordinal, out long cur) || id < cur)
+                    lowest[ordinal] = id;
+            }
+        }
+        return lowest;
+    }
+
     /// <summary>PlanFiles is the ordinal↔path dictionary a caller pairs with these overloads — the same
     /// planner that produces the ordinals a positional row identifier packs.</summary>
     private static Dictionary<int, string> PathsByOrdinal(DeltaTable table, Snapshot.Snapshot snapshot)
