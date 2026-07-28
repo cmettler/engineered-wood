@@ -1976,6 +1976,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             Files = transaction.RemovedPaths,
             Predicates = transaction.ReadPredicates,
+            WholeTable = transaction.ReadWholeTable,
         };
 
         // The row-tracking high-water mark is emitted ONCE for the whole transaction, from the counter each
@@ -2085,7 +2086,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
-        bool rowLevel = rowLevelDeletes is { Count: > 0 };
+        // Row-level reconciliation is a WriteSerializable behaviour. Under Serializable the whole point is that
+        // commit order IS the logical order, so two deletes touching one file conflict at FILE granularity even
+        // when their rows are disjoint — reconciling them would admit an interleaving the level exists to
+        // forbid. The gate covers both halves of the relaxation: the deletion-vector resolution below, and the
+        // read-set exemption that follows from it.
+        bool rowLevel = rowLevelDeletes is { Count: > 0 }
+            && isolationLevel != IsolationLevel.Serializable;
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             baseSnapshot.Metadata.Configuration);
 
@@ -2165,8 +2172,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     currentActions = dataActions; // stable source; row-tracking ids re-derived below
                 }
 
+                // Under WriteSerializable a row-level delete's READS do not serialize: the row-level write
+                // validation above already established that no row this transaction removes was concurrently
+                // removed or moved beyond reach, and that is the whole guarantee WriteSerializable offers —
+                // commits may be reordered relative to reads, only writes may not conflict. Checking the read
+                // set as well would abort transactions the level is defined to admit (and does not merely
+                // narrow the exemption to reconciled paths: a file this transaction READ and did not touch can
+                // be compacted away by a concurrent writer without invalidating any row it deletes).
+                // Serializable keeps the full check — making commit order the logical order is what it is for.
+                var effectiveReads = rowLevel ? Concurrency.ReadSet.Blind : reads;
                 var verdict = Concurrency.ConflictChecker.Check(
-                    reads, plannedRemovePaths, pruner, isolationLevel, concurrent, resolvedPaths);
+                    effectiveReads, plannedRemovePaths, pruner, isolationLevel, concurrent, resolvedPaths);
                 if (verdict.HasConflict)
                     throw new DeltaConflictException(verdict.Message!);
 

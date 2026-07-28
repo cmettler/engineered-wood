@@ -69,6 +69,9 @@ public sealed class DeltaTransaction
     private readonly Dictionary<string, AppTransactionStage> _appTransactions = new(StringComparer.Ordinal);
     // Set by SetOperation: what the host says this transaction did, which beats the inference.
     private string? _operationOverride;
+    // Set by StageWholeTableRead: the host's scan had no pushable predicate, so every concurrent add and
+    // remove is potentially relevant. Strictly stronger than any predicate list.
+    private bool _readWholeTable;
     private bool _committed;
 
     internal DeltaTransaction(
@@ -334,6 +337,39 @@ public sealed class DeltaTransaction
         StageInternal(actions);
         _operations.Add("WRITE");
     }
+
+    /// <summary>
+    /// Declares a predicate this transaction READ, so a concurrent add that could satisfy it is a
+    /// concurrentAppend conflict.
+    ///
+    /// <para>The <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> /
+    /// <see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken)"/>
+    /// overloads record their own predicate, but a host that ran its own scan and staged the result has no
+    /// other way to say what that scan depended on — and a transaction that declares nothing is treated as
+    /// having read only the files it removes. Under
+    /// <see cref="IsolationLevel.Serializable"/> that is the difference between detecting a concurrent append
+    /// into the range this transaction read and silently accepting it.</para>
+    /// </summary>
+    public void StageReadPredicate(Expressions.Predicate predicate)
+    {
+        EnsureNotCommitted();
+        if (predicate is null)
+            throw new ArgumentNullException(nameof(predicate));
+        _readPredicates.Add(predicate);
+    }
+
+    /// <summary>
+    /// Declares that this transaction read the WHOLE table — the honest answer when a host's scan had no
+    /// pushable predicate, since every concurrent add and remove is then potentially relevant. Strictly
+    /// stronger than any set of predicates: it makes <see cref="StageReadPredicate"/> redundant.
+    /// </summary>
+    public void StageWholeTableRead()
+    {
+        EnsureNotCommitted();
+        _readWholeTable = true;
+    }
+
+    internal bool ReadWholeTable => _readWholeTable;
 
     /// <summary>
     /// Names the operation this transaction records in <c>commitInfo</c>, overriding what it would infer from
