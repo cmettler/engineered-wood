@@ -23,8 +23,14 @@ public static class SchemaConverter
     /// <c>arrow.parquet.variant</c> extension (struct storage) exchange variant values in this LEAF-binary
     /// form instead; <see cref="FromArrowSchema"/> accepts it unconditionally (marker-keyed), and
     /// <c>DeltaTableOptions.VariantTransportBlob</c> selects it for the read direction.
+    ///
+    /// <para>Named for this library rather than for any host, in the same spirit as
+    /// <c>TransientRowAddress.ColumnName</c>: it identifies engineered-wood's own host-boundary form, which
+    /// several hosts can speak. The marker exists ONLY in memory at that boundary — the Delta schema records
+    /// <c>variant</c> and the parquet file carries the canonical annotation — so it is not part of any table's
+    /// persisted form.</para>
     /// </summary>
-    public const string VariantTransportExtensionName = "fabricator.variant";
+    public const string VariantTransportExtensionName = "ew.variant_transport";
 
     private const string ArrowExtensionNameKey = "ARROW:extension:name";
 

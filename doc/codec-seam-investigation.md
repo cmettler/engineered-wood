@@ -77,7 +77,7 @@ item is a bug or missing feature with a known fix.
 
 Arrow-the-type-system held up. VARIANT initially failed to cross with `Unsupported Arrow type VARIANT`,
 but that was fixed by registering an Arrow extension type; the blob-instead-of-struct transport
-(`fabricator.variant`) works around an upstream **DuckDB appender bug** (`ArrowAppender::FinalizeChild`
+(`ew.variant_transport`) works around an upstream **DuckDB appender bug** (`ArrowAppender::FinalizeChild`
 walks the logical type's 4 children against an appender built for the internal type), not an Arrow
 limitation.
 
