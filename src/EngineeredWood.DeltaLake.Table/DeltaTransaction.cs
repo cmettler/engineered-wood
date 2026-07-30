@@ -363,6 +363,23 @@ public sealed class DeltaTransaction
     /// pushable predicate, since every concurrent add and remove is then potentially relevant. Strictly
     /// stronger than any set of predicates: it makes <see cref="StageReadPredicate"/> redundant.
     /// </summary>
+    /// <remarks>
+    /// <para><b>This declaration is NOT honoured for a row-level DELETE under</b>
+    /// <see cref="IsolationLevel.WriteSerializable"/><b>, which is the DEFAULT level.</b> There the commit
+    /// loop drops it (keeping any staged predicates), so a concurrent writer that DV-deletes or compacts away
+    /// a file this transaction merely READ does not abort it. Without that, declaring the whole table is
+    /// self-defeating for the case it exists to serve: the row-level write validation has already established
+    /// that no row this transaction removes was concurrently removed or moved beyond reach, yet
+    /// <c>WholeTable</c> makes EVERY concurrent add and remove match.</para>
+    /// <para>Stated here because it is a behaviour the caller cannot otherwise observe, and because it is a
+    /// DEPARTURE rather than an implementation of the level: in Delta, <c>concurrentDeleteRead</c> is
+    /// level-INDEPENDENT (Spark gates only <c>concurrentAppend</c> on isolation, via the blind-append test), so
+    /// a <c>dataChange=true</c> remove of a file the transaction read raises at both levels there. The
+    /// departure is deliberate and is fabricator's policy choice for Databricks-style row-level concurrency;
+    /// it is under discussion upstream (clast-project/engineered-wood#13, #15) and measurement against Spark
+    /// and delta-rs is what should settle it. <see cref="IsolationLevel.Serializable"/> keeps the full read
+    /// set and is unaffected.</para>
+    /// </remarks>
     public void StageWholeTableRead()
     {
         EnsureNotCommitted();
