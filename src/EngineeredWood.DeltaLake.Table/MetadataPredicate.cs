@@ -1,4 +1,4 @@
-// Copyright (c) clast-project. All rights reserved.
+﻿// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using EngineeredWood.Expressions;
@@ -6,7 +6,7 @@ using EngineeredWood.Expressions;
 namespace EngineeredWood.DeltaLake.Table;
 
 /// <summary>
-/// Lowers `_metadata` predicates onto a <see cref="FileRowSelection"/> — the symbolic evaluation that
+/// Lowers `_metadata` predicates onto a <see cref="RowSelection"/> — the symbolic evaluation that
 /// makes a metadata DELETE/UPDATE run without scanning: <c>_metadata.file_path</c> equality selects files
 /// by identity (no read, no stats), <c>_metadata.row_index</c> IN/equality names the positions. Supported
 /// shape: <c>(file_path = 'f' AND row_index IN (…))</c> — the two conjuncts in either order, a single
@@ -17,19 +17,19 @@ namespace EngineeredWood.DeltaLake.Table;
 public static class MetadataPredicate
 {
     /// <summary>The locator column names, CONSUMED here and DEFINED by the read surface that emits them
-    /// (<see cref="DeltaTable.MetadataFilePathColumn"/>) — so the dependency runs predicate → reader, not the
+    /// (<see cref="DeltaMetadataColumns"/>) — so the dependency runs predicate → reader, not the
     /// reverse. Kept as aliases because this type's callers read as predicate code.</summary>
     public const string FilePathColumn = DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.FilePathSuffix;
     public const string RowIndexColumn = DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIndexSuffix;
 
     /// <summary>Attempts the symbolic lowering. False = the shape is not (purely) a metadata selection.</summary>
-    public static bool TryLower(Predicate predicate, out FileRowSelection selection)
+    public static bool TryLower(Predicate predicate, out RowSelection selection)
     {
         selection = null!;
         var files = new Dictionary<string, HashSet<long>>(StringComparer.Ordinal);
         if (!TryCollect(predicate, files) || files.Count == 0)
             return false;
-        selection = new FileRowSelection(files.ToDictionary(
+        selection = RowSelection.ByPath(files.ToDictionary(
             kv => kv.Key, kv => (IReadOnlyCollection<long>)kv.Value.ToList(), StringComparer.Ordinal));
         return true;
     }

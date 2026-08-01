@@ -1,4 +1,4 @@
-// Copyright (c) clast-project. All rights reserved.
+﻿// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Runtime.CompilerServices;
@@ -2054,32 +2054,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             actions = extended;
         }
 
-        // Idempotent-producer versions become `txn` actions here rather than at staging time, so the caller
-        // does not hand-build one; their compare-and-set travels separately because the commit loop must
-        // re-validate it on every attempt (see DeltaTransaction.StageAppTransaction).
-        if (transaction.AppTransactions.Count > 0)
-        {
-            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var withTxns = new List<DeltaAction>(actions.Count + transaction.AppTransactions.Count);
-            withTxns.AddRange(actions);
-            foreach (var kv in transaction.AppTransactions)
-            {
-                withTxns.Add(new TransactionId
-                {
-                    AppId = kv.Key,
-                    Version = kv.Value.Version,
-                    LastUpdated = now,
-                });
-            }
-            actions = withTxns;
-        }
 
         return CommitOccAsync(
             baseSnapshot, actions, reads, transaction.RemovedPaths,
             transaction.IsolationLevel, transaction.EffectiveOperation, rebaseSafe: true,
             cancellationToken,
             rowLevelDeletes: transaction.DvEdits,
-            appTransactions: required);
+            appTransactions: required,
+            exemptRowLevelFromWholeTableRead: transaction.ExemptRowLevelFromWholeTableRead);
     }
 
     /// <summary>
@@ -2162,7 +2144,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool rebaseSafe,
         CancellationToken cancellationToken,
         IReadOnlyList<DeleteDvEdit>? rowLevelDeletes = null,
-        IReadOnlyList<DeltaTransaction.AppTransactionRequirement>? appTransactions = null)
+        IReadOnlyList<DeltaTransaction.AppTransactionRequirement>? appTransactions = null,
+        bool exemptRowLevelFromWholeTableRead = false)
     {
         ThrowIfDisposed();
 
@@ -2272,6 +2255,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // reported as one, whatever the checker would have said.
                 if (appTransactions is { Count: > 0 })
                     ValidateAppTransactions(appTransactions, baseSnapshot, concurrent);
+
+                // A row-level DELETE may DROP its whole-table read declaration — and nothing else — when the
+                // caller has explicitly asked for that (see DeltaTransaction.ExemptRowLevelFromWholeTableRead
+                // for why it is an opt-in and not an inference). The row-level write validation above has
+                // already established that no row this transaction removes was concurrently removed or moved
+                // beyond reach, which is the whole guarantee WriteSerializable offers; WholeTable would
+                // otherwise make EVERY concurrent add and remove match, including files this transaction
+                // never touched. Predicates are deliberately KEPT: a declared predicate is a real read
+                // dependency, and dropping it would admit a concurrent append into the range that was read.
+                // Serializable keeps the full read set — making commit order the logical order is what it is
+                // for — and there the resolution itself is narrowed instead
+                // (KeepOnlyDataPreservingResolutions above).
+                var effectiveReads =
+                    exemptRowLevelFromWholeTableRead && rowLevel && isolationLevel != IsolationLevel.Serializable
+                        ? reads with { WholeTable = false }
+                        : reads;
 
                 var verdict = Concurrency.ConflictChecker.Check(
                     effectiveReads, plannedRemovePaths, pruner, isolationLevel, concurrent, resolvedPaths);
@@ -2757,10 +2756,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>Routes a lowered selection to the deletion-vector path when the table enables DVs (no data read
     /// at all), else to copy-on-write. Mirrors the choice the rowid DELETE surface makes.</summary>
     private ValueTask<(long RowsDeleted, long Version)> DeleteBySelectionViaVectorsOrRewriteAsync(
-        FileRowSelection selection, CancellationToken cancellationToken)
-        => DeletionVectors.DeletionVectorConfig.IsEnabled(CurrentSnapshot.Metadata.Configuration)
-            ? DeleteBySelectionViaVectorsAsync(selection, cancellationToken)
-            : DeleteBySelectionAsync(selection, cancellationToken);
+        RowSelection selection, CancellationToken cancellationToken)
+        => DeleteRowsAsync(
+            selection,
+            DeletionVectors.DeletionVectorConfig.IsEnabled(CurrentSnapshot.Metadata.Configuration)
+                ? RowDeleteMode.DeletionVector
+                : RowDeleteMode.CopyOnWrite,
+            cancellationToken: cancellationToken);
 
     /// <summary>The remove/add (and CDC) actions a DELETE produces, its removed-file paths, the row
     /// count, and the per-file row-level edits — everything a commit needs, but without committing. Shared
@@ -2989,10 +2991,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // binds DATA columns only — would mis-evaluate it.
         if (MetadataPredicate.TryLower(predicate, out var lowered))
         {
-            long version = await UpdateBySelectionAsync(
+            long version = await UpdateRowsAsync(
                     lowered, MatchedRowsUpdater(lowered, updater), cancellationToken)
                 .ConfigureAwait(false);
-            long rows = lowered.RowsByFile.Sum(kv => (long)kv.Value.Count);
+            long rows = lowered.TotalPositions;
             return (rows, version);
         }
         MetadataPredicate.ThrowIfReferencesMetadata(predicate, "UPDATE");
@@ -3007,11 +3009,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// absolute positions. Matched rows are taken out, updated, and spliced back at their original slots.
     /// </summary>
     private static Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>>
-        MatchedRowsUpdater(FileRowSelection selection, Func<RecordBatch, RecordBatch> updater)
+        MatchedRowsUpdater(RowSelection selection, Func<RecordBatch, RecordBatch> updater)
         => (filePath, sourceBatches, positionsPerBatch) =>
         {
-            var targets = selection.RowsByFile[filePath] as HashSet<long>
-                          ?? new HashSet<long>(selection.RowsByFile[filePath]);
+            var targets = selection.PositionsFor(filePath) as HashSet<long>
+                          ?? new HashSet<long>(selection.PositionsFor(filePath));
             var result = new List<RecordBatch>(sourceBatches.Count);
             for (int b = 0; b < sourceBatches.Count; b++)
             {
@@ -5231,7 +5233,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     //   * BY PATH-SORTED ORDINAL in the snapshot's active set (OrderedActiveFiles) — what a positional row
     //     identifier packs. Stable only within one snapshot, which is why a buffered transaction pins the
     //     version its ordinals were captured against (atVersion / resolveAgainst) and re-validates before
-    //     committing. These overloads resolve to a FileRowSelection and delegate.
+    //     committing. These overloads resolve to a RowSelection and delegate.
 
     // The transient rowid packs (path-sorted file ordinal, absolute in-file position) — see
     // <see cref="TransientRowAddress"/>, which owns the encoding and the public pack/unpack helpers.
@@ -5349,7 +5351,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var actions = new List<DeltaAction>(files.Count + 1);
         long liveRows = 0;
 
-        for (int fi = 0; fi < files.Count; fi++)
+        foreach (var f in files)
         {
             DeletionVector? dv = null;
             string? stats = f.StatsJson ?? $"{{\"numRecords\":{f.NumRecords}}}";
@@ -5587,7 +5589,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// transaction's PINNED snapshot — resolve there, not against a possibly-advanced current snapshot. The
     /// caller runs <see cref="CheckLogicalRebaseAsync"/> before committing the result on a newer snapshot.</param>
     public async ValueTask<(IReadOnlyList<DeltaAction> Actions, long RowsDeleted)> ComputeDeletionVectorActionsAsync(
-        FileRowSelection selection,
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal,
         CancellationToken cancellationToken = default,
         Snapshot.Snapshot? resolveAgainst = null)
     {
@@ -5638,7 +5640,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             long newlyDeleted = 0;
             var newRows = new List<long>();
-            foreach (long p in positions)
+            foreach (long p in kvp.Value)
             {
                 if (allDeleted.Add(p))
                 {
@@ -5762,7 +5764,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     .ConfigureAwait(false))
                 : new HashSet<long>();
             var newPositions = new List<long>();
-            foreach (long p in targets)
+            foreach (long p in kvp.Value)
                 if (allDeleted.Add(p))
                     newPositions.Add(p);
             if (newPositions.Count == 0)
@@ -6551,7 +6553,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     public async ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsAsync(
         IReadOnlyList<DeltaAction> actions,
-        FileRowSelection newRows,
+        RowSelection newRows,
         Snapshot.Snapshot from,
         Snapshot.Snapshot to,
         CancellationToken cancellationToken = default)
@@ -6572,7 +6574,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 "concurrent protocol change — cannot rebase the transaction");
         }
 
-        var oursByPath = newRows.RowsByFile;
+        var oursByPath = newRows.Paths.ToDictionary(
+            p => p, p => newRows.PositionsFor(p), StringComparer.Ordinal);
         var fromByPath = new HashSet<string>(StringComparer.Ordinal);
         foreach (var f in from.ActiveFiles.Values)
             fromByPath.Add(f.Path);
@@ -6741,8 +6744,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        // Skip, not Throw: this overload is the ordinal-keyed compatibility surface and keeps the historical
+        // leniency of the lower-layer primitives (see ComputeDeletionVectorActionsAsync). The path-keyed
+        // overload below is the one that fails loudly on an address that no longer resolves.
         return RebaseDvDmlActionsAsync(
-            actions, SelectionFromOrdinals(newPositionsByOrdinal, from), from, to, cancellationToken);
+            actions,
+            RowSelection.FromOrdinals(
+                newPositionsByOrdinal, from, StaleAddressPolicy.Skip, nameof(newPositionsByOrdinal)),
+            from, to, cancellationToken);
     }
 
     /// <summary>

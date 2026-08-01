@@ -193,12 +193,12 @@ public class StagedDataFileParityTests : IDisposable
 
         var txn = table.StartTransaction();
         await txn.StageDataFilesAsync(files);
-        await txn.StageRowDeletesAsync(new FileRowSelection(
+        await txn.StageRowDeletesAsync(RowSelection.ByPath(
             new Dictionary<string, IReadOnlyCollection<long>>
             {
                 [table.CurrentSnapshot.ActiveFiles.Values.First().Path] = new long[] { 0 },
             }));
-        txn.SetOperation("TRANSACTION");
+        txn.Operation = "TRANSACTION";
         long version = await txn.CommitAsync();
 
         await using var check = await OpenAsync();
@@ -219,7 +219,7 @@ public class StagedDataFileParityTests : IDisposable
 
         var txn = table.StartTransaction();
         await txn.StageDataFilesAsync(files);
-        await txn.StageRowDeletesAsync(new FileRowSelection(
+        await txn.StageRowDeletesAsync(RowSelection.ByPath(
             new Dictionary<string, IReadOnlyCollection<long>>
             {
                 [table.CurrentSnapshot.ActiveFiles.Values.First().Path] = new long[] { 0 },
@@ -239,6 +239,6 @@ public class StagedDataFileParityTests : IDisposable
     public async Task EmptyOperation_Throws()
     {
         await using var table = await CreateAsync();
-        Assert.Throws<ArgumentException>(() => table.StartTransaction().SetOperation(""));
+        Assert.Throws<ArgumentException>(() => table.StartTransaction().Operation = "");
     }
 }

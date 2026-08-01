@@ -9,7 +9,7 @@ using EngineeredWood.IO.Local;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// The PATH-KEYED row-level DML entry points (<see cref="FileRowSelection"/>) and their equivalence with —
+/// The PATH-KEYED row-level DML entry points (<see cref="RowSelection"/>) and their equivalence with —
 /// and improvement over — the ordinal-keyed overloads.
 /// </summary>
 /// <remarks>
@@ -25,11 +25,11 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// cannot be misread that way, so the path-keyed overload reports it.
 /// </para>
 /// </remarks>
-public class FileRowSelectionTests : IDisposable
+public class RowSelectionKeyedDmlTests : IDisposable
 {
     private readonly string _tempDir;
 
-    public FileRowSelectionTests()
+    public RowSelectionKeyedDmlTests()
     {
         _tempDir = Path.Combine(Path.GetTempPath(), $"delta_frsel_{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
@@ -109,7 +109,7 @@ public class FileRowSelectionTests : IDisposable
         // A concurrent writer removes the file at ordinal 0 outright (copy-on-write delete of all its rows).
         await using (var other = await OpenAsync())
         {
-            await other.DeleteBySelectionAsync(new FileRowSelection(
+            await other.DeleteBySelectionAsync(RowSelection.ByPath(
                 new Dictionary<string, IReadOnlyCollection<long>>
                 {
                     [pathsAtPin[0]] = new long[] { 0, 1, 2 },
@@ -133,7 +133,7 @@ public class FileRowSelectionTests : IDisposable
         Assert.Contains(intendedId, survivors);
 
         // The path did not change meaning, so the path-keyed form hits the row that was actually selected.
-        await table.DeleteBySelectionViaVectorsAsync(new FileRowSelection(
+        await table.DeleteRowsAsync(RowSelection.ByPath(
             new Dictionary<string, IReadOnlyCollection<long>> { [intendedPath] = new long[] { 0 } }));
         Assert.DoesNotContain(intendedId, await ReadIdsFreshAsync());
     }
@@ -195,7 +195,7 @@ public class FileRowSelectionTests : IDisposable
         var (ordinalActions, ordinalRows) = await table.ComputeDeletionVectorActionsAsync(
             byOrdinal, resolveAgainst: snap);
         var (pathActions, pathRows) = await table.ComputeDeletionVectorActionsAsync(
-            new FileRowSelection(byPath), resolveAgainst: snap);
+            RowSelection.ByPath(byPath), resolveAgainst: snap);
 
         Assert.Equal(2, ordinalRows);
         Assert.Equal(ordinalRows, pathRows);
@@ -226,7 +226,7 @@ public class FileRowSelectionTests : IDisposable
 
         // In each file, drop its FIRST row. Which ids those are depends on which commit sorted where, so
         // assert on the count and on "one survivor pair per file" rather than on a fixed id list.
-        var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        var selection = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
         {
             [paths[0]] = new long[] { 0 },
             [paths[1]] = new long[] { 0 },
@@ -271,7 +271,7 @@ public class FileRowSelectionTests : IDisposable
         Assert.Empty(actions);
         Assert.Equal(0, rows);   // silently nothing — the defect the path key removes
 
-        var staleSelection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        var staleSelection = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
         {
             [stalePaths[1]] = new long[] { 0 },
         });
@@ -286,7 +286,7 @@ public class FileRowSelectionTests : IDisposable
     public async Task PathKeyed_UnknownPath_Throws()
     {
         await using var table = await CreateThreeFileTableAsync();
-        var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        var selection = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
         {
             ["part-does-not-exist.parquet"] = new long[] { 0 },
         });
@@ -306,7 +306,7 @@ public class FileRowSelectionTests : IDisposable
         var paths = PathsByOrdinal(table, pinned);
 
         // this transaction deletes row 0 of the file at ordinal 1
-        var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        var selection = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
         {
             [paths[1]] = new long[] { 0 },
         });
@@ -318,7 +318,7 @@ public class FileRowSelectionTests : IDisposable
         {
             var racerPaths = PathsByOrdinal(racer, racer.CurrentSnapshot);
             Assert.Equal(paths[1], racerPaths[1]);   // same file at the same ordinal — nothing moved yet
-            var racerSel = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+            var racerSel = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
             {
                 [racerPaths[1]] = new long[] { 2 },
             });
@@ -369,7 +369,7 @@ public class FileRowSelectionTests : IDisposable
         await using (var table = await CreateThreeFileTableAsync())
         {
             var selection = await SelectionForIdsAsync(table, id => id is 2 or 22);
-            var (deleted, _) = await table.DeleteBySelectionViaVectorsAsync(selection);
+            var (deleted, _) = await table.DeleteRowsAsync(selection);
             Assert.Equal(2, deleted);
         }
         Assert.Equal(viaRowIds, await ReadIdsFreshAsync());
@@ -417,12 +417,12 @@ public class FileRowSelectionTests : IDisposable
     public async Task DeleteBySelection_UnknownPath_Throws()
     {
         await using var table = await CreateThreeFileTableAsync();
-        var bogus = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        var bogus = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
         {
             ["part-gone.parquet"] = new long[] { 0 },
         });
         var dv = await Assert.ThrowsAsync<InvalidOperationException>(
-            async () => await table.DeleteBySelectionViaVectorsAsync(bogus));
+            async () => await table.DeleteRowsAsync(bogus));
         Assert.Contains("part-gone.parquet", dv.Message);
         var cow = await Assert.ThrowsAsync<InvalidOperationException>(
             async () => await table.DeleteBySelectionAsync(bogus));
@@ -446,7 +446,7 @@ public class FileRowSelectionTests : IDisposable
 
     /// <summary>The same rows as a path-keyed selection — decoded exactly as an engine that owns the rowid
     /// encoding would: ordinal -> PlanFiles -> add.path, position = the low bits.</summary>
-    private static async Task<FileRowSelection> SelectionForIdsAsync(DeltaTable table, Func<long, bool> match)
+    private static async Task<RowSelection> SelectionForIdsAsync(DeltaTable table, Func<long, bool> match)
     {
         var paths = PathsByOrdinal(table, table.CurrentSnapshot);
         var byFile = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
@@ -457,7 +457,7 @@ public class FileRowSelectionTests : IDisposable
                 byFile[path] = set = new HashSet<long>();
             ((HashSet<long>)set).Add(rid & ((1L << 40) - 1));
         }
-        return new FileRowSelection(byFile);
+        return RowSelection.ByPath(byFile);
     }
 
     /// <summary>A selection naming a file that was not active in the snapshot it claims to come from is a
@@ -468,7 +468,7 @@ public class FileRowSelectionTests : IDisposable
         await using var table = await CreateThreeFileTableAsync();
         var pinned = table.CurrentSnapshot;
         var paths = PathsByOrdinal(table, pinned);
-        var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        var selection = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
         {
             [paths[0]] = new long[] { 0 },
         });
@@ -480,7 +480,7 @@ public class FileRowSelectionTests : IDisposable
             await racer.WriteAsync([BuildBatch(200, 1)]);
         }
         await using var committer = await OpenAsync();
-        var bogus = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        var bogus = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
         {
             ["part-never-existed.parquet"] = new long[] { 0 },
         });

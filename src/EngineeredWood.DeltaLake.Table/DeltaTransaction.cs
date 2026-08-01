@@ -569,6 +569,32 @@ public sealed class DeltaTransaction
     }
 
     /// <summary>
+    /// Opts this transaction into DROPPING its <see cref="DeclareWholeTableRead"/> declaration — and nothing
+    /// else — when it also stages row-level deletes and runs at
+    /// <see cref="IsolationLevel.WriteSerializable"/>. Default <c>false</c>: the declaration is honoured at
+    /// both levels, which is what Delta does.
+    /// </summary>
+    /// <remarks>
+    /// <para>This is the proposal <see cref="DeclareWholeTableRead"/>'s remarks describe (issue #15, open
+    /// question 4), implemented as an explicit PER-TRANSACTION opt-in rather than as an inference from
+    /// "this transaction staged row-level deletes" — because a library must not decide on a host's behalf
+    /// that it read less than it declared. Only the host knows whether its whole-table declaration was a
+    /// genuine dependency or merely the honest answer to "the scan pushed no predicate".</para>
+    /// <para><b>What it buys, and it is narrower than it sounds.</b> Concurrent disjoint-row DML on the SAME
+    /// file already composes WITHOUT this, through row-level resolution: the commit rebases each staged
+    /// delete's deletion vector onto the concurrent one and the checker then skips those paths entirely,
+    /// before reads are consulted. What this covers is the case that resolution cannot reach — a concurrent
+    /// <c>dataChange=true</c> remove of a file this transaction never touched, which a whole-table
+    /// declaration otherwise turns into a <c>concurrentDeleteRead</c> conflict even though the row-level
+    /// write validation has already proven no row being removed was disturbed.</para>
+    /// <para>Predicates staged via <see cref="DeclareRead"/> are KEPT regardless: a declared predicate is a
+    /// real read dependency, and dropping it would admit a concurrent append into the range that was read —
+    /// a conflict both isolation levels catch. <see cref="IsolationLevel.Serializable"/> ignores this flag
+    /// entirely; making commit order the logical order is the whole point of that level.</para>
+    /// </remarks>
+    public bool ExemptRowLevelFromWholeTableRead { get; set; }
+
+    /// <summary>
     /// Adds staged actions, holding back the row-tracking high-water mark. That action is a per-domain
     /// SINGLETON — every staging call computes one, and a version carrying two <c>domainMetadata</c> entries
     /// for one domain is malformed — so the transaction re-emits exactly one from its running counter at

@@ -84,7 +84,7 @@ public class AppTransactionStagingTests : IDisposable
         await using var table = await CreateAsync();
         var txn = table.StartTransaction();
         await StageAppendAsync(table, txn, Batch(10, 3));
-        txn.StageAppTransaction("producer-1", 7);
+        txn.RequireAppTransaction("producer-1", 7);
         await txn.CommitAsync();
 
         Assert.Equal(5, await RowCountAsync());
@@ -98,14 +98,14 @@ public class AppTransactionStagingTests : IDisposable
         await using var table = await CreateAsync();
         var first = table.StartTransaction();
         await StageAppendAsync(table, first, Batch(10, 3));
-        first.StageAppTransaction("producer-1", 7);
+        first.RequireAppTransaction("producer-1", 7);
         await first.CommitAsync();
         long versionAfterFirst = table.CurrentSnapshot.Version;
 
         // A replay of the same batch: it still expects "no recorded version", but there is one now.
         var replay = table.StartTransaction();
         await StageAppendAsync(table, replay, Batch(10, 3));
-        replay.StageAppTransaction("producer-1", 7);
+        replay.RequireAppTransaction("producer-1", 7);
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await replay.CommitAsync());
         Assert.Contains("producer-1", ex.Message);
 
@@ -129,14 +129,14 @@ public class AppTransactionStagingTests : IDisposable
         await using var mine = await OpenAsync();
         var txn = mine.StartTransaction(pinned);
         await StageAppendAsync(mine, txn, Batch(10, 3));
-        txn.StageAppTransaction("producer-1", 7);
+        txn.RequireAppTransaction("producer-1", 7);
 
         // The twin runs the identical batch through its own handle and commits first, taking our version.
         await using (var twin = await OpenAsync())
         {
             var twinTxn = twin.StartTransaction();
             await StageAppendAsync(twin, twinTxn, Batch(10, 3));
-            twinTxn.StageAppTransaction("producer-1", 7);
+            twinTxn.RequireAppTransaction("producer-1", 7);
             await twinTxn.CommitAsync();
         }
 
@@ -155,12 +155,12 @@ public class AppTransactionStagingTests : IDisposable
         await using var table = await CreateAsync();
         var first = table.StartTransaction();
         await StageAppendAsync(table, first, Batch(10, 1));
-        first.StageAppTransaction("producer-1", 1);
+        first.RequireAppTransaction("producer-1", 1);
         await first.CommitAsync();
 
         var second = table.StartTransaction();
         await StageAppendAsync(table, second, Batch(20, 1));
-        second.StageAppTransaction("producer-1", 2, expectedPrevious: 1);
+        second.RequireAppTransaction("producer-1", 2, expectedPrevious: 1);
         await second.CommitAsync();
 
         Assert.Equal(2, await RecordedVersionAsync("producer-1"));
@@ -173,8 +173,8 @@ public class AppTransactionStagingTests : IDisposable
         await using var table = await CreateAsync();
         var txn = table.StartTransaction();
         await StageAppendAsync(table, txn, Batch(10, 1));
-        txn.StageAppTransaction("producer-a", 3);
-        txn.StageAppTransaction("producer-b", 99);
+        txn.RequireAppTransaction("producer-a", 3);
+        txn.RequireAppTransaction("producer-b", 99);
         await txn.CommitAsync();
 
         Assert.Equal(3, await RecordedVersionAsync("producer-a"));
@@ -186,6 +186,6 @@ public class AppTransactionStagingTests : IDisposable
     {
         await using var table = await CreateAsync();
         var txn = table.StartTransaction();
-        Assert.Throws<ArgumentException>(() => txn.StageAppTransaction("", 1));
+        Assert.Throws<ArgumentException>(() => txn.RequireAppTransaction("", 1));
     }
 }

@@ -60,10 +60,10 @@ public class StagedReadSetAndIsolationTests : IDisposable
         return table;
     }
 
-    private static FileRowSelection Select(Snapshot.Snapshot snapshot, params long[] positions)
+    private static RowSelection Select(Snapshot.Snapshot snapshot, params long[] positions)
     {
         string path = snapshot.ActiveFiles.Values.Single().Path;
-        return new FileRowSelection(
+        return RowSelection.ByPath(
             new Dictionary<string, IReadOnlyCollection<long>> { [path] = positions });
     }
 
@@ -90,7 +90,7 @@ public class StagedReadSetAndIsolationTests : IDisposable
         var txn = table.StartTransaction(pinned, IsolationLevel.Serializable);
         var files = await table.WriteDataFilesAsync([Batch(200, 1)]);
         await txn.StageDataFilesAsync(files);
-        txn.StageReadPredicate(Ex.GreaterThanOrEqual("id", 100L));
+        txn.DeclareRead(Ex.GreaterThanOrEqual("id", 100L));
 
         // A blind append landing in the range the transaction says it read.
         await using (var other = await OpenAsync())
@@ -116,7 +116,7 @@ public class StagedReadSetAndIsolationTests : IDisposable
         var txn = table.StartTransaction(pinned, IsolationLevel.WriteSerializable);
         var files = await table.WriteDataFilesAsync([Batch(200, 1)]);
         await txn.StageDataFilesAsync(files);
-        txn.StageReadPredicate(Ex.GreaterThanOrEqual("id", 100L));
+        txn.DeclareRead(Ex.GreaterThanOrEqual("id", 100L));
 
         await using (var other = await OpenAsync())
         {
@@ -141,7 +141,7 @@ public class StagedReadSetAndIsolationTests : IDisposable
         var txn = table.StartTransaction(pinned, IsolationLevel.Serializable);
         var files = await table.WriteDataFilesAsync([Batch(200, 1)]);
         await txn.StageDataFilesAsync(files);
-        txn.StageWholeTableRead();
+        txn.DeclareWholeTableRead();
 
         await using (var other = await OpenAsync())
         {
@@ -191,7 +191,7 @@ public class StagedReadSetAndIsolationTests : IDisposable
 
             await using (var other = await OpenAsync())
             {
-                await other.DeleteBySelectionViaVectorsAsync(Select(other.CurrentSnapshot, 7));
+                await other.DeleteRowsAsync(Select(other.CurrentSnapshot, 7));
             }
 
             await txn.CommitAsync();
@@ -210,7 +210,7 @@ public class StagedReadSetAndIsolationTests : IDisposable
 
             await using (var other = await OpenAsync())
             {
-                await other.DeleteBySelectionViaVectorsAsync(Select(other.CurrentSnapshot, 7));
+                await other.DeleteRowsAsync(Select(other.CurrentSnapshot, 7));
             }
 
             await Assert.ThrowsAsync<DeltaConflictException>(async () => await txn.CommitAsync());

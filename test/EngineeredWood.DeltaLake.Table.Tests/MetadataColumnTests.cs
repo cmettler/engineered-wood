@@ -167,7 +167,7 @@ public class MetadataColumnTests : IDisposable
         Assert.Equal(9, rows.Select(r => r.RowId).Distinct().Count());
     }
 
-    /// <summary>The locator round-trips into a <see cref="FileRowSelection"/> that deletes exactly the intended
+    /// <summary>The locator round-trips into a <see cref="RowSelection"/> that deletes exactly the intended
     /// rows — i.e. the struct is directly usable as the DML key, with no packing step.</summary>
     [Fact]
     public async Task Metadata_LocatorFeedsAFileRowSelection_Directly()
@@ -182,7 +182,7 @@ public class MetadataColumnTests : IDisposable
                     byFile[r.FilePath] = set = new HashSet<long>();
                 ((HashSet<long>)set).Add(r.RowIndex);
             }
-            var (deleted, _) = await table.DeleteBySelectionViaVectorsAsync(new FileRowSelection(byFile));
+            var (deleted, _) = await table.DeleteRowsAsync(RowSelection.ByPath(byFile));
             Assert.Equal(2, deleted);
         }
 
@@ -201,7 +201,7 @@ public class MetadataColumnTests : IDisposable
         {
             var rows = await ReadMetaAsync(table);
             var target = rows.First(r => r.RowIndex == 0);
-            await table.DeleteBySelectionViaVectorsAsync(new FileRowSelection(
+            await table.DeleteRowsAsync(RowSelection.ByPath(
                 new Dictionary<string, IReadOnlyCollection<long>> { [target.FilePath] = new long[] { 0 } }));
         }
 
@@ -337,7 +337,7 @@ public class MetadataColumnTests : IDisposable
             // pick a file and mask its FIRST row, so absolute != in-batch index afterwards
             targetFile = rows.First(r => r.Id == 11).FilePath;
             long maskedAbs = rows.First(r => r.Id == 11).RowIndex;
-            await table.DeleteBySelectionViaVectorsAsync(new FileRowSelection(
+            await table.DeleteRowsAsync(RowSelection.ByPath(
                 new Dictionary<string, IReadOnlyCollection<long>> { [targetFile] = new long[] { maskedAbs } }));
             survivingIdAtAbs2 = (await ReadMetaAsync(table))
                 .First(r => r.FilePath == targetFile && r.RowIndex == 2).Id;
@@ -350,7 +350,7 @@ public class MetadataColumnTests : IDisposable
         await using (var table = await OpenAsync())
         {
             // target the row at ABSOLUTE position 2 of that file
-            var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+            var selection = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
             {
                 [targetFile] = new long[] { 2 },
             });
@@ -402,7 +402,7 @@ public class MetadataColumnTests : IDisposable
     {
         await using var table = await CreateTrackedAsync();
         bool invoked = false;
-        var bogus = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        var bogus = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
         {
             ["part-vanished.parquet"] = new long[] { 0 },
         });
@@ -488,7 +488,7 @@ public class MetadataColumnTests : IDisposable
         int filesBefore = before.ActiveFiles.Count;
 
         var target = (await ReadMetaAsync(table)).First(r => r.Id == 12);
-        var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+        var selection = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
         {
             [target.FilePath] = new long[] { target.RowIndex },
         });
@@ -535,7 +535,7 @@ public class MetadataColumnTests : IDisposable
             Assert.NotNull(idBefore);
 
             await table.UpdateBySelectionViaVectorsAsync(
-                new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+                RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
                 {
                     [targetPath] = new long[] { targetPos },
                 }),
@@ -568,7 +568,7 @@ public class MetadataColumnTests : IDisposable
             var rows = await ReadMetaAsync(table);
             targetFile = rows.First(r => r.Id == 11).FilePath;
             // mask absolute 0 of that file, so its survivors sit at absolute 1 and 2
-            await table.DeleteBySelectionViaVectorsAsync(new FileRowSelection(
+            await table.DeleteRowsAsync(RowSelection.ByPath(
                 new Dictionary<string, IReadOnlyCollection<long>>
                 {
                     [targetFile] = new long[] { rows.First(r => r.Id == 11).RowIndex },
@@ -582,7 +582,7 @@ public class MetadataColumnTests : IDisposable
         {
             // select BOTH survivors, and key the new values by absolute position
             var newByPos = new Dictionary<long, long> { [1] = 777L, [2] = 888L };
-            var selection = new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+            var selection = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
             {
                 [targetFile] = new long[] { 1, 2 },
             });
@@ -628,7 +628,7 @@ public class MetadataColumnTests : IDisposable
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
             await table.UpdateBySelectionViaVectorsAsync(
-                new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+                RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
                 {
                     [path] = new long[] { 0 },
                 }),
@@ -645,7 +645,7 @@ public class MetadataColumnTests : IDisposable
         var target = (await ReadMetaAsync(table)).First(r => r.Id == 2);
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
             await table.UpdateBySelectionViaVectorsAsync(
-                new FileRowSelection(new Dictionary<string, IReadOnlyCollection<long>>
+                RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
                 {
                     [target.FilePath] = new long[] { target.RowIndex },
                 }),

@@ -62,10 +62,10 @@ public class PinnedTransactionTests : IDisposable
     }
 
     /// <summary>A selection naming absolute positions in the single file of <paramref name="snapshot"/>.</summary>
-    private static FileRowSelection Select(Snapshot.Snapshot snapshot, params long[] positions)
+    private static RowSelection Select(Snapshot.Snapshot snapshot, params long[] positions)
     {
         string path = snapshot.ActiveFiles.Values.Single().Path;
-        return new FileRowSelection(
+        return RowSelection.ByPath(
             new Dictionary<string, IReadOnlyCollection<long>> { [path] = positions });
     }
 
@@ -119,7 +119,7 @@ public class PinnedTransactionTests : IDisposable
         // Concurrent writer deletes id 0 (position 0) through its own handle.
         await using (var other = await OpenAsync())
         {
-            await other.DeleteBySelectionViaVectorsAsync(Select(other.CurrentSnapshot, 0));
+            await other.DeleteRowsAsync(Select(other.CurrentSnapshot, 0));
         }
 
         // Our transaction was pinned BEFORE that delete and deletes a different row (position 5 = id 5).
@@ -148,7 +148,7 @@ public class PinnedTransactionTests : IDisposable
 
         await using (var other = await OpenAsync())
         {
-            await other.DeleteBySelectionViaVectorsAsync(Select(other.CurrentSnapshot, 3));
+            await other.DeleteRowsAsync(Select(other.CurrentSnapshot, 3));
         }
 
         await using var table = await OpenAsync();
