@@ -10,7 +10,7 @@ using Ex = EngineeredWood.Expressions.Expressions;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// The trailing <c>_metadata</c> struct from <see cref="DeltaTable.ReadAllWithMetadataAsync"/>: one per-row
+/// The trailing <c>_metadata</c> struct from <see cref="DeltaTable.ReadAsync"/> with <c>DeltaRowMetadata.Locator</c>: one per-row
 /// identity surface carrying BOTH halves in Spark's vocabulary — the LOCATOR (<c>file_path</c> +
 /// <c>row_index</c>, a physical address valid for this snapshot) and the durable IDENTITY (<c>row_id</c> +
 /// <c>row_commit_version</c>).
@@ -68,7 +68,7 @@ public class MetadataColumnTests : IDisposable
     private readonly record struct MetaRow(long Id, string FilePath, long RowIndex, long? RowId, long? Version);
 
     /// <summary>
-    /// Reads the LOCATOR pair from <see cref="DeltaTable.ReadAllWithMetadataAsync"/> and, when
+    /// Reads the LOCATOR pair from <see cref="DeltaTable.ReadAsync"/> with <c>DeltaRowMetadata.Locator</c> and, when
     /// <paramref name="withIdentity"/>, the IDENTITY pair from
     /// <see cref="DeltaTable.ReadAllWithRowTrackingAsync"/> — two reads, because the two surfaces own
     /// different columns. They stream the same snapshot's files in the same path-sorted order with no filter,
@@ -78,7 +78,7 @@ public class MetadataColumnTests : IDisposable
     private static async Task<List<MetaRow>> ReadMetaAsync(DeltaTable table, bool withIdentity = true)
     {
         var locators = new List<(long Id, string FilePath, long RowIndex)>();
-        await foreach (var batch in table.ReadAllWithMetadataAsync())
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
         {
             var ids = (Int64Array)batch.Column("id");
             var path = (StringArray)batch.Column(MetadataPredicate.FilePathColumn);
@@ -131,7 +131,7 @@ public class MetadataColumnTests : IDisposable
     public async Task Metadata_EmitsTheTwoFlatLocatorColumns_BothNonNull()
     {
         await using var table = await CreateTrackedAsync();
-        await foreach (var batch in table.ReadAllWithMetadataAsync())
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
         {
             var path = batch.Schema.GetFieldByName(MetadataPredicate.FilePathColumn);
             var idx = batch.Schema.GetFieldByName(MetadataPredicate.RowIndexColumn);
@@ -415,7 +415,7 @@ public class MetadataColumnTests : IDisposable
 
     /// <summary>
     /// THE NATURAL USAGE, end to end and with no predicate anywhere: read with
-    /// <see cref="DeltaTable.ReadAllWithMetadataAsync"/>, KEEP the rows you want to change (carrying their
+    /// <see cref="DeltaTable.ReadAsync"/> with <c>DeltaRowMetadata.Locator</c>, KEEP the rows you want to change (carrying their
     /// <c>_metadata</c> along), change a column, hand that batch back to
     /// <c>UpdateBySelectionAsync</c>. This is the documented flow, so it is worth a test rather than prose.
     /// </summary>
@@ -430,7 +430,7 @@ public class MetadataColumnTests : IDisposable
         await using (var table = await CreateTrackedAsync())
         {
             var updateBatches = new List<RecordBatch>();
-            await foreach (var batch in table.ReadAllWithMetadataAsync())
+            await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
             {
                 var ids = (Int64Array)batch.Column("id");
                 // keep only the rows we intend to change (ids 2 and 22)
@@ -686,8 +686,10 @@ public class MetadataColumnTests : IDisposable
     {
         await using var table = await CreateTrackedAsync();
         var ex = await Assert.ThrowsAsync<ArgumentException>(
-            async () => await table.UpdateBySelectionAsync(BuildBatch(1, 1)));
-        Assert.Contains(nameof(DeltaTable.ReadAllWithMetadataAsync), ex.Message);
+            async () => await table.UpdateRowsAsync(BuildBatch(1, 1)));
+        // The point of the assertion is that the message tells you HOW to obtain the locator, not merely
+        // that one is missing — so it names the read option that produces it.
+        Assert.Contains(nameof(DeltaRowMetadata.Locator), ex.Message);
     }
 
     /// <summary>Delegating filesystem that counts opens of DATA parquet files (the log and its checkpoints
@@ -957,7 +959,7 @@ public class MetadataColumnTests : IDisposable
 
         var filtered = new List<MetaRow>();
         var pred = EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", 21L);
-        await foreach (var batch in table.ReadAllWithMetadataAsync(null, pred))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator, Filter = pred }))
         {
             var ids = (Int64Array)batch.Column("id");
             var path = (StringArray)batch.Column(MetadataPredicate.FilePathColumn);
