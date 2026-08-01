@@ -175,6 +175,82 @@ public class HostRowIdentityTests : IDisposable
         Assert.Equal([4L], ids);
     }
 
+    // ── rowAddressesOut: the SNAPSHOT-RELATIVE address, as distinct from the stable identity ──
+
+    /// <summary>
+    /// A host whose row identifiers ARE the transient address needs it back, row-aligned, to pair results
+    /// with what it asked for — batching and deletion-vector filtering both break any positional
+    /// correspondence, and the method surfaces no absolute position otherwise, so this cannot be
+    /// reconstructed from outside.
+    ///
+    /// <para>The file ORDINAL half is what makes this more than bookkeeping: it is a position in the
+    /// snapshot's FULL path-sorted active set, not in the selection. So the rows are taken from the
+    /// LAST-SORTING file ONLY, and nothing from the other — an ordinal derived from the selection would
+    /// then be 0 where the right answer is 1, and every assertion below would still pass if the selection
+    /// named both files, because the two numbering schemes agree in that case.</para>
+    /// </summary>
+    [Fact]
+    public async Task RowAddresses_AreThoseRequested_AndOrdinalsIndexTheFullActiveSet()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
+        await table.WriteAsync([Batch(1, 5)]);
+        await table.WriteAsync([Batch(11, 5)]);
+        var at = await LocateRowsAsync(table);
+
+        // Data files are GUID-named, so which BATCH sorts last is not knowable up front — pick the rows by
+        // the path that does.
+        string lastPath = table.CurrentSnapshot.ActiveFiles.Values
+            .Select(f => f.Path).OrderBy(p => p, StringComparer.Ordinal).Last();
+        var wanted = at.Values.Where(a => a.Path == lastPath).Take(2).ToArray();
+        Assert.Equal(2, wanted.Length);
+        var addresses = new List<long[]>();
+        var seen = new List<long>();
+        await foreach (var batch in table.ReadRowsAsync(
+            Sel(wanted), rowAddressesOut: addresses))
+        {
+            var col = (Int64Array)batch.Column("id");
+            for (int i = 0; i < batch.Length; i++)
+                seen.Add(col.GetValue(i)!.Value);
+        }
+
+        // Row-aligned: one address array per yielded batch, each as long as its batch.
+        Assert.Equal(seen.Count, addresses.Sum(a => a.Length));
+
+        // The addresses returned are exactly the ones the selection named — via the paths, which is the
+        // only key both sides share.
+        var ordinalByPath = new Dictionary<string, int>(StringComparer.Ordinal);
+        var ordered = table.CurrentSnapshot.ActiveFiles.Values
+            .Select(f => f.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
+        Assert.Equal(2, ordered.Count);
+        for (int i = 0; i < ordered.Count; i++)
+            ordinalByPath[ordered[i]] = i;
+
+        var expected = wanted
+            .Select(w => TransientRowAddress.Pack(ordinalByPath[w.Path], w.Position))
+            .OrderBy(a => a).ToList();
+        Assert.Equal(expected, addresses.SelectMany(a => a).OrderBy(a => a).ToList());
+
+        // ...and every ordinal is 1 — the LAST-sorting file's position in the active set. Derived from the
+        // one-file selection instead it would be 0, which is what this asserts against.
+        Assert.All(
+            addresses.SelectMany(a => a),
+            a => Assert.Equal(1, TransientRowAddress.FileOrdinal(a)));
+    }
+
+    /// <summary>Not asked for, not computed — the ordinal costs a sort of the whole active set.</summary>
+    [Fact]
+    public async Task RowAddresses_AreOptional()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
+        await table.WriteAsync([Batch(1, 5)]);
+        var at = await LocateRowsAsync(table);
+
+        int rows = 0;
+        await foreach (var batch in table.ReadRowsAsync(Sel(at[2])))
+            rows += batch.Length;
+        Assert.Equal(1, rows);
+    }
+
     // ── sourceRowTrackingOut: the spec derivation, not just materialized values ──
 
     [Fact]

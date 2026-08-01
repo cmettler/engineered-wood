@@ -152,6 +152,16 @@ public class TransactionPreconditionTests : IDisposable
         Assert.Contains("expected the table to record version 4", ex.Message);
         Assert.Contains("records 5", ex.Message);
 
+        // A host reporting this ONE case in its own vocabulary must be able to identify it without matching
+        // on message text, which would relabel every other invalid-operation failure raised while
+        // committing — so the type is dedicated and carries the four values a message would have to be
+        // parsed for. Still an InvalidOperationException, which is the retry contract (asserted above).
+        var precondition = Assert.IsType<AppTransactionPreconditionException>(ex);
+        Assert.Equal("producer", precondition.AppId);
+        Assert.Equal(6, precondition.RequiredVersion);
+        Assert.Equal(4, precondition.ExpectedPrevious);
+        Assert.Equal(5, precondition.ActualPrevious);
+
         // Nothing landed: the data is not in the table and the recorded version is untouched.
         Assert.Equal(new long[] { 1 }, await ReadIdsFreshAsync());
         Assert.Equal(5, await RecordedVersionAsync("producer"));
