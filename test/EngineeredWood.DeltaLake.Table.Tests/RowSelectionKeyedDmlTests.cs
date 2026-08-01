@@ -150,7 +150,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
     {
         await using var table = await OpenAsync();
         var lowest = new Dictionary<int, long>();
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var ids = (Int64Array)batch.Column("id");
             var addr = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
@@ -435,7 +435,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
     private static async Task<List<long>> CollectRowIdsAsync(DeltaTable table, Func<long, bool> match)
     {
         var rowIds = new List<long>();
-        await foreach (var batch in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var ids = (Int64Array)batch.Column("id");
             var rids = (Int64Array)batch.Column(batch.ColumnCount - 1);
