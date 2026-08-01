@@ -68,6 +68,22 @@ public class RowSelectionKeyedDmlTests : IDisposable
 
     private Task<DeltaTable> OpenAsync() => DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir)).AsTask();
 
+    /// <summary>
+    /// The PATH-KEYED DV computation, which is what this suite is about. The PUBLIC
+    /// <see cref="DeltaTable.ComputeDeletionVectorActionsAsync"/> is ordinal-keyed — it builds a
+    /// <see cref="RowSelection"/> with <see cref="StaleAddressPolicy.Skip"/> and delegates to the path-keyed
+    /// body below, which is where the reporting behaviour these tests pin actually lives. Calling that body
+    /// directly keeps the coverage; routing through the public overload would re-introduce the very silent
+    /// skip the suite exists to contrast against.
+    /// </summary>
+    private static async ValueTask<(IReadOnlyList<DeltaAction> Actions, long RowsDeleted)> ComputePathKeyedAsync(
+        DeltaTable table, RowSelection selection, DeltaLake.Snapshot.Snapshot? resolveAgainst = null)
+    {
+        var result = await table.ComputeDvActionsWithEditsAsync(
+            selection, resolveAgainst ?? table.CurrentSnapshot, default);
+        return (result.Actions, result.RowsDeleted);
+    }
+
     private async Task<List<long>> ReadIdsFreshAsync()
     {
         await using var reader = await OpenAsync();
@@ -142,7 +158,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
 
     /// <summary>
     /// The lowest id held by each file, keyed by that file's CURRENT path-sorted ordinal — read through
-    /// <see cref="DeltaTable.ReadAllWithRowIdsAsync"/>, whose trailing address column carries the very ordinal
+    /// a <see cref="DeltaRowMetadata.RowAddress"/> read, whose trailing address column carries the very ordinal
     /// the DML overloads are keyed by, so the mapping comes from the library rather than from an assumption
     /// about write order (data files are GUID-named, so path order is uncorrelated with it).
     /// </summary>
@@ -196,8 +212,8 @@ public class RowSelectionKeyedDmlTests : IDisposable
 
         var (ordinalActions, ordinalRows) = await table.ComputeDeletionVectorActionsAsync(
             byOrdinal, resolveAgainst: snap);
-        var (pathActions, pathRows) = await table.ComputeDeletionVectorActionsAsync(
-            RowSelection.ByPath(byPath), resolveAgainst: snap);
+        var (pathActions, pathRows) = await ComputePathKeyedAsync(
+            table, RowSelection.ByPath(byPath), snap);
 
         Assert.Equal(2, ordinalRows);
         Assert.Equal(ordinalRows, pathRows);
@@ -234,7 +250,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
             [paths[1]] = new long[] { 0 },
             [paths[2]] = new long[] { 0 },
         });
-        var (actions, rows) = await table.ComputeDeletionVectorActionsAsync(selection, resolveAgainst: snap);
+        var (actions, rows) = await ComputePathKeyedAsync(table, selection, snap);
         Assert.Equal(3, rows);
 
         await table.CommitDataFilesAsync([], DeltaWriteMode.Append,
@@ -278,9 +294,9 @@ public class RowSelectionKeyedDmlTests : IDisposable
             [stalePaths[1]] = new long[] { 0 },
         });
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await table.ComputeDeletionVectorActionsAsync(staleSelection, resolveAgainst: shrunk));
+            await ComputePathKeyedAsync(table, staleSelection, shrunk));
         Assert.Contains(stalePaths[1], ex.Message);
-        Assert.Contains("not active", ex.Message);
+        Assert.Contains("not an active file", ex.Message);
     }
 
     /// <summary>A path that never existed is reported too — not silently ignored.</summary>
@@ -293,7 +309,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
             ["part-does-not-exist.parquet"] = new long[] { 0 },
         });
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await table.ComputeDeletionVectorActionsAsync(selection));
+            await ComputePathKeyedAsync(table, selection));
         Assert.Contains("part-does-not-exist.parquet", ex.Message);
     }
 
@@ -312,7 +328,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
         {
             [paths[1]] = new long[] { 0 },
         });
-        var (actions, rows) = await table.ComputeDeletionVectorActionsAsync(selection, resolveAgainst: pinned);
+        var (actions, rows) = await ComputePathKeyedAsync(table, selection, pinned);
         Assert.Equal(1, rows);
 
         // a concurrent writer deletes row 2 of the SAME file while the transaction is open
@@ -324,7 +340,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
             {
                 [racerPaths[1]] = new long[] { 2 },
             });
-            var (racerActions, racerRows) = await racer.ComputeDeletionVectorActionsAsync(racerSel);
+            var (racerActions, racerRows) = await ComputePathKeyedAsync(racer, racerSel);
             Assert.Equal(1, racerRows);
             await racer.CommitDataFilesAsync([], DeltaWriteMode.Append,
                 extraActions: racerActions, expectedVersion: racer.CurrentSnapshot.Version, operation: "DELETE");
@@ -474,7 +490,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
         {
             [paths[0]] = new long[] { 0 },
         });
-        var (actions, _) = await table.ComputeDeletionVectorActionsAsync(selection, resolveAgainst: pinned);
+        var (actions, _) = await ComputePathKeyedAsync(table, selection, pinned);
 
         // move the table forward so the rebase actually runs, then rebase a selection naming a bogus file
         await using (var racer = await OpenAsync())

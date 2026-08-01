@@ -493,7 +493,7 @@ public class MetadataColumnTests : IDisposable
             [target.FilePath] = new long[] { target.RowIndex },
         });
 
-        long rows = await table.UpdateRowsAsync(selection, matched =>
+        var (rows, _) = await table.UpdateBySelectionViaVectorsAsync(selection, matched =>
         {
             Assert.Equal(1, matched.Length);
             Assert.Equal(12L, ((Int64Array)matched.Column("id")).GetValue(0)!.Value);
@@ -534,7 +534,7 @@ public class MetadataColumnTests : IDisposable
             targetPath = target.FilePath;
             Assert.NotNull(idBefore);
 
-            await table.UpdateRowsAsync(
+            await table.UpdateBySelectionViaVectorsAsync(
                 RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
                 {
                     [targetPath] = new long[] { targetPos },
@@ -587,7 +587,7 @@ public class MetadataColumnTests : IDisposable
                 [targetFile] = new long[] { 1, 2 },
             });
 
-            long rows = await table.UpdateRowsAsync(selection,
+            var (rows, _) = await table.UpdateBySelectionViaVectorsAsync(selection,
                 (filePath, matched, positions) =>
                 {
                     observedPaths.Add(filePath);
@@ -627,14 +627,14 @@ public class MetadataColumnTests : IDisposable
         var path = table.CurrentSnapshot.ActiveFiles.Values.First().Path;
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await table.UpdateRowsAsync(
+            await table.UpdateBySelectionViaVectorsAsync(
                 RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
                 {
                     [path] = new long[] { 0 },
                 }),
                 m => m));
         Assert.Contains("deletion vectors", ex.Message);
-        Assert.Contains("UpdateBySelectionAsync", ex.Message);   // names the alternative
+        Assert.Contains("UpdateRowsAsync", ex.Message);   // names the copy-on-write alternative
     }
 
     /// <summary>An updater returning the wrong row count is a caller error, caught rather than committed.</summary>
@@ -644,7 +644,7 @@ public class MetadataColumnTests : IDisposable
         await using var table = await CreateTrackedAsync();
         var target = (await ReadMetaAsync(table)).First(r => r.Id == 2);
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await table.UpdateRowsAsync(
+            await table.UpdateBySelectionViaVectorsAsync(
                 RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
                 {
                     [target.FilePath] = new long[] { target.RowIndex },

@@ -10,8 +10,8 @@ using EngineeredWood.IO.Local;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// The read-side TRANSIENT row-id surface — <see cref="DeltaTable.ReadAllWithRowIdsAsync"/> /
-/// <see cref="DeltaTable.ReadAtVersionWithRowIdsAsync"/> append a trailing <c>_ew_row_address</c> =
+/// The read-side TRANSIENT row-id surface — <see cref="DeltaTable.ReadAsync(DeltaReadOptions, CancellationToken)"/>
+/// with <see cref="DeltaRowMetadata.RowAddress"/> (optionally at a version) appends a trailing <c>_ew_row_address</c> =
 /// <c>(fileOrdinal &lt;&lt; 40) | absolutePosition</c>, and <see cref="DeltaTable.OrderedActiveBaseRowIdsAsync"/>
 /// gives the per-ordinal <c>baseRowId</c>. NOT a stable Delta id — it round-trips WITHIN a snapshot to the
 /// row-id DML surface (a host reads rows, keeps the ids, then deletes/updates exactly those rows). This is the

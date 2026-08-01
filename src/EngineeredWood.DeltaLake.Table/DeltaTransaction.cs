@@ -499,13 +499,27 @@ public sealed class DeltaTransaction
     /// <param name="expectedPrevious">The version the table must ALREADY record for
     /// <paramref name="appId"/>, re-checked against every concurrent commit before each attempt. Null — the
     /// default — writes unconditionally. Note that null is "do not check", not "expect no prior record":
-    /// the absence of a record cannot be asserted through this parameter, and a first-ever write simply
-    /// omits it.</param>
-    public void RequireAppTransaction(string appId, long version, long? expectedPrevious = null)
+    /// absence is asserted with <paramref name="requireAbsent"/> instead, and a first-ever write that does
+    /// not care omits both.</param>
+    /// <param name="requireAbsent">The table must record NO version at all for <paramref name="appId"/> —
+    /// the precondition a producer's FIRST batch needs, and the one <paramref name="expectedPrevious"/>
+    /// cannot state (its null means "do not check"). Without it a replayed first batch commits twice: the
+    /// replay has no prior version to name, so it would write unconditionally. Mutually exclusive with
+    /// <paramref name="expectedPrevious"/> — asserting both a specific prior version and no prior version
+    /// is a contradiction, and is rejected rather than silently resolved in one direction's favour.</param>
+    public void RequireAppTransaction(
+        string appId, long version, long? expectedPrevious = null, bool requireAbsent = false)
     {
         EnsureNotCommitted();
         if (string.IsNullOrEmpty(appId))
             throw new ArgumentException("appId must be a non-empty identifier.", nameof(appId));
+        if (requireAbsent && expectedPrevious is not null)
+        {
+            throw new ArgumentException(
+                $"requireAbsent and expectedPrevious are mutually exclusive for '{appId}': one asserts that "
+                + "the table records NO version, the other that it records a specific one.",
+                nameof(requireAbsent));
+        }
 
         foreach (var existing in _appTransactions)
         {
@@ -518,7 +532,7 @@ public sealed class DeltaTransaction
             }
         }
 
-        _appTransactions.Add(new AppTransactionRequirement(appId, version, expectedPrevious));
+        _appTransactions.Add(new AppTransactionRequirement(appId, version, expectedPrevious, requireAbsent));
     }
 
     // ── Declarations ───────────────────────────────────────────────────────────────────────────────────
@@ -633,5 +647,6 @@ public sealed class DeltaTransaction
 
     /// <summary>One <see cref="RequireAppTransaction"/> call: the <c>txn</c> action to write, plus the
     /// compare-and-set guard the commit loop re-checks before every attempt.</summary>
-    internal sealed record AppTransactionRequirement(string AppId, long Version, long? ExpectedPrevious);
+    internal sealed record AppTransactionRequirement(
+        string AppId, long Version, long? ExpectedPrevious, bool RequireAbsent = false);
 }

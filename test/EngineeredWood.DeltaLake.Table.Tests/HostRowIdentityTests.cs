@@ -63,7 +63,7 @@ public class HostRowIdentityTests : IDisposable
     /// <summary>
     /// Every row's (user id → STABLE row id) resolved the way a spec reader does: read each active file's
     /// parquet directly, take the materialized row-id column where the file has one, else derive
-    /// <c>baseRowId + position</c>. Deliberately NOT via <c>ReadAllWithRowIdsAsync</c>, whose
+    /// <c>baseRowId + position</c>. Deliberately NOT via a <c>DeltaRowMetadata.RowAddress</c> read, whose
     /// <c>_ew_row_address</c> column is the snapshot-relative TRANSIENT address — same name, different
     /// number (it is documented as "NOT a stable Delta row id").
     /// </summary>

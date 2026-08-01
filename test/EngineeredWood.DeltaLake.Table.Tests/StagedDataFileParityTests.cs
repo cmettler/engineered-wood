@@ -84,12 +84,14 @@ public class StagedDataFileParityTests : IDisposable
         var files = await table.WriteDataFilesAsync([Batch(10, 5)]);   // ids 10..14
 
         var txn = table.StartTransaction();
+        // Keyed by RelativePath, which is what add.path becomes — these files are in no snapshot yet, so
+        // there is no ordinal to name them by.
         await txn.StageDataFilesAsync(
             files,
-            deletedPositionsByFileIndex: new Dictionary<int, IReadOnlyCollection<long>>
+            bornDeleted: RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
             {
-                [0] = new long[] { 1, 3 },   // hide ids 11 and 13
-            });
+                [files[0].RelativePath] = new long[] { 1, 3 },   // hide ids 11 and 13
+            }));
         await txn.CommitAsync();
 
         var ids = await ReadIdsAsync();
