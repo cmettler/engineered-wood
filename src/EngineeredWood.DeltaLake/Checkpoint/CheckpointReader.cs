@@ -41,6 +41,14 @@ public sealed class CheckpointReader
     /// Reproduced live on Fabric OneLake, 2026-07-31: 8 concurrent writers × 12 commits (checkpoint
     /// interval 10) failed 2 of 8 writers this way. Single-writer runs can never hit it, which is why it
     /// survived so long.</para>
+    /// <para><b>Making the WRITE atomic would not remove the need for this.</b> A write-temp-then-rename
+    /// would narrow the partial-content window only on backends that have an atomic replacing rename, and
+    /// <see cref="ITableFileSystem.RenameAsync"/> is create-if-absent by contract (it returns false when
+    /// the target exists) so replacing this file would need a new primitive on every backend. It would also
+    /// leave the other two failure modes untouched: a read can still fail because the object was replaced
+    /// under it however the replacement happened, and a perfectly written hint can still point at a
+    /// checkpoint that log cleanup has since removed. The hint is advisory by design, so the reader has to
+    /// cope regardless — which is exactly what the protocol asks for.</para>
     /// </remarks>
     public async ValueTask<LastCheckpointInfo?> ReadLastCheckpointAsync(
         CancellationToken cancellationToken = default)
