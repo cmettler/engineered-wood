@@ -24,6 +24,7 @@ namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 /// files actually touched. Anything delta-rs can check belongs in <see cref="DeltaRsInteropTests"/>,
 /// which runs in seconds.</para>
 /// </summary>
+[Collection("Interop")]
 public class SparkInteropTests : IDisposable
 {
     private readonly string _tempDir;
@@ -471,7 +472,7 @@ public class SparkInteropTests : IDisposable
                     return new RecordBatch(IdRegionSchema, [b.Column("id"), region.Build()], b.Length);
                 });
 
-            await foreach (var batch in table.ReadAllWithRowTrackingAsync(null, null))
+            await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
             {
                 var ids = (Int64Array)batch.Column("id");
                 var rowIds = (Int64Array)batch.Column(
@@ -581,7 +582,7 @@ public class SparkInteropTests : IDisposable
         await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
 
         var ewIds = new Dictionary<long, long?>();
-        await foreach (var batch in table.ReadAllWithRowTrackingAsync(null, null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
         {
             var ids = (Int64Array)batch.Column("id");
             var rowIds = (Int64Array)batch.Column(
@@ -734,7 +735,7 @@ public class SparkInteropTests : IDisposable
 
             // the transient rowid of the id-20 row, then a copy-on-write delete of exactly it
             long rid20 = -1;
-            await foreach (var b in table.ReadAllWithRowIdsAsync(null, null))
+            await foreach (var b in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
             {
                 var id = (Int64Array)b.Column("id");
                 var rowId = (Int64Array)b.Column(TransientRowAddress.ColumnName);
@@ -742,7 +743,8 @@ public class SparkInteropTests : IDisposable
                     if (id.GetValue(i) == 20) rid20 = rowId.GetValue(i)!.Value;
             }
             Assert.True(rid20 >= 0);
-            var (deleted, _) = await table.DeleteByRowIdsAsync([rid20]);
+            var (deleted, _) = await table.DeleteRowsAsync(
+                RowSelection.FromRowAddresses([rid20], table.CurrentSnapshot), RowDeleteMode.CopyOnWrite);
             Assert.Equal(1, deleted);
         }
 
@@ -1954,7 +1956,7 @@ public class SparkInteropTests : IDisposable
 
         await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
         var feed = new List<(string Change, long Id, long? RowId, long? RowVersion, long Commit)>();
-        await foreach (var batch in table.ReadChangesWithRowTrackingAsync(0, table.CurrentSnapshot.Version))
+        await foreach (var batch in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 0, EndVersion = table.CurrentSnapshot.Version, Metadata = DeltaRowMetadata.RowTracking }))
         {
             var change = (StringArray)batch.Column("_change_type");
             var id = (Int64Array)batch.Column("id");
@@ -2008,7 +2010,7 @@ public class SparkInteropTests : IDisposable
     {
         var wanted = new HashSet<long>(ids);
         var result = new List<long>();
-        await foreach (var b in table.ReadAllWithRowIdsAsync(null, null))
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
         {
             var id = (Int64Array)b.Column("id");
             var rid = (Int64Array)b.Column(TransientRowAddress.ColumnName);
@@ -2047,21 +2049,31 @@ public class SparkInteropTests : IDisposable
 
             // UPDATE id=2's value → "z" by transient rowid (copy-on-write rewrite of its file).
             updateVersion = table.CurrentSnapshot.Version + 1;
-            long rid2 = (await RowIdsOfAsync(table, 2)).Single();
-            var updates = new RecordBatch(
-                new Apache.Arrow.Schema.Builder()
-                    .Field(new Field(TransientRowAddress.ColumnName, Int64Type.Default, false))
-                    .Field(new Field("value", StringType.Default, true))
-                    .Build(),
-                [
-                    new Int64Array.Builder().Append(rid2).Build(),
-                    new StringArray.Builder().Append("z").Build(),
-                ], 1);
-            Assert.Equal(updateVersion, await table.UpdateByRowIdsAsync(updates));
+            var selection2 = RowSelection.FromRowAddresses(
+                await RowIdsOfAsync(table, 2), table.CurrentSnapshot);
+            Assert.Equal(updateVersion, await table.UpdateRowsAsync(selection2, (_, batches, _) =>
+            {
+                var outp = new List<RecordBatch>(batches.Count);
+                foreach (var b in batches)
+                {
+                    var id = (Int64Array)b.Column("id");
+                    var value = (StringArray)b.Column("value");
+                    var nb = new StringArray.Builder();
+                    for (int i = 0; i < b.Length; i++)
+                        nb.Append(id.GetValue(i) == 2 ? "z" : value.GetString(i));
+                    var columns = new IArrowArray[b.ColumnCount];
+                    for (int c = 0; c < b.ColumnCount; c++)
+                        columns[c] = b.Schema.FieldsList[c].Name == "value" ? nb.Build() : b.Column(c);
+                    outp.Add(new RecordBatch(b.Schema, columns, b.Length));
+                }
+                return outp;
+            }));
 
             // DELETE id=3 by transient rowid (copy-on-write again — no deletion vectors on this table).
             deleteVersion = table.CurrentSnapshot.Version + 1;
-            var (deleted, version) = await table.DeleteByRowIdsAsync(await RowIdsOfAsync(table, 3));
+            var (deleted, version) = await table.DeleteRowsAsync(
+                RowSelection.FromRowAddresses(await RowIdsOfAsync(table, 3), table.CurrentSnapshot),
+                RowDeleteMode.CopyOnWrite);
             Assert.Equal(1, deleted);
             Assert.Equal(deleteVersion, version);
         }
@@ -2289,7 +2301,7 @@ public class SparkInteropTests : IDisposable
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.OpenAsync(fs);
         var rows = new List<(string, long)>();
-        await foreach (var b in table.ReadChangesAsync(start, end))
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = start, EndVersion = end }))
         {
             var ids = (Int64Array)b.Column("id");
             var ct = (StringArray)b.Column(b.Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn));

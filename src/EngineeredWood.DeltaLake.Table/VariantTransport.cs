@@ -4,6 +4,7 @@
 using Apache.Arrow;
 using Apache.Arrow.Scalars.Variant;
 using EngineeredWood.DeltaLake.Schema;
+using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.Data;
 
 namespace EngineeredWood.DeltaLake.Table;

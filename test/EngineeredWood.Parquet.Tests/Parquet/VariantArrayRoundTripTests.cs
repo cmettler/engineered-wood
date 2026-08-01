@@ -2,7 +2,9 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Operations.Shredding;
 using Apache.Arrow.Operations.VariantJson;
+using Apache.Arrow.Scalars.Variant;
 using Apache.Arrow.Types;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
@@ -170,6 +172,125 @@ public class VariantArrayRoundTripTests : IDisposable
             var got = va.GetValueBytes(i);
             Assert.Equal(values[i], got.ToArray());
         }
+    }
+
+    /// <summary>
+    /// An EXTENSION column in a batch that exceeds
+    /// <see cref="ParquetWriteOptions.RowGroupMaxRows"/> must survive the auto-split.
+    /// </summary>
+    /// <remarks>
+    /// It did not: <c>MaterializeSlice</c> reached the general path, which casts to
+    /// <c>Apache.Arrow.Array</c>, and <c>ExtensionArray</c> derives from <c>object</c> — so splitting a
+    /// batch carrying a VARIANT (or GUID) column threw <see cref="InvalidCastException"/>. Nothing
+    /// exercised it because the default row-group limit is far above any test's batch. Unrelated to
+    /// shredding: the split happens before any shredding decision, and this test leaves shredding off.
+    /// </remarks>
+    [Fact]
+    public async Task VariantColumn_LargerThanARowGroup_SurvivesTheAutoSplit()
+    {
+        string path = Path.Combine(_tempDir, "variant_split.parquet");
+        var values = Enumerable.Range(0, 10)
+            .Select(i => new byte[] { (byte)(i % 2 == 0 ? 0x00 : 0x0C) })
+            .ToArray();
+        var (batch, _, _) = MakeVariantBatch(values);
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false,
+            ParquetWriteOptions.Default with { RowGroupMaxRows = 4 }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false,
+            new ParquetReadOptions { ExtensionRegistry = VariantRegistry() });
+
+        var meta = await reader.ReadMetadataAsync();
+        Assert.Equal(3, meta.RowGroups.Count); // 4 + 4 + 2
+
+        int row = 0;
+        for (int g = 0; g < meta.RowGroups.Count; g++)
+        {
+            var read = await reader.ReadRowGroupAsync(g);
+            var variant = Assert.IsType<VariantArray>(read.Column(0));
+            for (int i = 0; i < variant.Length; i++, row++)
+                Assert.Equal(values[row], variant.GetValueBytes(i).ToArray());
+        }
+        Assert.Equal(values.Length, row);
+    }
+
+    /// <summary>
+    /// The write direction end to end: a column shredded by
+    /// <see cref="VariantShredding.TryShred(IReadOnlyList{VariantValue}, ReadOnlySpan{bool}, out VariantArray)"/>
+    /// must survive the writer as a SPEC-SHAPED shredded group and read back with every value intact.
+    /// </summary>
+    /// <remarks>
+    /// The unit tests around <c>TryShred</c> never leave memory, so they cannot see whether the
+    /// storage struct the shredder produces is one the writer can emit. What this asserts is the
+    /// physical layout the spec requires — the group annotated VARIANT, a required <c>metadata</c>, a
+    /// nullable <c>value</c> holding the residual, and a <c>typed_value</c> group carrying one
+    /// <c>value</c>/<c>typed_value</c> pair per shredded field — because that layout, not EW's own
+    /// round trip, is what a foreign reader keys off.
+    /// </remarks>
+    [Fact]
+    public async Task ShreddedVariantColumn_RoundTripsThroughAParquetFile()
+    {
+        VariantValue Obj(int a, string b) => VariantValue.FromObject(
+            new Dictionary<string, VariantValue>
+            {
+                ["a"] = VariantValue.FromInt32(a),
+                ["b"] = VariantValue.FromString(b),
+            });
+
+        // Row 1 is SQL NULL: the shredder sees a placeholder there, and the mask has to survive the
+        // file as storage validity rather than as a shredded placeholder value.
+        var values = new[] { Obj(1, "x"), VariantValue.Null, Obj(3, "z") };
+        var isSqlNull = new[] { false, true, false };
+
+        Assert.True(VariantShredding.TryShred(values, isSqlNull, out var shredded));
+        Assert.True(shredded.IsShredded);
+
+        string path = Path.Combine(_tempDir, "variant_shredded.parquet");
+        var field = new Field("v", shredded.Data.DataType, nullable: true);
+        var schema = new Apache.Arrow.Schema(new[] { field }, metadata: null);
+        var batch = new RecordBatch(schema, new IArrowArray[] { shredded }, values.Length);
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false,
+            new ParquetReadOptions { ExtensionRegistry = VariantRegistry() });
+
+        // Physical layout, as a foreign reader sees it.
+        var meta = await reader.ReadMetadataAsync();
+        var group = meta.Schema.First(s => s.Name == "v");
+        Assert.IsType<LogicalType.VariantType>(group.LogicalType);
+        Assert.Equal(3, group.NumChildren); // metadata, value, typed_value
+        Assert.Equal(FieldRepetitionType.Required, meta.Schema.First(s => s.Name == "metadata").RepetitionType);
+        var typed = meta.Schema.First(s => s.Name == "typed_value");
+        Assert.Equal(2, typed.NumChildren); // one group per shredded field: a, b
+        Assert.Contains(meta.Schema, s => s.Name == "a");
+        Assert.Contains(meta.Schema, s => s.Name == "b");
+
+        // Values, as EW's own reader sees them after reassembly.
+        var read = await reader.ReadRowGroupAsync(0);
+        var va = Assert.IsType<VariantArray>(read.Column(0));
+        Assert.Equal(values.Length, va.Length);
+        Assert.False(va.IsNull(0));
+        Assert.True(va.IsNull(1));
+        Assert.False(va.IsNull(2));
+        Assert.Equal(
+            VariantJsonWriter.ToJson(values[0], indented: false),
+            VariantJsonWriter.ToJson(va.GetLogicalVariantValue(0), indented: false));
+        Assert.Equal(
+            VariantJsonWriter.ToJson(values[2], indented: false),
+            VariantJsonWriter.ToJson(va.GetLogicalVariantValue(2), indented: false));
     }
 
     /// <summary>

@@ -38,8 +38,8 @@ namespace EngineeredWood.DeltaLake.Table;
 /// <see cref="StageRowDeletesAsync"/>, <see cref="StageSchemaChange"/>,
 /// <see cref="StageChangeDataAsync"/>, and <see cref="StageActions"/>. These commit through the same
 /// conflict-check, rebase, and retry loop as the computed ones, so an embedding host does not reimplement
-/// it. Plan against <see cref="Snapshot"/> so the file ordinals a staged delete is keyed by agree with
-/// what the transaction validates.</para>
+/// it. Plan against <see cref="Snapshot"/> so the rows a staged delete names agree with what the
+/// transaction validates.</para>
 /// </summary>
 public sealed class DeltaTransaction
 {
@@ -64,14 +64,13 @@ public sealed class DeltaTransaction
     // otherwise reserve the SAME ids, and the duplicate is invisible until a spec reader resolves two rows
     // to one identity. Null until the first row-tracking stage reads the base mark.
     private long? _nextRowId;
-    // Staged idempotent-producer versions, keyed by appId, each with the version it requires the table to be
-    // at. Kept out of _actions: the commit loop has to re-check them per attempt (see StageAppTransaction).
-    private readonly Dictionary<string, AppTransactionStage> _appTransactions = new(StringComparer.Ordinal);
-    // Set by SetOperation: what the host says this transaction did, which beats the inference.
-    private string? _operationOverride;
-    // Set by StageWholeTableRead: the host's scan had no pushable predicate, so every concurrent add and
-    // remove is potentially relevant. Strictly stronger than any predicate list.
-    private bool _readWholeTable;
+    // Preconditions: facts about the base version that must hold on EVERY commit attempt. Distinct from
+    // staged effects, which are rebased and retried — a precondition cannot become true by retrying.
+    private readonly List<AppTransactionRequirement> _appTransactions = [];
+    // Declarations: what the HOST read, which the commit loop cannot infer because it never saw the scan.
+    private bool _declaredWholeTableRead;
+    // What commitInfo records, when the caller says rather than letting it be inferred.
+    private string? _operation;
     private bool _committed;
 
     internal DeltaTransaction(
@@ -89,6 +88,7 @@ public sealed class DeltaTransaction
     /// The pinned snapshot this transaction reads, plans, and validates against. Pass it wherever a
     /// host-driven step needs to agree with the transaction on what the table looks like — most importantly
     /// <see cref="DeltaTable.PlanFiles"/>, whose <see cref="PlannedFile.FileOrdinal"/> values are the keys
+    /// <see cref="RowSelection.FromRowAddresses"/> resolves into the paths
     /// <see cref="StageRowDeletesAsync"/> expects. Planning against
     /// <see cref="DeltaTable.CurrentSnapshot"/> instead would silently key positions to a different file
     /// ordering once another writer commits.
@@ -108,8 +108,42 @@ public sealed class DeltaTransaction
 
     internal IReadOnlyList<DeltaTable.DeleteDvEdit> DvEdits => _dvEdits;
 
-    internal string Operation =>
-        _operationOverride ?? (_operations.Count == 1 ? _operations.First() : "WRITE");
+    /// <summary>
+    /// What this transaction's <c>commitInfo</c> records as its operation. Null — the default — keeps the
+    /// inference: a transaction that staged exactly one kind of work reports that kind, and a mixed one
+    /// reports <c>"WRITE"</c>, because Delta's operation field is ONE string per commit and no engine has a
+    /// name for a fused DELETE+INSERT. Set it and it wins.
+    ///
+    /// <para>A property rather than a per-call argument because it describes the TRANSACTION, not any one
+    /// staged thing: several staging calls cannot each name the commit's operation.</para>
+    /// </summary>
+    /// <exception cref="ArgumentException">The value is an empty or whitespace string. Null is how you ask
+    /// for the inference; <c>""</c> would silently commit an operation-less commitInfo.</exception>
+    public string? Operation
+    {
+        get => _operation;
+        set
+        {
+            if (value is not null && string.IsNullOrWhiteSpace(value))
+            {
+                throw new ArgumentException(
+                    "Operation must be null (infer it) or a non-empty name. An empty string would commit a "
+                    + "commitInfo naming no operation.",
+                    nameof(value));
+            }
+            _operation = value;
+        }
+    }
+
+    /// <summary>The operation the commit actually records: the caller's if set, else the inference.</summary>
+    internal string EffectiveOperation =>
+        _operation ?? (_operations.Count == 1 ? _operations.First() : "WRITE");
+
+    /// <summary>The app-transaction preconditions to re-check on every commit attempt.</summary>
+    internal IReadOnlyList<AppTransactionRequirement> AppTransactions => _appTransactions;
+
+    /// <summary>Whether the host declared that its scan read the whole table.</summary>
+    internal bool DeclaredWholeTableRead => _declaredWholeTableRead;
 
     /// <summary>
     /// The row id the next staged add would reserve, or null if nothing staged advanced it. The commit emits
@@ -294,29 +328,27 @@ public sealed class DeltaTransaction
     }
 
     /// <summary>
-    /// <see cref="StageDataFiles"/> for the two cases it cannot express, bringing staging to parity with
-    /// <see cref="DeltaTable.CommitDataFilesAsync"/>: files whose rows this transaction ALSO deleted before
-    /// committing, and files for a table with identity columns whose values the host generated itself.
+    /// Stages already-written data files with full parity to
+    /// <see cref="DeltaTable.CommitDataFilesAsync"/> — the same append, plus the two things only the
+    /// auto-committing surface could express. Use <see cref="StageDataFiles"/> for the plain case; reach for
+    /// this one only when you need an argument below.
     ///
-    /// <para>Asynchronous for the same reason <see cref="StageRowDeletesAsync(FileRowSelection,
-    /// CancellationToken)"/> is: hiding rows means WRITING a deletion vector. When
-    /// <paramref name="deletedPositionsByFileIndex"/> is null and
-    /// <paramref name="identityValuesPreGenerated"/> is false this is exactly
-    /// <see cref="StageDataFiles"/>.</para>
+    /// <para>Returns the rows the commit will make VISIBLE: every file's row count, less anything
+    /// <paramref name="bornDeleted"/> hides.</para>
     /// </summary>
-    /// <param name="files">As <see cref="StageDataFiles"/>.</param>
-    /// <param name="deletedPositionsByFileIndex">Positions to hide, keyed by index into
-    /// <paramref name="files"/>. The add is committed WITH an inline deletion vector, so those rows never
-    /// appear in any committed version — which is what lets a host delete rows it inserted in the same
-    /// transaction without a rewrite, and why the positions are file-INDEX keyed rather than path-keyed like
-    /// <see cref="FileRowSelection"/>: these files are in no snapshot yet, so no path can name them.</param>
-    /// <param name="identityValuesPreGenerated">The files already contain this table's identity values, so the
-    /// refusal that normally protects identity columns from an external writer does not apply. The caller owns
-    /// having generated them consistently with the table's recorded high-water mark.</param>
-    /// <param name="cancellationToken">Cancels the deletion-vector writes.</param>
-    public async ValueTask StageDataFilesAsync(
+    /// <param name="bornDeleted">Rows this transaction inserted and then deleted, so they never appear in any
+    /// committed version — keyed by <see cref="WrittenDataFile.RelativePath"/>, which is what
+    /// <c>add.path</c> becomes. The add is born with an inline deletion vector and its stats marked
+    /// <c>tightBounds=false</c>, as the spec requires once a vector hides rows the bounds were computed over.
+    /// The key can only name a file in this same call — these files are in no snapshot yet — and a path or
+    /// position that does not is reported rather than dropped.</param>
+    /// <param name="identityValuesPreGenerated">The caller generated the identity-column values itself (see
+    /// <see cref="DeltaTable.GenerateIdentityValues"/>), so the write-time per-row processing an outside
+    /// writer skipped has already happened. Without this an identity table's appends cannot be staged at
+    /// all — the reason this overload exists.</param>
+    public async ValueTask<long> StageDataFilesAsync(
         IReadOnlyList<WrittenDataFile> files,
-        IReadOnlyDictionary<int, IReadOnlyCollection<long>>? deletedPositionsByFileIndex = null,
+        RowSelection? bornDeleted = null,
         bool identityValuesPreGenerated = false,
         CancellationToken cancellationToken = default)
     {
@@ -325,93 +357,25 @@ public sealed class DeltaTransaction
             throw new ArgumentNullException(nameof(files));
         _table.ValidateWritable(_baseSnapshot, isAppend: true);
         if (files.Count == 0)
-            return;
+            return 0;
 
-        var dvs = deletedPositionsByFileIndex is { Count: > 0 }
-            ? await _table.BuildInlineDeletionVectorsAsync(deletedPositionsByFileIndex, cancellationToken)
-                .ConfigureAwait(false)
-            : null;
-        var (actions, nextRowId) = _table.BuildStagedAppendActions(
-            _baseSnapshot, files, _nextRowId, identityValuesPreGenerated, dvs);
+        var (actions, nextRowId, liveRows) = await _table.BuildStagedAppendActionsAsync(
+            _baseSnapshot, files, bornDeleted, identityValuesPreGenerated, _nextRowId, cancellationToken)
+            .ConfigureAwait(false);
+
         _nextRowId = nextRowId;
         StageInternal(actions);
         _operations.Add("WRITE");
-    }
-
-    /// <summary>
-    /// Declares a predicate this transaction READ, so a concurrent add that could satisfy it is a
-    /// concurrentAppend conflict.
-    ///
-    /// <para>The <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> /
-    /// <see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken)"/>
-    /// overloads record their own predicate, but a host that ran its own scan and staged the result has no
-    /// other way to say what that scan depended on — and a transaction that declares nothing is treated as
-    /// having read only the files it removes. Under
-    /// <see cref="IsolationLevel.Serializable"/> that is the difference between detecting a concurrent append
-    /// into the range this transaction read and silently accepting it.</para>
-    /// </summary>
-    public void StageReadPredicate(Expressions.Predicate predicate)
-    {
-        EnsureNotCommitted();
-        if (predicate is null)
-            throw new ArgumentNullException(nameof(predicate));
-        _readPredicates.Add(predicate);
-    }
-
-    /// <summary>
-    /// Declares that this transaction read the WHOLE table — the honest answer when a host's scan had no
-    /// pushable predicate, since every concurrent add and remove is then potentially relevant. Strictly
-    /// stronger than any set of predicates: it makes <see cref="StageReadPredicate"/> redundant.
-    /// </summary>
-    /// <remarks>
-    /// <para><b>This declaration is NOT honoured for a row-level DELETE under</b>
-    /// <see cref="IsolationLevel.WriteSerializable"/><b>, which is the DEFAULT level.</b> There the commit
-    /// loop drops it (keeping any staged predicates), so a concurrent writer that DV-deletes or compacts away
-    /// a file this transaction merely READ does not abort it. Without that, declaring the whole table is
-    /// self-defeating for the case it exists to serve: the row-level write validation has already established
-    /// that no row this transaction removes was concurrently removed or moved beyond reach, yet
-    /// <c>WholeTable</c> makes EVERY concurrent add and remove match.</para>
-    /// <para>Stated here because it is a behaviour the caller cannot otherwise observe, and because it is a
-    /// DEPARTURE rather than an implementation of the level: in Delta, <c>concurrentDeleteRead</c> is
-    /// level-INDEPENDENT (Spark gates only <c>concurrentAppend</c> on isolation, via the blind-append test), so
-    /// a <c>dataChange=true</c> remove of a file the transaction read raises at both levels there. The
-    /// departure is deliberate and is fabricator's policy choice for Databricks-style row-level concurrency;
-    /// it is under discussion upstream (clast-project/engineered-wood#13, #15) and measurement against Spark
-    /// and delta-rs is what should settle it. <see cref="IsolationLevel.Serializable"/> keeps the full read
-    /// set and is unaffected.</para>
-    /// </remarks>
-    public void StageWholeTableRead()
-    {
-        EnsureNotCommitted();
-        _readWholeTable = true;
-    }
-
-    internal bool ReadWholeTable => _readWholeTable;
-
-    /// <summary>
-    /// Names the operation this transaction records in <c>commitInfo</c>, overriding what it would infer from
-    /// the staging calls it received.
-    ///
-    /// <para>The inference cannot do better than <c>WRITE</c> once a transaction mixes kinds, but a host
-    /// usually knows exactly what its statement was — and the history is read by people and tools deciding
-    /// what a version did, so <c>WRITE</c> for what was really an <c>UPDATE</c>, or for a fused
-    /// multi-statement transaction, loses information nothing downstream can recover.</para>
-    /// </summary>
-    public void SetOperation(string operation)
-    {
-        EnsureNotCommitted();
-        if (string.IsNullOrEmpty(operation))
-            throw new ArgumentException("operation must be a non-empty name.", nameof(operation));
-        _operationOverride = operation;
+        return liveRows;
     }
 
     /// <summary>
     /// Stages a deletion-vector DELETE of rows the caller identified itself — the host-driven counterpart of
     /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CancellationToken)"/>, for an engine that
-    /// evaluated its own predicate and knows which rows must go. Rows are addressed as ABSOLUTE in-file
-    /// positions keyed by the file's ordinal in this transaction's pinned snapshot — the ordinals
-    /// <see cref="DeltaTable.PlanFiles"/> reports when planned against <see cref="Snapshot"/>, and the high
-    /// bits of the transient rowids the read paths emit. Returns the rows newly hidden.
+    /// evaluated its own predicate and knows which rows must go. Rows are named by
+    /// <see cref="RowSelection"/>: absolute in-file positions per <c>add.path</c>. Build it against
+    /// <see cref="Snapshot"/> — this transaction's pinned version — so the addresses and what the commit
+    /// validates agree. Returns the rows newly hidden.
     ///
     /// <para>Each touched file's existing vector is unioned with the new positions, so repeated deletes
     /// compose, and a position already covered is not counted or replayed. The per-file edits are recorded, so
@@ -419,37 +383,14 @@ public sealed class DeltaTransaction
     /// rewrite relocates these rows by stable id — the caller does not drive that rebase.</para>
     /// </summary>
     public async ValueTask<long> StageRowDeletesAsync(
-        IReadOnlyDictionary<int, IReadOnlyCollection<long>> positionsByOrdinal,
-        CancellationToken cancellationToken = default)
-    {
-        EnsureNotCommitted();
-        if (positionsByOrdinal is null)
-            throw new ArgumentNullException(nameof(positionsByOrdinal));
-        if (positionsByOrdinal.Count == 0)
-            return 0;
-        // Resolved here rather than deeper: the ordinals name files in THIS transaction's base snapshot, and
-        // an ordinal is only meaningful paired with the snapshot it was planned from.
-        return await StageRowDeletesAsync(
-            DeltaTable.SelectionFromOrdinals(positionsByOrdinal, _baseSnapshot), cancellationToken)
-            .ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Stages a row-level DELETE keyed by <see cref="FileRowSelection"/> — log <c>add.path</c> plus absolute
-    /// in-file positions — instead of by path-sorted ordinal. Same staging semantics as the ordinal overload;
-    /// prefer this one. The key is self-describing, so it carries no assumption that the caller reproduces this
-    /// library's file ordering, and a path that is not active in the base snapshot fails LOUDLY rather than
-    /// resolving to nothing and staging a delete of no rows.
-    /// </summary>
-    public async ValueTask<long> StageRowDeletesAsync(
-        FileRowSelection selection,
+        RowSelection selection,
         CancellationToken cancellationToken = default)
     {
         EnsureNotCommitted();
         if (selection is null)
             throw new ArgumentNullException(nameof(selection));
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
-        if (selection.RowsByFile.Count == 0)
+        if (selection.IsEmpty)
             return 0;
 
         var result = await _table.ComputeDvActionsWithEditsAsync(
@@ -492,7 +433,7 @@ public sealed class DeltaTransaction
     /// infer from this version's adds and removes.</para>
     /// </summary>
     /// <param name="rowIds">On a ROW TRACKING table, each row's stable row id — one per row of
-    /// <paramref name="rows"/>, ordinarily what <see cref="DeltaTable.ReadAllWithRowTrackingAsync"/> reported
+    /// <paramref name="rows"/>, ordinarily what a <see cref="DeltaRowMetadata.RowTracking"/> read reported
     /// for it. A change file is the only place a change row's identity can live (a <c>cdc</c> action has no
     /// <c>baseRowId</c>), so omitting these leaves the staged rows with NULL ids on the feed.</param>
     /// <param name="rowCommitVersions">The commit-version companion of <paramref name="rowIds"/>: the version
@@ -522,52 +463,109 @@ public sealed class DeltaTransaction
     /// snapshot-relative state (row-id ranges, deletion-vector positions) belongs in a typed method instead,
     /// which is what lets the commit loop rebase it.
     /// </summary>
-    /// <summary>
-    /// Stages an idempotent-producer version for <paramref name="appId"/> — a <c>txn</c> action committed
-    /// atomically with this transaction's work, guarded by a compare-and-set against
-    /// <paramref name="expectedPrevious"/>.
-    ///
-    /// <para>Not <see cref="StageActions"/> with a hand-built <see cref="TransactionId"/>, for the reason that
-    /// method's own remarks give: the guard is SNAPSHOT-RELATIVE state, so it has to be re-validated on every
-    /// commit attempt rather than once by the caller. The failure it prevents needs two producers running the
-    /// same batch: this transaction's first attempt loses the race to its twin, and on the retry the read-set
-    /// check passes — nothing it read was invalidated — so without the CAS inside the loop it would commit the
-    /// batch a SECOND time. Checked before the first attempt too, against the base snapshot, so a batch that
-    /// was already committed before this transaction opened fails without writing anything.</para>
-    /// </summary>
-    /// <param name="appId">The producer's identifier, as recorded in <c>txn.appId</c>.</param>
-    /// <param name="version">The version this batch advances the producer to.</param>
-    /// <param name="expectedPrevious">The version the producer must currently be at; <c>null</c> means it must
-    /// have NO recorded version yet (a first batch). A mismatch throws
-    /// <see cref="InvalidOperationException"/> — deliberately not <see cref="DeltaConflictException"/>, which
-    /// the commit loop retries, because re-attempting cannot make an already-committed batch un-commit.</param>
-    public void StageAppTransaction(string appId, long version, long? expectedPrevious = null)
-    {
-        EnsureNotCommitted();
-        if (string.IsNullOrEmpty(appId))
-            throw new ArgumentException("appId must be a non-empty application identifier.", nameof(appId));
-        _appTransactions[appId] = new AppTransactionStage(version, expectedPrevious);
-        _operations.Add("WRITE");
-    }
-
-    /// <summary>
-    /// The staged idempotent-producer versions and the previous version each requires. Read by
-    /// <see cref="DeltaTable.CommitTransactionAsync"/>, which turns them into <c>txn</c> actions and hands the
-    /// expectations to the commit loop so they are re-checked per attempt.
-    /// </summary>
-    internal IReadOnlyDictionary<string, AppTransactionStage> AppTransactions => _appTransactions;
-
-    /// <summary>A staged producer version paired with the version it requires the table to be at.</summary>
-    internal readonly record struct AppTransactionStage(long Version, long? ExpectedPrevious);
-
-    public void StageActions(IReadOnlyList<DeltaAction> actions, string? operation = null)
+    public void StageActions(IReadOnlyList<DeltaAction> actions)
     {
         EnsureNotCommitted();
         if (actions is null)
             throw new ArgumentNullException(nameof(actions));
         StageInternal(actions);
-        if (!string.IsNullOrEmpty(operation))
-            _operations.Add(operation!);
+    }
+
+    // ── Preconditions ──────────────────────────────────────────────────────────────────────────────────
+    //
+    // Not effects. An effect is staged output: the commit loop rebases it onto a newer version and retries.
+    // A precondition is a fact about the base version, re-checked before EVERY attempt — and it cannot
+    // become true by retrying, so a violation throws InvalidOperationException rather than
+    // DeltaConflictException, which the loop would retry.
+
+    /// <summary>
+    /// Idempotent-producer compare-and-set: commits a <c>txn</c> action recording that
+    /// <paramref name="appId"/> has reached <paramref name="version"/>, atomically with everything else this
+    /// transaction stages, guarded by <paramref name="expectedPrevious"/>.
+    ///
+    /// <para>This is what lets a streaming producer make "write this batch exactly once" true across
+    /// retries: the batch's data and the record of having written it land in ONE version, so there is no
+    /// window in which one exists without the other.</para>
+    ///
+    /// <para><b>Why the violation is not a conflict.</b> A failed precondition throws
+    /// <see cref="InvalidOperationException"/>, not <see cref="DeltaConflictException"/>. The commit loop
+    /// RETRIES the latter, and retrying cannot make an already-committed batch un-commit — a producer told
+    /// "conflict" would keep trying to write a batch that is already in the table.</para>
+    /// </summary>
+    /// <param name="appId">The producer's identifier. One transaction may require at most one version per
+    /// appId: two <c>txn</c> actions for one appId in a single commit is malformed, and the surviving one
+    /// would be whichever the reader saw last.</param>
+    /// <param name="version">The version to record for <paramref name="appId"/>.</param>
+    /// <param name="expectedPrevious">The version the table must ALREADY record for
+    /// <paramref name="appId"/>, re-checked against every concurrent commit before each attempt. Null — the
+    /// default — writes unconditionally. Note that null is "do not check", not "expect no prior record":
+    /// the absence of a record cannot be asserted through this parameter, and a first-ever write simply
+    /// omits it.</param>
+    public void RequireAppTransaction(string appId, long version, long? expectedPrevious = null)
+    {
+        EnsureNotCommitted();
+        if (string.IsNullOrEmpty(appId))
+            throw new ArgumentException("appId must be a non-empty identifier.", nameof(appId));
+
+        foreach (var existing in _appTransactions)
+        {
+            if (string.Equals(existing.AppId, appId, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"This transaction already requires an app transaction for '{appId}'. A commit carries "
+                    + "at most one txn action per appId; requiring two would leave which one lands to the "
+                    + "reader's action ordering.");
+            }
+        }
+
+        _appTransactions.Add(new AppTransactionRequirement(appId, version, expectedPrevious));
+    }
+
+    // ── Declarations ───────────────────────────────────────────────────────────────────────────────────
+    //
+    // Neither effects nor preconditions: they WIDEN the read set the conflict checker tests concurrent
+    // commits against. The library cannot infer them — the host's own engine did the scan — and, unlike a
+    // precondition, a declaration is subject to POLICY: the isolation level decides what conflicts with it.
+
+    /// <summary>
+    /// Declares that this transaction's work depended on the rows matching <paramref name="predicate"/> —
+    /// what the HOST's own scan read, which the commit loop has no other way to know.
+    ///
+    /// <para>A concurrent commit that ADDS a file matching the predicate is then a
+    /// <c>concurrentAppend</c> conflict under <see cref="IsolationLevel.Serializable"/>; under
+    /// <see cref="IsolationLevel.WriteSerializable"/> a blind append is exempt, which is what distinguishes
+    /// the two levels. Declaring several predicates widens the set — any one matching conflicts.</para>
+    /// </summary>
+    public void DeclareRead(Expressions.Predicate predicate)
+    {
+        EnsureNotCommitted();
+        if (predicate is null)
+            throw new ArgumentNullException(nameof(predicate));
+        _readPredicates.Add(predicate);
+    }
+
+    /// <summary>
+    /// Declares that this transaction's work depended on the WHOLE table — stronger than any set of
+    /// predicates, since every concurrent add and remove becomes relevant. The honest declaration when a
+    /// scan had no pushable predicate, and the one a host reaches for precisely when it has nothing better
+    /// to say.
+    ///
+    /// <para><b>Caveat, and it is undecided rather than merely undocumented.</b> A proposal carried
+    /// downstream (issue #15, open question 4) would DROP this declaration when the transaction also stages
+    /// row-level deletes and runs at <see cref="IsolationLevel.WriteSerializable"/> — which is the default —
+    /// on the reasoning that commits may be reordered relative to reads at that level. It is NOT implemented
+    /// here: today the declaration is honoured at both levels, and a <c>dataChange=true</c> remove of a file
+    /// covered by it raises <c>concurrentDeleteRead</c>, which is what Delta does (Spark gates only
+    /// <c>concurrentAppend</c> on the isolation level). The proposal is a DEPARTURE from that, gated on the
+    /// level rather than an implementation of it, and if it is ever adopted it should be an explicit
+    /// per-transaction opt-in rather than an inference — a library must not claim on a host's behalf that it
+    /// read less than it declared. Recorded here because it is the one behaviour in this seam a host cannot
+    /// observe from the outside.</para>
+    /// </summary>
+    public void DeclareWholeTableRead()
+    {
+        EnsureNotCommitted();
+        _declaredWholeTableRead = true;
     }
 
     /// <summary>
@@ -606,4 +604,8 @@ public sealed class DeltaTransaction
         if (_committed)
             throw new InvalidOperationException("This transaction has already been committed.");
     }
+
+    /// <summary>One <see cref="RequireAppTransaction"/> call: the <c>txn</c> action to write, plus the
+    /// compare-and-set guard the commit loop re-checks before every attempt.</summary>
+    internal sealed record AppTransactionRequirement(string AppId, long Version, long? ExpectedPrevious);
 }

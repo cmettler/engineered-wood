@@ -351,14 +351,18 @@ the rewrite. Appending to and reading such a table is still allowed.
 Readers can now see the ids: `ReadAllWithRowTrackingAsync` /
 `ReadAtVersionWithRowTrackingAsync` append `_metadata.row_id` and
 `_metadata.row_commit_version`, measured equal to Spark's own resolution row by
-row. The Change Data Feed carries them too, as of the CDF row-tracking work:
-`ReadChangesWithRowTrackingAsync` emits the same two columns on the feed, every
+row — requested as `DeltaRowMetadata.RowTracking` on `ReadAsync`. The Change
+Data Feed carries them too, as of the CDF row-tracking work: the same metadata
+flag on `ReadChangesAsync` emits the two columns on the feed, every
 `_change_data` file EW writes on a row-tracking table materializes the hidden
 id/commit-version columns (a `cdc` action has no `baseRowId`, so materializing
 is the only way identity reaches a change row), and both directions are measured
-against Spark 4.0.1. One gap remains on that surface: the emitted column names
-are fixed, with no option to rename them for a host that cannot use a dotted
-identifier. Background: `doc/row-tracking-conformance-brief.md`.
+against Spark 4.0.1. The last gap on that surface — fixed emitted column names,
+with no option to rename them for a host that cannot use a dotted identifier —
+is CLOSED: `DeltaReadOptions.MetadataPrefix` /
+`DeltaChangeReadOptions.MetadataPrefix` rename them, and a collision with a
+table's own column is refused rather than shadowed. Background:
+`doc/row-tracking-conformance-brief.md`.
 
 **Multi-part V1 checkpoints on write.** Read is supported
 (`CheckpointReader.cs`); write always emits a single
@@ -539,8 +543,8 @@ writer, so today the caller must wire those primitives together by hand.
 
 **High-level DML.** `DeleteAsync` and `UpdateAsync` each have a functional
 overload and an analyzable-`Expressions.Predicate` overload (the predicate form
-feeds file pruning + concurrency read-set analysis); `DeleteByRowIdsAsync` /
-`UpdateByRowIdsAsync` do copy-on-write DML keyed by transient row id. Still
+feeds file pruning + concurrency read-set analysis); `DeleteRowsAsync` /
+`UpdateRowsAsync` do row-level DML keyed by a path-keyed `RowSelection`. Still
 missing: MERGE, RESTORE (committing a time-travel state as the current version),
 and CLONE (shallow/deep). `ReadChangesAsync` exists for CDF but there is no raw
 incremental-by-version-range read outside of CDF.
@@ -584,7 +588,7 @@ not apply. There is still **no way to enable DVs on an EXISTING table** (no
 `ALTER TABLE`-style property update / protocol upgrade), and the predicate
 `DeleteAsync` path has **no copy-on-write fallback** when DVs are off — it
 removes whole files or throws. (A separate copy-on-write DELETE/UPDATE does
-exist, keyed by transient row id — `DeleteByRowIdsAsync` / `UpdateByRowIdsAsync`
+exist — `DeleteRowsAsync(selection, RowDeleteMode.CopyOnWrite)` / `UpdateRowsAsync`
 — which rewrites the affected files with no DV. It needs neither deletion
 vectors nor row tracking, preserves row-tracking ids when the table has them,
 and writes the Change Data Feed for exactly the rows it touched; only
