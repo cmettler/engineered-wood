@@ -6672,9 +6672,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// the selection does not name are not read. Batches come back in the selection's path order; a file
     /// contributing no matching row yields nothing.
     ///
-    /// <para>To pair the returned rows with what was asked for, read with <c>DeltaRowMetadata.Locator</c>
-    /// instead of this method's out-parameter: batching and deletion-vector filtering both break any positional
-    /// correspondence, and the locator pair is the same key the selection is built on.</para>
+    /// <para>To pair the returned rows with what was asked for, ask for <paramref name="metadata"/>: batching
+    /// and deletion-vector filtering both break any positional correspondence, so a caller must match on a
+    /// KEY rather than on order. <see cref="DeltaRowMetadata.Locator"/> gives the same
+    /// <c>(add.path, absolute position)</c> pair the selection is built on;
+    /// <see cref="DeltaRowMetadata.RowAddress"/> gives it packed, for a host whose own rowid is one integer.</para>
     /// </summary>
     /// <param name="sourceRowTrackingOut">When non-null, one entry per YIELDED batch (row-aligned): each matched
     /// row's ORIGINAL stable id (the source file's materialized value where present — a rewritten file — else
@@ -6687,32 +6689,50 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// concurrent rewrite would make the selection's paths look stale when they are exactly the ones the
     /// transaction is still validating against. Named to match
     /// <see cref="ComputeDeletionVectorActionsAsync"/>' parameter of the same purpose.</param>
-    /// <param name="rowAddressesOut">When non-null, one row-aligned array per YIELDED batch giving each row's
-    /// TRANSIENT address (<see cref="TransientRowAddress.Pack"/> of the resolving snapshot's path-sorted file
-    /// ordinal and the row's absolute in-file position). For a host whose row identifiers ARE that address:
-    /// batching and deletion-vector filtering both break any positional correspondence between what was asked
-    /// for and what comes back, so this is the key it pairs the two by. Distinct from
-    /// <paramref name="sourceRowTrackingOut"/> — this is the snapshot-relative ADDRESS, that is the STABLE
-    /// identity.</param>
+    /// <param name="metadata">Per-row metadata columns to append, exactly as
+    /// <see cref="ReadAsync(DeltaReadOptions, CancellationToken)"/> and
+    /// <see cref="ReadChangesAsync(DeltaChangeReadOptions, CancellationToken)"/> take it — same flags, same
+    /// column names, same combinability, and <see cref="GetReadSchema"/> reports the result. This read used to
+    /// be the ONE that could not ask: it offered <paramref name="sourceRowTrackingOut"/> for the stable
+    /// identity and nothing at all for the address, so a host needing the address had to reconstruct it from
+    /// outside — which it cannot, since the absolute position is never surfaced. The enum's own argument
+    /// applies here unchanged: asking for two kinds costs ONE pass.
+    ///
+    /// <para><see cref="DeltaRowMetadata.RowTracking"/> yields the same values as
+    /// <paramref name="sourceRowTrackingOut"/>, as columns rather than out-params; both are accepted, and
+    /// asking for both is not an error.</para></param>
+    /// <param name="metadataPrefix">Prefix for the <see cref="DeltaRowMetadata.Locator"/> and
+    /// <see cref="DeltaRowMetadata.RowTracking"/> column names, as on
+    /// <see cref="DeltaReadOptions.MetadataPrefix"/>. <see cref="DeltaRowMetadata.RowAddress"/> is not
+    /// prefixed.</param>
     public async IAsyncEnumerable<RecordBatch> ReadRowsAsync(
         RowSelection selection,
         List<(long?[] Ids, long?[] Versions)>? sourceRowTrackingOut = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default,
         Snapshot.Snapshot? resolveAgainst = null,
-        List<long[]>? rowAddressesOut = null)
+        DeltaRowMetadata metadata = DeltaRowMetadata.None,
+        string metadataPrefix = DeltaMetadataColumns.DefaultPrefix)
     {
         ThrowIfDisposed();
         if (selection is null)
             throw new ArgumentNullException(nameof(selection));
+        if (metadataPrefix is null)
+            throw new ArgumentNullException(nameof(metadataPrefix));
         if (resolveAgainst is not null)
             RequireSnapshotOfThisTable(resolveAgainst, nameof(resolveAgainst));
         var snapshot = resolveAgainst ?? CurrentSnapshot;
+        ValidateReadMetadata(snapshot, metadata, metadataPrefix);
         var byPath = ActiveFilesByPath(snapshot);
 
-        // The ordinal is a position in the FULL active set, not in the selection — computed only when asked
-        // for, since it costs a sort of every active file to answer for the few the selection names.
+        bool wantAddress = (metadata & DeltaRowMetadata.RowAddress) != 0;
+        bool wantLocator = (metadata & DeltaRowMetadata.Locator) != 0;
+        bool wantTracking = (metadata & DeltaRowMetadata.RowTracking) != 0;
+        var metadataFields = MetadataFields(metadata, metadataPrefix);
+
+        // RowAddress' ordinal is a position in the FULL active set, not in the selection — computed only when
+        // asked for, since it costs a sort of every active file to answer for the few the selection names.
         Dictionary<string, int>? ordinalByPath = null;
-        if (rowAddressesOut is not null)
+        if (wantAddress)
         {
             var ordered = OrderedActiveFiles(snapshot);
             ordinalByPath = new Dictionary<string, int>(ordered.Count, StringComparer.Ordinal);
@@ -6726,13 +6746,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 throw StaleSelectionPath(kvp.Key, snapshot);
             var targets = RowSelection.AsSet(kvp.Value);
             int fileOrdinal = ordinalByPath is not null ? ordinalByPath[kvp.Key] : -1;
+            byte[]? pathBytes = wantLocator
+                ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
 
             // Master's read path surfaces each surviving row's ABSOLUTE in-file position (DV-inclusive) and its
             // RESOLVED stable id/version via out-params (materialized ids stripped from the emitted user batch),
             // instead of appending a trailing row-id column — so match on the absolute position out-param.
             var absOut = new List<Int64Array?>();
-            var idsOut = sourceRowTrackingOut is not null ? new List<Int64Array?>() : null;
-            var versOut = sourceRowTrackingOut is not null ? new List<Int64Array?>() : null;
+            bool needTracking = sourceRowTrackingOut is not null || wantTracking;
+            var idsOut = needTracking ? new List<Int64Array?>() : null;
+            var versOut = needTracking ? new List<Int64Array?>() : null;
             int bi = -1;
             await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
                                                       strippedRowIdsOut: idsOut,
@@ -6764,14 +6787,55 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     }
                     sourceRowTrackingOut.Add((ids, vers));
                 }
-                if (rowAddressesOut is not null)
+
+                var taken = TakeRowsFromBatch(batch, rows);
+                if (metadataFields.Count == 0)
                 {
-                    var addresses = new long[rows.Count];
-                    for (int k = 0; k < rows.Count; k++)
-                        addresses[k] = TransientRowAddress.Pack(fileOrdinal, absPos.GetValue(rows[k])!.Value);
-                    rowAddressesOut.Add(addresses);
+                    yield return taken;
+                    continue;
                 }
-                yield return TakeRowsFromBatch(batch, rows);
+
+                // Built over the TAKEN rows, in the same flag order ReadCoreAsync uses — the columns describe
+                // what is yielded, not what was scanned, so `rows` indexes every builder below.
+                var columns = new List<IArrowArray>(metadataFields.Count);
+                if (wantAddress)
+                {
+                    var b = new Int64Array.Builder().Reserve(rows.Count);
+                    foreach (int i in rows)
+                        b.Append(TransientRowAddress.Pack(fileOrdinal, AbsoluteAt(absPos, i)));
+                    columns.Add(b.Build());
+                }
+                if (wantLocator)
+                {
+                    columns.Add(ArrowCompute.Repeat(
+                        Apache.Arrow.Types.StringType.Default, pathBytes!, rows.Count));
+                    var b = new Int64Array.Builder().Reserve(rows.Count);
+                    foreach (int i in rows)
+                        b.Append(AbsoluteAt(absPos, i));
+                    columns.Add(b.Build());
+                }
+                if (wantTracking)
+                {
+                    var matI = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
+                    var matV = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
+                    var ib = new Int64Array.Builder().Reserve(rows.Count);
+                    var vb = new Int64Array.Builder().Reserve(rows.Count);
+                    foreach (int i in rows)
+                    {
+                        if (matI is not null && i < matI.Length && !matI.IsNull(i))
+                            ib.Append(matI.GetValue(i)!.Value);
+                        else
+                            ib.AppendNull();
+                        if (matV is not null && i < matV.Length && !matV.IsNull(i))
+                            vb.Append(matV.GetValue(i)!.Value);
+                        else
+                            vb.AppendNull();
+                    }
+                    columns.Add(ib.Build());
+                    columns.Add(vb.Build());
+                }
+
+                yield return AppendColumns(taken, metadataFields, columns);
             }
         }
     }
