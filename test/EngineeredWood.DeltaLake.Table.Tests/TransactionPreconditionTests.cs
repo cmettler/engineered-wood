@@ -146,7 +146,7 @@ public class TransactionPreconditionTests : IDisposable
         await second.WriteAsync([Batch(2, 1)]);
         second.RequireAppTransaction("producer", version: 6, expectedPrevious: 4); // the table records 5
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await second.CommitAsync());
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(async () => await second.CommitAsync());
         Assert.IsNotType<DeltaConflictException>(ex);
         Assert.Contains("producer", ex.Message);
         Assert.Contains("expected the table to record version 4", ex.Message);
@@ -167,7 +167,7 @@ public class TransactionPreconditionTests : IDisposable
         await txn.WriteAsync([Batch(2, 1)]);
         txn.RequireAppTransaction("never-seen", version: 2, expectedPrevious: 1);
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await txn.CommitAsync());
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(async () => await txn.CommitAsync());
         Assert.Contains("no transaction at all", ex.Message);
     }
 
@@ -201,7 +201,7 @@ public class TransactionPreconditionTests : IDisposable
             await racerTxn.CommitAsync();
         }
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await txn.CommitAsync());
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(async () => await txn.CommitAsync());
         Assert.Contains("records 2", ex.Message);
 
         // The racer's work landed; ours did not.

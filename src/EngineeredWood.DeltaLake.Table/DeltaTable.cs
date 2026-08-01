@@ -2106,14 +2106,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             if (current != r.ExpectedPrevious)
             {
-                throw new InvalidOperationException(
+                throw new AppTransactionPreconditionException(
                     $"App transaction precondition failed for '{r.AppId}': expected the table to record "
                     + (r.ExpectedPrevious is { } e ? $"version {e}" : "no transaction at all")
                     + ", but it records "
                     + (current is { } c ? c.ToString() : "no transaction at all")
                     + $". Version {r.Version} was NOT committed. This is not a conflict to retry — retrying "
                     + "cannot make an already-committed batch un-commit; re-read the recorded version and "
-                    + "decide whether this batch still needs writing.");
+                    + "decide whether this batch still needs writing.",
+                    r.AppId, r.Version, r.ExpectedPrevious, current);
             }
         }
     }
@@ -6662,11 +6663,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// concurrent rewrite would make the selection's paths look stale when they are exactly the ones the
     /// transaction is still validating against. Named to match
     /// <see cref="ComputeDeletionVectorActionsAsync"/>' parameter of the same purpose.</param>
+    /// <param name="rowAddressesOut">When non-null, one row-aligned array per YIELDED batch giving each row's
+    /// TRANSIENT address (<see cref="TransientRowAddress.Pack"/> of the resolving snapshot's path-sorted file
+    /// ordinal and the row's absolute in-file position). For a host whose row identifiers ARE that address:
+    /// batching and deletion-vector filtering both break any positional correspondence between what was asked
+    /// for and what comes back, so this is the key it pairs the two by. Distinct from
+    /// <paramref name="sourceRowTrackingOut"/> — this is the snapshot-relative ADDRESS, that is the STABLE
+    /// identity.</param>
     public async IAsyncEnumerable<RecordBatch> ReadRowsAsync(
         RowSelection selection,
         List<(long?[] Ids, long?[] Versions)>? sourceRowTrackingOut = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default,
-        Snapshot.Snapshot? resolveAgainst = null)
+        Snapshot.Snapshot? resolveAgainst = null,
+        List<long[]>? rowAddressesOut = null)
     {
         ThrowIfDisposed();
         if (selection is null)
@@ -6676,11 +6685,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var snapshot = resolveAgainst ?? CurrentSnapshot;
         var byPath = ActiveFilesByPath(snapshot);
 
+        // The ordinal is a position in the FULL active set, not in the selection — computed only when asked
+        // for, since it costs a sort of every active file to answer for the few the selection names.
+        Dictionary<string, int>? ordinalByPath = null;
+        if (rowAddressesOut is not null)
+        {
+            var ordered = OrderedActiveFiles(snapshot);
+            ordinalByPath = new Dictionary<string, int>(ordered.Count, StringComparer.Ordinal);
+            for (int i = 0; i < ordered.Count; i++)
+                ordinalByPath[ordered[i].Path] = i;
+        }
+
         foreach (var kvp in selection.Entries.OrderBy(k => k.Key, StringComparer.Ordinal))
         {
             if (!byPath.TryGetValue(kvp.Key, out var addFile))
                 throw StaleSelectionPath(kvp.Key, snapshot);
             var targets = RowSelection.AsSet(kvp.Value);
+            int fileOrdinal = ordinalByPath is not null ? ordinalByPath[kvp.Key] : -1;
 
             // Master's read path surfaces each surviving row's ABSOLUTE in-file position (DV-inclusive) and its
             // RESOLVED stable id/version via out-params (materialized ids stripped from the emitted user batch),
@@ -6718,6 +6739,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         vers[k] = matV is not null && !matV.IsNull(i) ? matV.GetValue(i) : null;
                     }
                     sourceRowTrackingOut.Add((ids, vers));
+                }
+                if (rowAddressesOut is not null)
+                {
+                    var addresses = new long[rows.Count];
+                    for (int k = 0; k < rows.Count; k++)
+                        addresses[k] = TransientRowAddress.Pack(fileOrdinal, absPos.GetValue(rows[k])!.Value);
+                    rowAddressesOut.Add(addresses);
                 }
                 yield return TakeRowsFromBatch(batch, rows);
             }

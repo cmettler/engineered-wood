@@ -8,7 +8,7 @@ using EngineeredWood.IO.Local;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// <see cref="DeltaTransaction.StageAppTransaction"/> — an idempotent producer's version, committed atomically
+/// <see cref="DeltaTransaction.RequireAppTransaction"/> — an idempotent producer's version, committed atomically
 /// with the transaction's work and guarded by a compare-and-set.
 ///
 /// <para>What justifies a typed method rather than a hand-built <c>txn</c> action through
@@ -106,7 +106,7 @@ public class AppTransactionStagingTests : IDisposable
         var replay = table.StartTransaction();
         await StageAppendAsync(table, replay, Batch(10, 3));
         replay.RequireAppTransaction("producer-1", 7, requireAbsent: true);
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await replay.CommitAsync());
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(async () => await replay.CommitAsync());
         Assert.Contains("producer-1", ex.Message);
 
         Assert.Equal(versionAfterFirst, table.CurrentSnapshot.Version);
@@ -140,7 +140,7 @@ public class AppTransactionStagingTests : IDisposable
             await twinTxn.CommitAsync();
         }
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await txn.CommitAsync());
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(async () => await txn.CommitAsync());
         Assert.Contains("producer-1", ex.Message);
 
         // Exactly ONE copy of the batch landed — 2 original + 3 from the twin.
