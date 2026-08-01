@@ -98,14 +98,14 @@ public class AppTransactionStagingTests : IDisposable
         await using var table = await CreateAsync();
         var first = table.StartTransaction();
         await StageAppendAsync(table, first, Batch(10, 3));
-        first.RequireAppTransaction("producer-1", 7, requireAbsent: true);
+        first.RequireAppTransaction("producer-1", 7, AppTransactionPrecondition.Absent);
         await first.CommitAsync();
         long versionAfterFirst = table.CurrentSnapshot.Version;
 
         // A replay of the same batch: it still expects "no recorded version", but there is one now.
         var replay = table.StartTransaction();
         await StageAppendAsync(table, replay, Batch(10, 3));
-        replay.RequireAppTransaction("producer-1", 7, requireAbsent: true);
+        replay.RequireAppTransaction("producer-1", 7, AppTransactionPrecondition.Absent);
         var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(async () => await replay.CommitAsync());
         Assert.Contains("producer-1", ex.Message);
 
@@ -129,14 +129,14 @@ public class AppTransactionStagingTests : IDisposable
         await using var mine = await OpenAsync();
         var txn = mine.StartTransaction(pinned);
         await StageAppendAsync(mine, txn, Batch(10, 3));
-        txn.RequireAppTransaction("producer-1", 7, requireAbsent: true);
+        txn.RequireAppTransaction("producer-1", 7, AppTransactionPrecondition.Absent);
 
         // The twin runs the identical batch through its own handle and commits first, taking our version.
         await using (var twin = await OpenAsync())
         {
             var twinTxn = twin.StartTransaction();
             await StageAppendAsync(twin, twinTxn, Batch(10, 3));
-            twinTxn.RequireAppTransaction("producer-1", 7, requireAbsent: true);
+            twinTxn.RequireAppTransaction("producer-1", 7, AppTransactionPrecondition.Absent);
             await twinTxn.CommitAsync();
         }
 
@@ -148,19 +148,12 @@ public class AppTransactionStagingTests : IDisposable
         Assert.Equal(7, await RecordedVersionAsync("producer-1"));
     }
 
-    /// <summary>
-    /// The two preconditions are mutually exclusive, and saying both is rejected rather than resolved. A
-    /// silent precedence rule would make one of them a no-op at the call site that most needs a guard.
-    /// </summary>
-    [Fact]
-    public async Task RequireAbsentAndExpectedPrevious_Together_IsRejected()
-    {
-        await using var table = await CreateAsync();
-        var txn = table.StartTransaction();
-        var ex = Assert.Throws<ArgumentException>(() =>
-            txn.RequireAppTransaction("producer-1", 7, expectedPrevious: 3, requireAbsent: true));
-        Assert.Contains("producer-1", ex.Message);
-    }
+    // RETIRED by upstream #43, and retired for the RIGHT reason: this pinned that asking for BOTH
+    // `expectedPrevious: 3` and `requireAbsent: true` throws rather than silently letting one win. The two
+    // are now the single `AppTransactionPrecondition` union, so the contradiction is UNREPRESENTABLE — there
+    // is no call that could reach the ArgumentException. A test whose failure mode the type system has made
+    // impossible is not coverage worth keeping; it would only ever assert that C# still has one parameter.
+    // The behaviours it guarded are pinned by Absent / Exactly in TransactionPreconditionTests.
 
     /// <summary>The producer advances batch by batch: each states the version it expects to be at.</summary>
     [Fact]
@@ -174,7 +167,7 @@ public class AppTransactionStagingTests : IDisposable
 
         var second = table.StartTransaction();
         await StageAppendAsync(table, second, Batch(20, 1));
-        second.RequireAppTransaction("producer-1", 2, expectedPrevious: 1);
+        second.RequireAppTransaction("producer-1", 2, AppTransactionPrecondition.Exactly(1));
         await second.CommitAsync();
 
         Assert.Equal(2, await RecordedVersionAsync("producer-1"));
