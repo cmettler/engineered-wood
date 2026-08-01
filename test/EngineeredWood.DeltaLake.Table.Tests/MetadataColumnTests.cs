@@ -96,7 +96,7 @@ public class MetadataColumnTests : IDisposable
             return locators.Select(l => new MetaRow(l.Id, l.FilePath, l.RowIndex, null, null)).ToList();
 
         var identity = new List<(long Id, long? RowId, long? Version)>();
-        await foreach (var batch in table.ReadAllWithRowTrackingAsync(columns: null, filter: null))
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
         {
             var ids = (Int64Array)batch.Column("id");
             var rid = (Int64Array)batch.Column(
@@ -261,7 +261,7 @@ public class MetadataColumnTests : IDisposable
 
         await Assert.ThrowsAnyAsync<Exception>(async () =>
         {
-            await foreach (var _ in table.ReadAllWithRowTrackingAsync(columns: null, filter: null))
+            await foreach (var _ in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
             {
             }
         });
@@ -299,7 +299,7 @@ public class MetadataColumnTests : IDisposable
             var updates = new RecordBatch(updSchema,
                 new IArrowArray[] { pathB.Build(), idxB.Build(), newIds.Build() }, rows.Count);
 
-            await table.UpdateBySelectionAsync(updates);
+            await table.UpdateRowsAsync(updates);
         }
 
         await using var check = await OpenAsync();
@@ -355,7 +355,7 @@ public class MetadataColumnTests : IDisposable
                 [targetFile] = new long[] { 2 },
             });
 
-            await table.UpdateBySelectionAsync(selection, (filePath, sourceBatches, positionsPerBatch) =>
+            await table.UpdateRowsAsync(selection, (filePath, sourceBatches, positionsPerBatch) =>
             {
                 invocations++;
                 observedPaths.Add(filePath);
@@ -408,7 +408,7 @@ public class MetadataColumnTests : IDisposable
         });
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await table.UpdateBySelectionAsync(bogus, (_, batches, _) => { invoked = true; return batches; }));
+            await table.UpdateRowsAsync(bogus, (_, batches, _) => { invoked = true; return batches; }));
         Assert.Contains("part-vanished.parquet", ex.Message);
         Assert.False(invoked);
     }
@@ -461,7 +461,7 @@ public class MetadataColumnTests : IDisposable
 
             // one call per batch of changes; each addresses exactly its own rows
             foreach (var upd in updateBatches)
-                await table.UpdateBySelectionAsync(upd);
+                await table.UpdateRowsAsync(upd);
         }
 
         await using var check = await OpenAsync();
@@ -493,7 +493,7 @@ public class MetadataColumnTests : IDisposable
             [target.FilePath] = new long[] { target.RowIndex },
         });
 
-        var (rows, _) = await table.UpdateBySelectionViaVectorsAsync(selection, matched =>
+        long rows = await table.UpdateRowsAsync(selection, matched =>
         {
             Assert.Equal(1, matched.Length);
             Assert.Equal(12L, ((Int64Array)matched.Column("id")).GetValue(0)!.Value);
@@ -534,7 +534,7 @@ public class MetadataColumnTests : IDisposable
             targetPath = target.FilePath;
             Assert.NotNull(idBefore);
 
-            await table.UpdateBySelectionViaVectorsAsync(
+            await table.UpdateRowsAsync(
                 RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
                 {
                     [targetPath] = new long[] { targetPos },
@@ -587,7 +587,7 @@ public class MetadataColumnTests : IDisposable
                 [targetFile] = new long[] { 1, 2 },
             });
 
-            var (rows, _) = await table.UpdateBySelectionViaVectorsAsync(selection,
+            long rows = await table.UpdateRowsAsync(selection,
                 (filePath, matched, positions) =>
                 {
                     observedPaths.Add(filePath);
@@ -627,7 +627,7 @@ public class MetadataColumnTests : IDisposable
         var path = table.CurrentSnapshot.ActiveFiles.Values.First().Path;
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await table.UpdateBySelectionViaVectorsAsync(
+            await table.UpdateRowsAsync(
                 RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
                 {
                     [path] = new long[] { 0 },
@@ -644,7 +644,7 @@ public class MetadataColumnTests : IDisposable
         await using var table = await CreateTrackedAsync();
         var target = (await ReadMetaAsync(table)).First(r => r.Id == 2);
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await table.UpdateBySelectionViaVectorsAsync(
+            await table.UpdateRowsAsync(
                 RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
                 {
                     [target.FilePath] = new long[] { target.RowIndex },
@@ -676,7 +676,7 @@ public class MetadataColumnTests : IDisposable
             }, 1);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-            async () => await table.UpdateBySelectionAsync(updates));
+            async () => await table.UpdateRowsAsync(updates));
         Assert.Contains("part-not-here.parquet", ex.Message);
     }
 

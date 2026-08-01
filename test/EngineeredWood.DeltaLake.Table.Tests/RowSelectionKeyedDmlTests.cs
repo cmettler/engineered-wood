@@ -1,4 +1,4 @@
-// Copyright (c) clast-project. All rights reserved.
+﻿// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
@@ -109,11 +109,13 @@ public class RowSelectionKeyedDmlTests : IDisposable
         // A concurrent writer removes the file at ordinal 0 outright (copy-on-write delete of all its rows).
         await using (var other = await OpenAsync())
         {
-            await other.DeleteBySelectionAsync(RowSelection.ByPath(
-                new Dictionary<string, IReadOnlyCollection<long>>
-                {
-                    [pathsAtPin[0]] = new long[] { 0, 1, 2 },
-                }));
+            await other.DeleteRowsAsync(
+                RowSelection.ByPath(
+                    new Dictionary<string, IReadOnlyCollection<long>>
+                    {
+                        [pathsAtPin[0]] = new long[] { 0, 1, 2 },
+                    }),
+                RowDeleteMode.CopyOnWrite);
         }
 
         await using var table = await OpenAsync();
@@ -127,7 +129,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
 
         // Reuse the captured ordinal, exactly as a caller holding a stale row identifier would. It resolves,
         // and it removes a row nobody selected.
-        await table.DeleteByRowIdsViaVectorsAsync(new[] { TransientRowAddress.Pack(1, 0) });
+        await table.DeleteRowsAsync(RowSelection.FromRowAddresses(new[] { TransientRowAddress.Pack(1, 0) }, table.CurrentSnapshot, StaleAddressPolicy.Skip));
         var survivors = await ReadIdsFreshAsync();
         Assert.DoesNotContain(idNowAtOrdinal1, survivors);
         Assert.Contains(intendedId, survivors);
@@ -358,7 +360,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
         await using (var table = await CreateThreeFileTableAsync())
         {
             var rowIds = await CollectRowIdsAsync(table, id => id is 2 or 22);
-            var (deleted, _) = await table.DeleteByRowIdsViaVectorsAsync(rowIds);
+            var (deleted, _) = await table.DeleteRowsAsync(RowSelection.FromRowAddresses(rowIds, table.CurrentSnapshot, StaleAddressPolicy.Skip));
             Assert.Equal(2, deleted);
         }
         viaRowIds = [.. await ReadIdsFreshAsync()];
@@ -394,7 +396,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
         await using (var table = await PlainTableAsync())
         {
             var rowIds = await CollectRowIdsAsync(table, id => id is 1 or 12);
-            var (deleted, _) = await table.DeleteByRowIdsAsync(rowIds);
+            var (deleted, _) = await table.DeleteRowsAsync(RowSelection.FromRowAddresses(rowIds, table.CurrentSnapshot, StaleAddressPolicy.Skip), RowDeleteMode.CopyOnWrite);
             Assert.Equal(2, deleted);
         }
         viaRowIds = [.. await ReadIdsFreshAsync()];
@@ -404,7 +406,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
         await using (var table = await PlainTableAsync())
         {
             var selection = await SelectionForIdsAsync(table, id => id is 1 or 12);
-            var (deleted, _) = await table.DeleteBySelectionAsync(selection);
+            var (deleted, _) = await table.DeleteRowsAsync(selection, RowDeleteMode.CopyOnWrite);
             Assert.Equal(2, deleted);
             // copy-on-write: rewritten adds, no deletion vector anywhere
             Assert.All(table.CurrentSnapshot.ActiveFiles.Values, f => Assert.Null(f.DeletionVector));
@@ -425,7 +427,7 @@ public class RowSelectionKeyedDmlTests : IDisposable
             async () => await table.DeleteRowsAsync(bogus));
         Assert.Contains("part-gone.parquet", dv.Message);
         var cow = await Assert.ThrowsAsync<InvalidOperationException>(
-            async () => await table.DeleteBySelectionAsync(bogus));
+            async () => await table.DeleteRowsAsync(bogus, RowDeleteMode.CopyOnWrite));
         Assert.Contains("part-gone.parquet", cow.Message);
     }
 
