@@ -410,7 +410,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Both are spec-legal and Spark reads ours (SparkInteropTests covers it); the difference is
         // cosmetic, because writer v5's extra implied features only impose obligations on tables that
         // actually declare a constraint or generated column, and HonorWriterFeatures already fails
-        // closed on those. See doc/upstream-landing-notes.md for the full measurement.
+        // closed on those. See doc/known-issues.md, "Column-mapping protocol shape differs from Spark's".
         if (mappingMode != ColumnMappingMode.None &&
             (minReaderVersion >= 3 || minWriterVersion >= 7))
         {
@@ -2026,11 +2026,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // transaction, so nothing here reads the whole active-file set (the one remaining non-rebase-safe case).
         var reads = new Concurrency.ReadSet
         {
-            Files = transaction.RemovedPaths,
+            // The files this transaction's own DML rewrites, plus the ones the HOST declared its scan read
+            // (DeclareFilesRead). A NEW set when there are declared paths — never transaction.RemovedPaths
+            // itself, which is ALSO passed below as plannedRemovePaths and drives the delete/delete check.
+            // Adding a merely-read file to that object would make a concurrent delete of it report as
+            // ConcurrentDeleteDelete ("this transaction also removes it") for a file this transaction never
+            // removes, instead of the ConcurrentDeleteRead it is.
+            Files = UnionReadFiles(transaction),
             Predicates = transaction.ReadPredicates,
             // What the HOST declared it read (DeclareWholeTableRead), which the loop cannot infer — it never
-            // saw the scan. Honoured at both isolation levels; see the method's own remarks for the proposal
-            // that would narrow it and why it is not implemented.
+            // saw the scan. Honoured at both isolation levels by default; a transaction may opt out of it
+            // for its row-level deletes at WriteSerializable — see
+            // DeltaTransaction.ExemptRowLevelFromWholeTableRead, which implements issue #15's open
+            // question 4 as a per-transaction flag rather than as an inference.
             WholeTable = transaction.DeclaredWholeTableRead,
         };
 
@@ -2117,6 +2125,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     r.AppId, r.Version, r.ExpectedPrevious, current);
             }
         }
+    }
+
+    /// <summary>
+    /// The read-set's file half: what the transaction rewrites, unioned with what its host declared it read.
+    /// Returns the transaction's own removed-path set unchanged when nothing was declared — the common case,
+    /// and one copy fewer — and a fresh set otherwise, because that object is also the commit loop's
+    /// <c>plannedRemovePaths</c> and must keep meaning ONLY what this transaction removes.
+    /// </summary>
+    private static ISet<string> UnionReadFiles(DeltaTransaction transaction)
+    {
+        if (transaction.DeclaredReadPaths.Count == 0)
+            return transaction.RemovedPaths;
+
+        var union = new HashSet<string>(transaction.RemovedPaths, StringComparer.Ordinal);
+        union.UnionWith(transaction.DeclaredReadPaths);
+        return union;
     }
 
     /// <summary>Shared by blind-append commits, which plan no removes.</summary>
@@ -2626,7 +2650,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// post-image add's <c>baseRowId</c> from <paramref name="latestSnapshot"/>'s high-water mark and its
     /// <c>defaultRowCommitVersion</c> to <paramref name="attemptVersion"/>, and rebuilds the
     /// <c>delta.rowTracking</c> high-water-mark domain to match — mirroring Spark's row-id reassignment on
-    /// conflict resolution and pr-4's <c>RebaseDvDmlActionsAsync</c>.
+    /// conflict resolution.
     ///
     /// <para>A post-image add is a data-change <see cref="AddFile"/> carrying a <c>baseRowId</c> whose path is
     /// NOT active in <paramref name="baseSnapshot"/> and was NOT produced by the row-level DELETE resolution
