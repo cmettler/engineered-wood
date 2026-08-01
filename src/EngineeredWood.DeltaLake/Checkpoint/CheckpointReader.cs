@@ -70,9 +70,13 @@ public sealed class CheckpointReader
             return null;
         }
 
-        // Empty = caught mid-overwrite (see remarks). Indistinguishable from "no hint", so treat it as such.
-        // MUTATION-TESTED 2026-07-31: with these two guards removed, the empty and invalid-JSON shapes of
-        // test/verify_delta_last_checkpoint.test fail with the exact production error.
+        // Empty = caught mid-overwrite (see remarks), which is the shape actually measured in production.
+        // This check is a deliberate FAST PATH, not the thing that makes empty safe: the catch below
+        // already covers it, since Parse("") throws JsonException ("The input does not contain any JSON
+        // tokens") — that exact message is what the failing commits reported. Mutation-testing confirms
+        // the asymmetry: removing this check alone changes no test outcome, while removing the catch
+        // fails both the empty and the truncated case. Kept because opening a table is common and the
+        // empty window is the expected concurrent observation, so paying a throw for it is wasteful.
         if (data.Length == 0)
             return null;
 
@@ -89,8 +93,12 @@ public sealed class CheckpointReader
         // Dispose the parsed document (it rents pooled buffers); every value below is copied out before then.
         using var docScope = doc;
         var root = doc.RootElement;
-        // A partial write can also yield VALID JSON that is missing the required fields; the hint is only
-        // usable if both are present, so fall back rather than throw on a half-written object.
+        // A partial write can also yield VALID JSON that is not the object we expect, or is that object
+        // without its required fields. Both are unusable, and reaching for a property would THROW rather
+        // than fall back: GetProperty on a missing name, and TryGetProperty itself (InvalidOperationException,
+        // "requires an element of type 'Object'") when the root is any other kind. So check the kind first.
+        if (root.ValueKind != JsonValueKind.Object)
+            return null;
         if (!root.TryGetProperty("version", out _) || !root.TryGetProperty("size", out _))
             return null;
 
