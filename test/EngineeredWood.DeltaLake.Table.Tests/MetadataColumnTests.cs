@@ -81,8 +81,8 @@ public class MetadataColumnTests : IDisposable
         await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
         {
             var ids = (Int64Array)batch.Column("id");
-            var path = (StringArray)batch.Column(MetadataPredicate.FilePathColumn);
-            var idx = (Int64Array)batch.Column(MetadataPredicate.RowIndexColumn);
+            var path = (StringArray)batch.Column(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.FilePathSuffix);
+            var idx = (Int64Array)batch.Column(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIndexSuffix);
             for (int i = 0; i < batch.Length; i++)
                 locators.Add((ids.GetValue(i)!.Value, path.GetString(i), idx.GetValue(i)!.Value));
         }
@@ -133,8 +133,8 @@ public class MetadataColumnTests : IDisposable
         await using var table = await CreateTrackedAsync();
         await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
         {
-            var path = batch.Schema.GetFieldByName(MetadataPredicate.FilePathColumn);
-            var idx = batch.Schema.GetFieldByName(MetadataPredicate.RowIndexColumn);
+            var path = batch.Schema.GetFieldByName(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.FilePathSuffix);
+            var idx = batch.Schema.GetFieldByName(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIndexSuffix);
             Assert.NotNull(path);
             Assert.NotNull(idx);
             Assert.IsType<StringType>(path!.DataType);
@@ -292,8 +292,8 @@ public class MetadataColumnTests : IDisposable
                 newIds.Append(r.Id + 1000);
             }
             var updSchema = new Apache.Arrow.Schema.Builder()
-                .Field(new Field(MetadataPredicate.FilePathColumn, StringType.Default, false))
-                .Field(new Field(MetadataPredicate.RowIndexColumn, Int64Type.Default, false))
+                .Field(new Field(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.FilePathSuffix, StringType.Default, false))
+                .Field(new Field(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIndexSuffix, Int64Type.Default, false))
                 .Field(new Field("id", Int64Type.Default, false))
                 .Build();
             var updates = new RecordBatch(updSchema,
@@ -443,17 +443,17 @@ public class MetadataColumnTests : IDisposable
 
                 // carry the locator columns through untouched; rewrite the value column
                 var metaPath = EngineeredWood.Arrow.ArrowCompute.Take(
-                    batch.Column(MetadataPredicate.FilePathColumn), keep);
+                    batch.Column(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.FilePathSuffix), keep);
                 var metaIdx = EngineeredWood.Arrow.ArrowCompute.Take(
-                    batch.Column(MetadataPredicate.RowIndexColumn), keep);
+                    batch.Column(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIndexSuffix), keep);
                 var newIds = new Int64Array.Builder();
                 foreach (int i in keep)
                     newIds.Append(ids.GetValue(i)!.Value * 10);
 
                 updateBatches.Add(new RecordBatch(
                     new Apache.Arrow.Schema.Builder()
-                        .Field(batch.Schema.GetFieldByName(MetadataPredicate.FilePathColumn)!)
-                        .Field(batch.Schema.GetFieldByName(MetadataPredicate.RowIndexColumn)!)
+                        .Field(batch.Schema.GetFieldByName(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.FilePathSuffix)!)
+                        .Field(batch.Schema.GetFieldByName(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIndexSuffix)!)
                         .Field(new Field("id", Int64Type.Default, false))
                         .Build(),
                     new IArrowArray[] { metaPath, metaIdx, newIds.Build() }, keep.Count));
@@ -664,8 +664,8 @@ public class MetadataColumnTests : IDisposable
         await using var table = await CreateTrackedAsync();
         var updates = new RecordBatch(
             new Apache.Arrow.Schema.Builder()
-                .Field(new Field(MetadataPredicate.FilePathColumn, StringType.Default, false))
-                .Field(new Field(MetadataPredicate.RowIndexColumn, Int64Type.Default, false))
+                .Field(new Field(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.FilePathSuffix, StringType.Default, false))
+                .Field(new Field(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIndexSuffix, Int64Type.Default, false))
                 .Field(new Field("id", Int64Type.Default, false))
                 .Build(),
             new IArrowArray[]
@@ -726,229 +726,6 @@ public class MetadataColumnTests : IDisposable
             => inner.WriteAllBytesAsync(path, data, ct);
     }
 
-    /// <summary>THE CAPABILITY, measured rather than asserted: a DELETE whose predicate addresses rows only
-    /// physically (<c>_metadata.file_path</c> + <c>_metadata.row_index</c>) lowers to a selection and commits
-    /// with ZERO data-parquet opens — it needs the log and a deletion-vector write, nothing else.</summary>
-    [Fact]
-    public async Task MetadataPredicateDelete_ReadsNoDataFiles()
-    {
-        string targetPath;
-        await using (var setup = await CreateTrackedAsync())
-        {
-            targetPath = (await ReadMetaAsync(setup)).First(r => r.Id == 12).FilePath;
-        }
-
-        var countingFs = new CountingFileSystem(new LocalTableFileSystem(_tempDir));
-        await using (var table = await DeltaTable.OpenAsync(countingFs))
-        {
-            var pred = new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
-            {
-                Ex.Equal(MetadataPredicate.FilePathColumn, targetPath),
-                Ex.Equal(MetadataPredicate.RowIndexColumn, 1L),
-            });
-            var (deleted, _) = await table.DeleteAsync(pred);
-            Assert.Equal(1, deleted);
-        }
-
-        Assert.Equal(0, countingFs.DataParquetOpens);   // the measurement that makes the claim real
-
-        await using var check = await OpenAsync();
-        var left = (await ReadMetaAsync(check)).Select(r => r.Id).OrderBy(x => x).ToArray();
-        Assert.Equal(new long[] { 1, 2, 3, 11, 13, 21, 22, 23 }, left);
-    }
-
-    /// <summary>
-    /// SCOPES the zero-read claim, so it cannot be over-read. Without deletion vectors the same lowered
-    /// predicate routes to COPY-ON-WRITE, which must read and rewrite each affected file — so it opens data
-    /// files, and is NOT a zero-read fast path. The lowering still helps (it names the files directly instead
-    /// of evaluating a mask over pruning candidates), but the saving is different in kind.
-    /// </summary>
-    [Fact]
-    public async Task MetadataPredicateDelete_WithoutDeletionVectors_IsCopyOnWrite_AndDoesReadData()
-    {
-        string targetPath;
-        await using (var setup = await DeltaTable.CreateAsync(
-            new LocalTableFileSystem(_tempDir), BuildSchema()))   // NO deletion vectors
-        {
-            await setup.WriteAsync([BuildBatch(1, 3)]);
-            await setup.WriteAsync([BuildBatch(11, 3)]);
-            targetPath = (await ReadMetaAsync(setup)).First(r => r.Id == 12).FilePath;
-        }
-
-        var countingFs = new CountingFileSystem(new LocalTableFileSystem(_tempDir));
-        await using (var table = await DeltaTable.OpenAsync(countingFs))
-        {
-            var pred = new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
-            {
-                Ex.Equal(MetadataPredicate.FilePathColumn, targetPath),
-                Ex.Equal(MetadataPredicate.RowIndexColumn, 1L),
-            });
-            var (deleted, _) = await table.DeleteAsync(pred);
-            Assert.Equal(1, deleted);
-        }
-
-        // the rewrite had to read the affected file — this is the assertion that scopes the DV-path claim
-        Assert.True(countingFs.DataParquetOpens > 0,
-            "copy-on-write must read the file it rewrites; only the deletion-vector path is zero-read");
-
-        await using var check = await OpenAsync();
-        Assert.Equal(new long[] { 1, 2, 3, 11, 13 },
-            (await ReadMetaAsync(check)).Select(r => r.Id).OrderBy(x => x).ToArray());
-    }
-
-    /// <summary>
-    /// The other boundary: with Change Data Feed on, even the deletion-vector path must read the SELECTED
-    /// files to capture the deleted rows' content for the feed — so it is not zero-read either. It still reads
-    /// only the selected file, not the whole table, which is the actual guarantee.
-    /// </summary>
-    [Fact]
-    public async Task MetadataPredicateDelete_WithChangeDataFeed_ReadsOnlyTheSelectedFile()
-    {
-        string targetPath;
-        await using (var setup = await DeltaTable.CreateAsync(
-            new LocalTableFileSystem(_tempDir), BuildSchema(),
-            enableDeletionVectors: true,
-            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" }))
-        {
-            await setup.WriteAsync([BuildBatch(1, 3)]);
-            await setup.WriteAsync([BuildBatch(11, 3)]);
-            await setup.WriteAsync([BuildBatch(21, 3)]);
-            targetPath = (await ReadMetaAsync(setup)).First(r => r.Id == 12).FilePath;
-        }
-
-        var countingFs = new CountingFileSystem(new LocalTableFileSystem(_tempDir));
-        await using (var table = await DeltaTable.OpenAsync(countingFs))
-        {
-            var pred = new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
-            {
-                Ex.Equal(MetadataPredicate.FilePathColumn, targetPath),
-                Ex.Equal(MetadataPredicate.RowIndexColumn, 1L),
-            });
-            var (deleted, _) = await table.DeleteAsync(pred);
-            Assert.Equal(1, deleted);
-        }
-
-        // reads happened (for the feed) but were confined to the ONE selected file out of three
-        Assert.True(countingFs.DataParquetOpens > 0, "CDF capture must read the selected rows' content");
-        Assert.True(countingFs.DataParquetOpens <= 2,
-            $"only the selected file should be read, not all three — saw {countingFs.DataParquetOpens} opens");
-    }
-
-    /// <summary>An IN set names several positions, and OR combines several files — the shapes the lowering
-    /// supports. Still zero data reads.</summary>
-    [Fact]
-    public async Task MetadataPredicateDelete_InSet_AndOrAcrossFiles()
-    {
-        string fileA, fileB;
-        await using (var setup = await CreateTrackedAsync())
-        {
-            var rows = await ReadMetaAsync(setup);
-            fileA = rows.First(r => r.Id == 1).FilePath;
-            fileB = rows.First(r => r.Id == 21).FilePath;
-        }
-
-        var countingFs = new CountingFileSystem(new LocalTableFileSystem(_tempDir));
-        await using (var table = await DeltaTable.OpenAsync(countingFs))
-        {
-            // (fileA AND row_index IN (0,1)) OR (fileB AND row_index = 2)
-            var pred = new EngineeredWood.Expressions.OrPredicate(new EngineeredWood.Expressions.Predicate[]
-            {
-                new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
-                {
-                    Ex.Equal(MetadataPredicate.FilePathColumn, fileA),
-                    Ex.In(MetadataPredicate.RowIndexColumn, new EngineeredWood.Expressions.LiteralValue[] { 0L, 1L }),
-                }),
-                new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
-                {
-                    Ex.Equal(MetadataPredicate.FilePathColumn, fileB),
-                    Ex.Equal(MetadataPredicate.RowIndexColumn, 2L),
-                }),
-            });
-            var (deleted, _) = await table.DeleteAsync(pred);
-            Assert.Equal(3, deleted);
-        }
-        Assert.Equal(0, countingFs.DataParquetOpens);
-
-        await using var check = await OpenAsync();
-        Assert.Equal(6, (await ReadMetaAsync(check)).Count);
-    }
-
-    /// <summary>A predicate that MENTIONS <c>_metadata</c> but cannot be lowered is REJECTED loudly. It must
-    /// never fall through to the row mask, which binds data columns only and would mis-evaluate it —
-    /// silently deleting the wrong rows.</summary>
-    [Fact]
-    public async Task MetadataPredicateThatCannotLower_IsRejected_NotMisEvaluated()
-    {
-        await using var table = await CreateTrackedAsync();
-        // mixing a metadata reference with a data column is not a supported lowering
-        var pred = new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
-        {
-            Ex.Equal(MetadataPredicate.FilePathColumn, "whatever.parquet"),
-            Ex.Equal("id", 2L),
-        });
-        var ex = await Assert.ThrowsAsync<NotSupportedException>(async () => await table.DeleteAsync(pred));
-        Assert.Contains("_metadata", ex.Message);
-
-        // and nothing was deleted
-        Assert.Equal(9, (await ReadMetaAsync(table)).Count);
-    }
-
-    /// <summary>UpdateAsync is now SYMMETRIC with DeleteAsync: a physically-addressing predicate lowers to a
-    /// selection, and the updater sees only the MATCHED rows. Non-matched rows pass through untouched.</summary>
-    [Fact]
-    public async Task MetadataPredicateUpdate_LowersAndUpdatesOnlyTheMatchedRows()
-    {
-        string targetFile;
-        await using (var setup = await CreateTrackedAsync())
-        {
-            targetFile = (await ReadMetaAsync(setup)).First(r => r.Id == 12).FilePath;
-        }
-
-        await using (var table = await OpenAsync())
-        {
-            var pred = new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
-            {
-                Ex.Equal(MetadataPredicate.FilePathColumn, targetFile),
-                Ex.Equal(MetadataPredicate.RowIndexColumn, 1L),
-            });
-            var (rows, _) = await table.UpdateAsync(pred, matched =>
-            {
-                // exactly the one selected row reaches the updater
-                Assert.Equal(1, matched.Length);
-                var ids = (Int64Array)matched.Column("id");
-                Assert.Equal(12L, ids.GetValue(0)!.Value);
-                return new RecordBatch(matched.Schema,
-                    new IArrowArray[] { new Int64Array.Builder().Append(9999L).Build() }, 1);
-            });
-            Assert.Equal(1, rows);
-        }
-
-        await using var check = await OpenAsync();
-        var after = (await ReadMetaAsync(check)).Select(r => r.Id).OrderBy(x => x).ToArray();
-        Assert.Equal(new long[] { 1, 2, 3, 11, 13, 21, 22, 23, 9999 }, after);
-    }
-
-    /// <summary>THE DEFECT THIS FIXES: before UpdateAsync got the guard, a `_metadata` predicate it could not
-    /// lower fell through to a row mask that binds DATA columns only — so it would mis-evaluate rather than
-    /// refuse. DeleteAsync rejected it; UpdateAsync did not. Now both do.</summary>
-    [Fact]
-    public async Task MetadataPredicateUpdate_ThatCannotLower_IsRejected_LikeDelete()
-    {
-        await using var table = await CreateTrackedAsync();
-        var pred = new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[]
-        {
-            Ex.Equal(MetadataPredicate.FilePathColumn, "somewhere.parquet"),
-            Ex.Equal("id", 2L),
-        });
-        var ex = await Assert.ThrowsAsync<NotSupportedException>(
-            async () => await table.UpdateAsync(pred, b => b));
-        Assert.Contains("_metadata", ex.Message);
-        Assert.Contains("UPDATE", ex.Message);
-
-        // untouched
-        Assert.Equal(9, (await ReadMetaAsync(table)).Count);
-    }
-
     /// <summary>A pushed filter prunes files, and the surviving rows still carry a correct locator — the
     /// metadata read goes through the same planner as every other read.</summary>
     [Fact]
@@ -962,7 +739,7 @@ public class MetadataColumnTests : IDisposable
         await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator, Filter = pred }))
         {
             var ids = (Int64Array)batch.Column("id");
-            var path = (StringArray)batch.Column(MetadataPredicate.FilePathColumn);
+            var path = (StringArray)batch.Column(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.FilePathSuffix);
             for (int i = 0; i < batch.Length; i++)
                 filtered.Add(new MetaRow(ids.GetValue(i)!.Value, path.GetString(i), 0, null, null));
         }

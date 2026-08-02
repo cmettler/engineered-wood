@@ -2864,35 +2864,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        // A predicate that only addresses rows PHYSICALLY (_metadata.file_path / _metadata.row_index) lowers to
-        // a selection, which deletes without reading any data at all. One that mentions `_metadata` but cannot
-        // lower is REJECTED rather than handed to the row mask, which binds data columns only and would
-        // silently mis-evaluate it. The selection route reaches DeleteRowsAsync, which owns its own
-        // failure-collection ledger, so it needs no transaction of its own to clean up after.
-        if (MetadataPredicate.TryLower(predicate, out var lowered))
-        {
-            return await DeleteBySelectionViaVectorsOrRewriteAsync(lowered, cancellationToken)
-                .ConfigureAwait(false);
-        }
-        MetadataPredicate.ThrowIfReferencesMetadata(predicate, "DELETE");
-
         await using var transaction = StartTransaction(); // aborts (and cleans up) on any failure — see above
         long rowsDeleted = await transaction.DeleteAsync(predicate, cancellationToken)
             .ConfigureAwait(false);
         long version = await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return (rowsDeleted, version);
     }
-
-    /// <summary>Routes a lowered selection to the deletion-vector path when the table enables DVs (no data read
-    /// at all), else to copy-on-write. Mirrors the choice the rowid DELETE surface makes.</summary>
-    private ValueTask<(long RowsDeleted, long Version)> DeleteBySelectionViaVectorsOrRewriteAsync(
-        RowSelection selection, CancellationToken cancellationToken)
-        => DeleteRowsAsync(
-            selection,
-            DeletionVectors.DeletionVectorConfig.IsEnabled(CurrentSnapshot.Metadata.Configuration)
-                ? RowDeleteMode.DeletionVector
-                : RowDeleteMode.CopyOnWrite,
-            cancellationToken: cancellationToken);
 
     /// <summary>The remove/add (and CDC) actions a DELETE produces, its removed-file paths, the row
     /// count, and the per-file row-level edits — everything a commit needs, but without committing. Shared
@@ -3123,70 +3100,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        // Symmetric with DeleteAsync: a predicate that addresses rows only PHYSICALLY lowers to a selection,
-        // and one that MENTIONS `_metadata` but cannot lower is REJECTED. Without this the mask below — which
-        // binds DATA columns only — would mis-evaluate it.
-        if (MetadataPredicate.TryLower(predicate, out var lowered))
-        {
-            long version = await UpdateRowsAsync(
-                    lowered, MatchedRowsUpdater(lowered, updater), cancellationToken)
-                .ConfigureAwait(false);
-            long rows = lowered.TotalPositions;
-            return (rows, version);
-        }
-        MetadataPredicate.ThrowIfReferencesMetadata(predicate, "UPDATE");
-
         return await UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
             readPredicates: [predicate], cancellationToken).ConfigureAwait(false);
     }
-
-    /// <summary>
-    /// Adapts the predicate surface's <c>Func&lt;RecordBatch, RecordBatch&gt;</c> updater — which receives only
-    /// the MATCHED rows — onto the selection primitive, which hands over whole source batches plus their
-    /// absolute positions. Matched rows are taken out, updated, and spliced back at their original slots.
-    /// </summary>
-    private static Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>>
-        MatchedRowsUpdater(RowSelection selection, Func<RecordBatch, RecordBatch> updater)
-        => (filePath, sourceBatches, positionsPerBatch) =>
-        {
-            var targets = selection.PositionsFor(filePath) as HashSet<long>
-                          ?? new HashSet<long>(selection.PositionsFor(filePath));
-            var result = new List<RecordBatch>(sourceBatches.Count);
-            for (int b = 0; b < sourceBatches.Count; b++)
-            {
-                var src = sourceBatches[b];
-                var pos = positionsPerBatch[b];
-                var matchedRows = new List<int>();
-                for (int i = 0; i < src.Length; i++)
-                    if (!pos.IsNull(i) && targets.Contains(pos.GetValue(i)!.Value))
-                        matchedRows.Add(i);
-                if (matchedRows.Count == 0) { result.Add(src); continue; }
-
-                var matchColumns = new IArrowArray[src.ColumnCount];
-                for (int c = 0; c < src.ColumnCount; c++)
-                    matchColumns[c] = ArrowCompute.Take(src.Column(c), matchedRows);
-                var updated = updater(new RecordBatch(src.Schema, matchColumns, matchedRows.Count));
-                if (updated.Length != matchedRows.Count)
-                {
-                    throw new InvalidOperationException(
-                        "UpdateAsync: the updater must return one row per matched row.");
-                }
-
-                // take indices: i from the source half, a matched slot from the appended updated half
-                var take = BuildIdentity(src.Length);
-                for (int k = 0; k < matchedRows.Count; k++)
-                    take[matchedRows[k]] = src.Length + k;
-                var columns = new IArrowArray[src.ColumnCount];
-                for (int c = 0; c < src.ColumnCount; c++)
-                {
-                    var combined = ArrowArrayConcatenator.Concatenate(
-                        new[] { src.Column(c), updated.Column(c) });
-                    columns[c] = ArrowCompute.Take(combined, take);
-                }
-                result.Add(new RecordBatch(src.Schema, columns, src.Length));
-            }
-            return result;
-        };
 
     private async ValueTask<(long RowsUpdated, long Version)> UpdateCoreAsync(
         Func<RecordBatch, BooleanArray> predicate,
