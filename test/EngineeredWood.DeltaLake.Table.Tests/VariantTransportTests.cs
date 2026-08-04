@@ -14,7 +14,8 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// the canonical <c>arrow.parquet.variant</c> extension (struct storage) exchanges variant values as ONE
 /// self-delimiting BINARY per row (metadata bytes ++ value bytes) tagged with the
 /// <see cref="SchemaConverter.VariantTransportExtensionName"/> field-metadata marker. The write side is
-/// marker-keyed and always on; <c>DeltaTableOptions.VariantTransportBlob</c> selects the read direction.
+/// marker-keyed and always on. There is no read direction: a host wanting the transport form converts this
+/// library's canonical output at its own boundary.
 /// These tests pin the transport against the CANONICAL flow: a transport-written table reads back
 /// canonically (default options) and vice versa — the two host dialects see one spec table.
 /// </summary>
@@ -111,47 +112,6 @@ public class VariantTransportTests : IDisposable
     }
 
     [Fact]
-    public async Task CanonicalWritten_ReadsBackAsTransportBlobs()
-    {
-        // WRITE canonically (a VariantArray host, e.g. EW's own tests / Spark-parity callers)...
-        var canonicalSchema = new Apache.Arrow.Schema.Builder()
-            .Field(new Field("id", Int64Type.Default, false))
-            .Field(new Field("v", VariantType.Default, true))
-            .Build();
-        var ids = new Int64Array.Builder().Append(1).Append(2).Append(3).Build();
-        var vb = new VariantArray.Builder();
-        vb.Append(EmptyMetadata, True);
-        vb.AppendNull();
-        vb.Append(EmptyMetadata, Int8_42);
-        var fs = new LocalTableFileSystem(_tempDir);
-        await using (var table = await DeltaTable.CreateAsync(fs, canonicalSchema))
-        {
-            await table.WriteAsync(
-                [new RecordBatch(canonicalSchema, [ids, vb.Build(allocator: null)], 3)]);
-        }
-
-        // ...and READ with VariantTransportBlob: the transport dialect sees marker-tagged blobs whose
-        // bytes are exactly metadata ++ value, with SQL NULL preserved as a null row.
-        var options = DeltaTableOptions.Default with { VariantTransportBlob = true };
-        await using var reread = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir), options);
-
-        var rows = new List<(bool IsNull, byte[]? Value)>();
-        await foreach (var b in reread.ReadAllAsync())
-        {
-            int idx = b.Schema.GetFieldIndex("v");
-            Assert.True(SchemaConverter.IsVariantTransportField(b.Schema.FieldsList[idx]));
-            var col = Assert.IsType<BinaryArray>(b.Column(idx));
-            for (int i = 0; i < col.Length; i++)
-                rows.Add((col.IsNull(i), col.IsNull(i) ? null : col.GetBytes(i).ToArray()));
-        }
-
-        Assert.Equal(3, rows.Count);
-        Assert.Equal(Blob(True), rows[0].Value);
-        Assert.True(rows[1].IsNull);
-        Assert.Equal(Blob(Int8_42), rows[2].Value);
-    }
-
-    [Fact]
     public async Task TransportRoundTrip_UniformColumnShredsAndReassembles()
     {
         // A UNIFORM column shreds on write (ShredSchemaInferer applies a typed_value schema) and
@@ -173,31 +133,32 @@ public class VariantTransportTests : IDisposable
             await table.WriteAsync([new RecordBatch(TransportSchema(), [ids.Build(), blobs.Build()], 3)]);
         }
 
-        var options = DeltaTableOptions.Default with { VariantTransportBlob = true };
-        await using var reread = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir), options);
+        // Read back CANONICALLY — the only read dialect this library has. The transport's read direction
+        // moved to the embedding host, so what is under test here is what remains this library's: that a
+        // uniform column SHREDS on write and REASSEMBLES to the canonical (metadata, value) pair on read.
+        await using var reread = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
         var values = new List<byte[]?>();
         await foreach (var b in reread.ReadAllAsync())
         {
-            var col = Assert.IsType<BinaryArray>(b.Column(b.Schema.GetFieldIndex("v")));
-            for (int i = 0; i < col.Length; i++)
-                values.Add(col.IsNull(i) ? null : col.GetBytes(i).ToArray());
+            var col = Assert.IsType<VariantArray>(b.Column(b.Schema.GetFieldIndex("v")));
+            var storage = Assert.IsType<StructArray>(col.Storage);
+            var stype = (Apache.Arrow.Types.StructType)storage.Data.DataType;
+            int valueIdx = stype.GetFieldIndex("value");
+            Assert.True(valueIdx >= 0, "reassembly must yield a canonical 'value' child");
+            // typed_value gone => reassembly actually ran, rather than the raw shredded layout surviving.
+            Assert.True(stype.GetFieldIndex("typed_value") < 0);
+            var value = Assert.IsType<BinaryArray>(
+                Apache.Arrow.ArrowArrayFactory.BuildArray(storage.Data.Children[valueIdx]));
+            for (int i = 0; i < storage.Length; i++)
+                values.Add(storage.IsNull(i) || value.IsNull(i) ? null : value.GetBytes(i).ToArray());
         }
 
-        // Reassembly re-ENCODES (the metadata header's flag bits may differ from the canonical empty
-        // form) — assert the VALUE half byte-exactly, splitting each blob at its self-delimiting
-        // metadata length; the SQL NULL survives as a null row.
+        // The VALUE half asserted byte-exactly. Only the value half: reassembly re-ENCODES the metadata
+        // (its header flag bits may differ from the canonical empty form), so the metadata bytes are not
+        // a stable expectation. The SQL NULL survives as a null storage row.
         Assert.Equal(3, values.Count);
-        // Array.Copy rather than a `blob[start..]` range indexer: the range form lowers to
-        // RuntimeHelpers.GetSubArray, which net472 does not have (CS0656) — and this project targets it.
-        static byte[] ValueHalf(byte[] blob)
-        {
-            int start = VariantTransport.MetadataLength(blob);
-            var value = new byte[blob.Length - start];
-            System.Array.Copy(blob, start, value, 0, value.Length);   // System.: `Array` is Apache.Arrow.Array here
-            return value;
-        }
-        Assert.Equal(Int8(1), ValueHalf(values[0]!));
+        Assert.Equal(Int8(1), values[0]);
         Assert.Null(values[1]);
-        Assert.Equal(Int8(2), ValueHalf(values[2]!));
+        Assert.Equal(Int8(2), values[2]);
     }
 }

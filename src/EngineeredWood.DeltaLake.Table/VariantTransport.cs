@@ -17,8 +17,13 @@ namespace EngineeredWood.DeltaLake.Table;
 /// The variant metadata header carries its own size, so the transport splits without a length prefix.
 /// Embedding hosts whose Arrow boundary cannot carry an extension type over struct storage exchange
 /// variant values in this LEAF-binary form: the WRITE side converts marked blob columns before the
-/// built-in parquet codec (marker-keyed — a no-op for canonical input), and the READ side converts the
-/// pipeline's output back to blobs when <c>DeltaTableOptions.VariantTransportBlob</c> is set.
+/// built-in parquet codec (marker-keyed — a no-op for canonical input).
+///
+/// <para><b>WRITE direction only.</b> The read-side counterpart is gone: a host that wants the transport
+/// form converts the pipeline's canonical output at its OWN boundary, which is where the constraint lives
+/// and which needs no knowledge of the four physical layouts <see cref="VariantColumnCoercion.Coerce"/>
+/// already normalises (canonical, shredded, a bare struct from an unannotated file, a seam-delivered
+/// blob). Only the write direction has to be here, because it feeds the built-in parquet codec.</para>
 ///
 /// <para><b>Shredding</b> (the VariantShredding spec) is NOT this type's concern: it is a physical-layout
 /// decision owned by <see cref="VariantShredding"/> in the parquet layer, which this type calls in both
@@ -96,170 +101,6 @@ internal static class VariantTransport
             // type changes to the extension; the transport marker is harmless alongside it.
             fields[c] = new Field(f.Name, variant.Data.DataType, f.IsNullable, f.Metadata);
             arrays![c] = variant;
-        }
-        if (fields is null)
-            return batch;
-        var sb = new Apache.Arrow.Schema.Builder();
-        foreach (var f in fields)
-            sb.Field(f);
-        return new RecordBatch(sb.Build(), arrays!, batch.Length);
-    }
-
-    /// <summary>
-    /// READ direction (selected by <c>DeltaTableOptions.VariantTransportBlob</c>): converts each column
-    /// whose DELTA type is <c>variant</c> back to the transport blob, tagging the field with the marker.
-    /// Handles every shape the pipeline can deliver: a <see cref="VariantArray"/> (the built-in reader's
-    /// registry wrapped an annotated group — possibly SHREDDED, reassembled per row), a bare
-    /// <see cref="StructArray"/> (an unannotated spec-minimal file), or an already-binary column
-    /// (a pluggable host reader delivered the transport directly — passes through).
-    /// </summary>
-    internal static RecordBatch ToTransportBlobs(RecordBatch batch, StructType deltaSchema)
-    {
-        List<Field>? fields = null;
-        List<IArrowArray>? arrays = null;
-        for (int c = 0; c < batch.ColumnCount; c++)
-        {
-            var f = batch.Schema.FieldsList[c];
-            StructField? deltaField = null;
-            foreach (var df in deltaSchema.Fields)
-            {
-                if (string.Equals(df.Name, f.Name, StringComparison.Ordinal))
-                {
-                    deltaField = df;
-                    break;
-                }
-            }
-            if (deltaField is null || !IsVariantField(deltaField))
-                continue;
-
-            var column = batch.Column(c);
-            if (column is BinaryArray)
-            {
-                // A host reader delivered the transport form directly — pass the DATA through, but make
-                // sure the FIELD still carries the marker (an intermediate reconcile may have relabeled it).
-                if (!SchemaConverter.IsVariantTransportField(f))
-                {
-                    if (fields is null)
-                    {
-                        fields = new List<Field>(batch.Schema.FieldsList);
-                        arrays = new List<IArrowArray>(batch.ColumnCount);
-                        for (int i = 0; i < batch.ColumnCount; i++)
-                            arrays.Add(batch.Column(i));
-                    }
-                    var passTagged = new Dictionary<string, string>
-                    {
-                        ["ARROW:extension:name"] = SchemaConverter.VariantTransportExtensionName,
-                    };
-                    if (f.Metadata is { } passSrc)
-                    {
-                        foreach (var kv in passSrc)
-                            passTagged[kv.Key] = kv.Value;
-                    }
-                    fields[c] = new Field(f.Name, Apache.Arrow.Types.BinaryType.Default, f.IsNullable, passTagged);
-                }
-                continue;
-            }
-
-            var st = column switch
-            {
-                VariantArray va => va.Storage as StructArray,
-                StructArray s => s,
-                _ => null,
-            };
-            if (st is null)
-            {
-                throw new DeltaFormatException(
-                    $"column '{f.Name}' is declared variant but materialised as {column.GetType().Name}, "
-                    + "which is neither VariantArray, struct-of-binary, nor the binary transport form.");
-            }
-
-            var structType = (Apache.Arrow.Types.StructType)st.Data.DataType;
-            if (structType.GetFieldIndex("typed_value") >= 0 || structType.GetFieldIndex("value") < 0)
-            {
-                // Shredded layout (typed_value present, or a fully-shredded file without a value column).
-                // Normalise it to the canonical (metadata, value) pair through the parquet layer's
-                // reassembly — which merges typed columns with residual bytes per the VariantShredding
-                // spec, ours or a foreign writer's — then fall into the single concat path below.
-                if (st.Data.Offset != 0)
-                {
-                    throw new DeltaFormatException(
-                        $"column '{f.Name}': shredded variant reassembly over an offset struct slice is "
-                        + "not supported (fresh reader batches are never sliced).");
-                }
-                var shreddedVariant = column as VariantArray
-                    ?? new VariantArray(Apache.Arrow.ArrowArrayFactory.BuildArray(st.Data));
-                var canonical = VariantShredding.Reassemble(shreddedVariant).Storage as StructArray;
-                // Post-condition, checked rather than assumed: reassembly must have produced the
-                // canonical shape. If a typed_value survived, the concat below would read the RAW value
-                // child — EMPTY for every shredded row — so fail loudly instead of returning empty
-                // variants (the exact silent-data trap VariantShredding's own remarks warn about).
-                if (canonical is null
-                    || ((Apache.Arrow.Types.StructType)canonical.Data.DataType)
-                        .GetFieldIndex("typed_value") >= 0)
-                {
-                    throw new DeltaFormatException(
-                        $"column '{f.Name}': shredded variant reassembly did not yield a canonical "
-                        + "metadata/value struct.");
-                }
-                st = canonical;
-                structType = (Apache.Arrow.Types.StructType)st.Data.DataType;
-            }
-
-            int off = st.Data.Offset; // struct children do NOT incorporate the parent's offset
-            var builder = new BinaryArray.Builder();
-            BinaryArray? meta = null, val = null;
-            for (int i = 0; i < structType.Fields.Count; i++)
-            {
-                string name = structType.Fields[i].Name;
-                // Apache.Arrow's factory, QUALIFIED on purpose: EngineeredWood.Parquet.Data declares its
-                // own internal ArrowArrayFactory that throws on 'struct'. It is invisible here today
-                // (this assembly is not in Parquet's InternalsVisibleTo), so the unqualified name binds
-                // correctly — but adding one would silently rebind it and fail only at runtime.
-                var child = Apache.Arrow.ArrowArrayFactory.BuildArray(st.Data.Children[i]) as BinaryArray;
-                if (string.Equals(name, "metadata", StringComparison.Ordinal))
-                    meta = child;
-                else if (string.Equals(name, "value", StringComparison.Ordinal))
-                    val = child;
-            }
-            if (meta is null || val is null)
-            {
-                throw new DeltaFormatException(
-                    $"column '{f.Name}' is annotated VARIANT but lacks binary metadata/value children.");
-            }
-
-            for (int r = 0; r < st.Length; r++)
-            {
-                if (st.IsNull(r) || meta.IsNull(off + r) || val.IsNull(off + r))
-                {
-                    builder.AppendNull();
-                    continue;
-                }
-                var m = meta.GetBytes(off + r);
-                var v = val.GetBytes(off + r);
-                var combined = new byte[m.Length + v.Length];
-                m.CopyTo(combined);
-                v.CopyTo(combined.AsSpan(m.Length));
-                builder.Append(combined.AsSpan());
-            }
-
-            if (fields is null)
-            {
-                fields = new List<Field>(batch.Schema.FieldsList);
-                arrays = new List<IArrowArray>(batch.ColumnCount);
-                for (int i = 0; i < batch.ColumnCount; i++)
-                    arrays.Add(batch.Column(i));
-            }
-            var tagged = new Dictionary<string, string>
-            {
-                ["ARROW:extension:name"] = SchemaConverter.VariantTransportExtensionName,
-            };
-            if (f.Metadata is { } src)
-            {
-                foreach (var kv in src)
-                    tagged[kv.Key] = kv.Value;
-            }
-            fields[c] = new Field(f.Name, Apache.Arrow.Types.BinaryType.Default, f.IsNullable, tagged);
-            arrays![c] = builder.Build();
         }
         if (fields is null)
             return batch;

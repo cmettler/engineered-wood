@@ -7789,12 +7789,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // file (Spark 4.0.x, a spec-minimal writer, or our own output under
             // EmitVariantLogicalType=false) yields a bare struct-of-binary that the parquet reader did
             // not wrap. Without this the column would silently read as a struct rather than a variant.
-            // Under VariantTransportBlob the host boundary speaks the LEAF-binary transport instead —
-            // convert every layout (VariantArray incl. shredded, bare struct, seam-delivered blob) to the
-            // marker-tagged blob; otherwise coerce to the canonical VariantArray.
-            cleanResult = _options.VariantTransportBlob
-                ? VariantTransport.ToTransportBlobs(cleanResult, snapshot.Schema)
-                : VariantColumnCoercion.Coerce(cleanResult, expectedSchema);
+            cleanResult = VariantColumnCoercion.Coerce(cleanResult, expectedSchema);
 
             // Surface each surviving row's RESOLVED id + commit version (row-aligned with cleanResult): the
             // materialized value where present, else add.baseRowId + absolute position / defaultRowCommitVersion
