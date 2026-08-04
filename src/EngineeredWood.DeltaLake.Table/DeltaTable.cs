@@ -3775,51 +3775,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         new Dictionary<string, string>();
 
     /// <summary>
-    /// The partition-aware convenience over <see cref="WriteChangeDataFileAsync"/>: splits
-    /// <paramref name="rows"/> (logical user columns, partition columns INCLUDED) by partition per the
-    /// data-file convention — each partition's rows land in their own <c>_change_data</c> file with the
-    /// partition columns excluded from the bytes and the file's <c>partitionValues</c> physical-keyed —
-    /// and returns one <see cref="CdcFile"/> per written file. On an unpartitioned table this is exactly
-    /// one <see cref="WriteChangeDataFileAsync"/> call. Callers holding a statement's change rows as one
-    /// batch (a DELETE's matched rows, an UPDATE's pre/post-images) need no partition-splitting code.
-    /// </summary>
-    public async ValueTask<IReadOnlyList<CdcFile>> WriteChangeDataFilesAsync(
-        RecordBatch rows, string changeType, CancellationToken cancellationToken = default)
-    {
-        var snapshot = CurrentSnapshot;
-        var partitionColumns = snapshot.Metadata.PartitionColumns;
-        if (partitionColumns is not { Count: > 0 })
-        {
-            return new[]
-            {
-                await WriteChangeDataFileAsync(rows, changeType, null, cancellationToken)
-                    .ConfigureAwait(false),
-            };
-        }
-
-        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
-        var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
-        var files = new List<CdcFile>();
-        foreach (var (partValues, dataBatch) in Partitioning.PartitionUtils.SplitByPartition(
-                     rows, partitionColumns))
-        {
-            if (dataBatch.Length == 0)
-                continue;
-            IReadOnlyDictionary<string, string> keyed = partValues;
-            if (mappingMode != ColumnMappingMode.None && partValues.Count > 0)
-            {
-                var k = new Dictionary<string, string>(partValues.Count);
-                foreach (var kv in partValues)
-                    k[logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
-                keyed = k;
-            }
-            files.Add(await WriteChangeDataFileAsync(dataBatch, changeType, keyed, cancellationToken)
-                .ConfigureAwait(false));
-        }
-        return files;
-    }
-
-    /// <summary>
     /// Creates a log compaction file for a range of commits.
     /// Compacted files aggregate reconciled actions, allowing readers to
     /// skip individual commit files for faster snapshot construction.
@@ -3835,7 +3790,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         await logCompaction.CompactRangeAsync(startVersion, endVersion, cancellationToken)
             .ConfigureAwait(false);
     }
-
 
     /// <summary>
     /// Reads the table — one entry point for every combination of projection, pruning, version and per-row
