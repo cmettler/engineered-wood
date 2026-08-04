@@ -3441,12 +3441,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 foreach (var batch in writeBatches)
                 {
-                    // Built-in codec: transport-marked variant blobs -> VariantArray (no-op for
-                    // canonical), then the annotation policy (see the committing write path).
-                    var codecBatch = VariantTransport.ToVariantArrays(batch);
-                    if (!_options.EmitVariantLogicalType)
-                        codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
-                    await writer.WriteRowGroupAsync(codecBatch, cancellationToken)
+                    await writer.WriteRowGroupAsync(batch, cancellationToken)
                         .ConfigureAwait(false);
                 }
 
@@ -4627,26 +4622,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (_options.DataFileWriter is { } dataFileWriter)
                 {
                     // Delegate the parquet bytes to the host writer; it places the file at the location the
-                    // table filesystem maps `fileName` to and returns its byte size. A transport-blob variant
-                    // column passes through UNCONVERTED — a host that speaks the transport form encodes it
-                    // itself (its writer produced the marker in the first place).
+                    // table filesystem maps `fileName` to and returns its byte size.
                     fileSize = await dataFileWriter.WriteAsync(
                         new[] { writeBatch }.ToAsyncEnumerable(), fileName, cancellationToken)
                         .ConfigureAwait(false);
                 }
                 else
                 {
-                    // The built-in codec takes VariantArray columns: convert any transport-marked blob
-                    // column first (marker-keyed no-op for canonical input), then re-apply the annotation
-                    // policy (the pre-branch StripAnnotation ran before the conversion existed to strip).
-                    var codecBatch = VariantTransport.ToVariantArrays(writeBatch);
-                    if (!_options.EmitVariantLogicalType)
-                        codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
                     await using var file = await _fs.CreateAsync(
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
                         file, ownsFile: false, _options.ParquetWriteOptions);
-                    await writer.WriteRowGroupAsync(codecBatch, cancellationToken)
+                    await writer.WriteRowGroupAsync(writeBatch, cancellationToken)
                         .ConfigureAwait(false);
 
                     // DisposeAsync writes the Parquet footer before we read Position
@@ -5148,9 +5135,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     dataBatch = DropColumn(splitBatch, RowIdRideAlongColumn);
                 }
 
-                // Rename logical columns to physical names + stamp field ids at every nesting level. The
-                // materialized ids are NOT re-attached here — that happens below, after the variant-annotation
-                // strip, so nothing between reads the id column as table data (stats included).
+                // Rename logical columns to physical names + stamp field ids at every nesting level.
                 var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode);
 
                 // partitionValues keyed by the PHYSICAL column name under mapping (the spec convention).
@@ -5192,16 +5177,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 }
                 else
                 {
-                    // Built-in codec: transport-marked variant blobs -> VariantArray (no-op for canonical),
-                    // then the annotation policy (see the committing write path).
-                    var codecBatch = VariantTransport.ToVariantArrays(writeBatch);
-                    if (!_options.EmitVariantLogicalType)
-                        codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
                     await using var file = await _fs.CreateAsync(
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
                         file, ownsFile: false, _options.ParquetWriteOptions);
-                    await writer.WriteRowGroupAsync(codecBatch, cancellationToken).ConfigureAwait(false);
+                    await writer.WriteRowGroupAsync(writeBatch, cancellationToken).ConfigureAwait(false);
                     await writer.DisposeAsync().ConfigureAwait(false);
                     fileSize = file.Position;
                 }
@@ -6411,14 +6391,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             await using var writer = new Parquet.ParquetFileWriter(
                 file, ownsFile: false, _options.ParquetWriteOptions);
             foreach (var batch in writeBatches)
-            {
-                // Built-in codec: transport-marked variant blobs -> VariantArray (no-op for canonical),
-                // then the annotation policy (see the committing write path).
-                var codecBatch = VariantTransport.ToVariantArrays(batch);
-                if (!_options.EmitVariantLogicalType)
-                    codecBatch = VariantColumnCoercion.StripAnnotation(codecBatch);
-                await writer.WriteRowGroupAsync(codecBatch, cancellationToken).ConfigureAwait(false);
-            }
+                await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
             await writer.DisposeAsync().ConfigureAwait(false);
             fileSize = file.Position;
         }
