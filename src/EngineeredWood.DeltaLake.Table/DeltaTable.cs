@@ -2634,11 +2634,30 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         ValidateAppTransactions(appTransactions, snapshot, concurrent)
                     : null,
                 OnCommitDurable = written is null ? null : written.Clear,
-                // NOT checkpointed here, matching the behaviour this loop has always had: only the batch
-                // write path (CommitWriteAsync) and CommitDataFilesAsync auto-checkpoint, so a table written
-                // exclusively through DML never gets one. Worth revisiting — it is an accident of where the
-                // call happened to sit rather than a decision — but it is not this refactoring's to change.
-                WriteCheckpointOnInterval = false,
+                // [FABRICATOR-PATCH: OFFER-READY — upstream issue #86]
+                // Retired by: upstream flipping this itself.
+                //
+                // CHECKPOINT HERE TOO. This line read `WriteCheckpointOnInterval = false` with a comment
+                // calling it "an accident of where the call happened to sit rather than a decision — but
+                // not this refactoring's to change". Upstream then filed #86 for exactly that. This is the
+                // change.
+                //
+                // CommitOccAsync has SIX callers — the transaction commit plus the row-level DML, the
+                // copy-on-write rewrites, compaction and the schema changes — so a table written through
+                // anything but a plain batch append never got a checkpoint, and therefore never got a
+                // `_last_checkpoint` either. Three consequences, all compounding:
+                //   * every open replays the log from v0, growing linearly and forever;
+                //   * foreign readers (Spark, delta-rs) get no resume hint either;
+                //   * commits accumulate without bound, because log cleanup is DEFINED in terms of what a
+                //     checkpoint subsumes — so with no checkpoint, no cleanup can ever reclaim anything.
+                // MEASURED before this change, same table and same 26 commits: 24 INSERTs produced 3
+                // checkpoints, 24 DELETEs produced 0.
+                //
+                // Nothing here is a new mechanism — the condition (interval, writer present) and the
+                // ordering (after the post-commit snapshot refresh, from the refreshed snapshot) are
+                // LogCommitter's own, identical to the batch write path that already sets this. The default
+                // on LogCommitRequest is already true; this simply stops opting out.
+                WriteCheckpointOnInterval = true,
                 // Incremental: this handle's snapshot is usually newer than the transaction's base, so
                 // refreshing from it replays fewer versions for the same result.
                 RefreshFrom = CurrentSnapshot,
