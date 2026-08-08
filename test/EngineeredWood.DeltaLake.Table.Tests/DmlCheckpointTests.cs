@@ -120,6 +120,78 @@ public class DmlCheckpointTests : IDisposable
     }
 
     /// <summary>
+    /// A table's own <c>delta.checkpointInterval</c> is what it gets checkpointed at — the property is part
+    /// of the Delta spec and is the table's statement about a cost it pays per commit. Reading only
+    /// <see cref="DeltaTableOptions.CheckpointInterval"/> meant a table declaring 25 was still checkpointed
+    /// every 10, i.e. honouring someone else's declaration incorrectly rather than neutrally.
+    /// </summary>
+    [Fact]
+    public async Task CheckpointInterval_ComesFromTheTableProperty_WhenItDeclaresOne()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = IdSchema();
+
+        await using (var created = await DeltaTable.CreateAsync(
+            fs, schema,
+            configuration: new Dictionary<string, string> { ["delta.checkpointInterval"] = "4" }))
+        {
+        }
+
+        // Re-opened so the property is read from the snapshot, which is where a foreign writer's would be.
+        await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions { CheckpointInterval = 10 });
+        for (long i = 1; i <= 4; i++)
+            await table.WriteAsync([Rows(schema, i)]);
+
+        Assert.Equal(4, table.CurrentSnapshot.Version);
+        Assert.True(
+            await fs.ExistsAsync(DeltaVersion.CheckpointPath(4)),
+            "the table declares delta.checkpointInterval = 4 and was not checkpointed at v4");
+    }
+
+    /// <summary>
+    /// THE CONTROL. Without it the test above passes equally if the caller's option had simply started
+    /// being ignored in favour of a hardcoded 4 — a different bug with the same symptom on one table.
+    /// </summary>
+    [Fact]
+    public async Task CheckpointInterval_FallsBackToTheCallerOption_WhenTheTableDeclaresNone()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = IdSchema();
+
+        await using var table = await DeltaTable.CreateAsync(
+            fs, schema, new DeltaTableOptions { CheckpointInterval = 4 });
+        for (long i = 1; i <= 4; i++)
+            await table.WriteAsync([Rows(schema, i)]);
+
+        Assert.Equal(4, table.CurrentSnapshot.Version);
+        Assert.True(await fs.ExistsAsync(DeltaVersion.CheckpointPath(4)));
+    }
+
+    /// <summary>
+    /// <c>CheckpointInterval = 0</c> means "never checkpoint" and is an ABSOLUTE caller override: a host
+    /// that owns checkpointing on its own schedule must not have a table property switch it back on.
+    /// </summary>
+    [Fact]
+    public async Task CheckpointInterval_Zero_StaysDisabled_EvenWhenTheTableDeclaresOne()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = IdSchema();
+
+        await using (var created = await DeltaTable.CreateAsync(
+            fs, schema,
+            configuration: new Dictionary<string, string> { ["delta.checkpointInterval"] = "2" }))
+        {
+        }
+
+        await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions { CheckpointInterval = 0 });
+        for (long i = 1; i <= 4; i++)
+            await table.WriteAsync([Rows(schema, i)]);
+
+        Assert.False(await fs.ExistsAsync(DeltaVersion.CheckpointPath(2)));
+        Assert.False(await fs.ExistsAsync(DeltaVersion.CheckpointPath(4)));
+    }
+
+    /// <summary>
     /// The hint file is what a FOREIGN reader uses to skip the replay — a checkpoint nobody can find helps
     /// only us. Asserted on the DML path for the same reason as above.
     /// </summary>

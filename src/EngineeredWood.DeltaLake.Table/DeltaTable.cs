@@ -1,6 +1,7 @@
 ﻿// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using Apache.Arrow;
 using EngineeredWood.Arrow;
@@ -54,13 +55,56 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _checkpointWriter = new CheckpointWriter(fileSystem, options.ParquetWriteOptions);
         _committer = new LogCommitter(_log, new LogCommitOptions
         {
-            CheckpointInterval = options.CheckpointInterval,
+            CheckpointInterval = ResolveCheckpointInterval(options, snapshot),
             // Shared with the table's own explicit CheckpointAsync, so both write checkpoints under the
             // caller's parquet options rather than the committer's defaults.
             CheckpointWriter = _checkpointWriter,
             PreferTypedCheckpointStats = options.PreferTypedCheckpointStats,
         });
         _currentSnapshot = snapshot;
+    }
+
+    /// <summary>
+    /// The checkpoint interval this table actually commits at: its own <c>delta.checkpointInterval</c>
+    /// where it declares one, otherwise the caller's <see cref="DeltaTableOptions.CheckpointInterval"/>.
+    ///
+    /// <para>The property is part of the Delta spec and a table's own statement about how often it wants
+    /// checkpointing — a cost it pays per commit and a count another engine may be tuning deliberately.
+    /// Reading only the code-level option meant a table declaring 100 was still checkpointed every 10,
+    /// i.e. ten times the objects its owner asked for. The value is STORED by writers that accept the
+    /// property, so ignoring it is not neutral: it is honouring someone else's declaration incorrectly.</para>
+    ///
+    /// <para><b>⚠ A caller that DISABLED checkpointing keeps it disabled.</b> <c>CheckpointInterval = 0</c>
+    /// means "never checkpoint" and is an absolute caller override — a table property must not switch it
+    /// back on, or a host that deliberately owns checkpointing on its own schedule would start racing one
+    /// it did not ask for.</para>
+    ///
+    /// <para>Resolved once per open, from the snapshot the table was constructed with. A value changed by
+    /// a later <c>set_tblproperties</c> therefore takes effect on the next open, which is the same
+    /// granularity every other configuration read here has.</para>
+    /// </summary>
+    // [FABRICATOR-PATCH: OFFER-READY]
+    // Retired by: upstream reading delta.checkpointInterval itself.
+    //
+    // The property was accepted and stored by writers (ours puts it in the WITH surface) and read by
+    // NOBODY, so a table declaring 100 was still checkpointed every 10 — honouring someone else's
+    // declaration incorrectly rather than neutrally. Same class as delta.logRetentionDuration, which
+    // remains unimplemented and is a much bigger fix (it needs log cleanup, not a value read).
+    private static int ResolveCheckpointInterval(DeltaTableOptions options, Snapshot.Snapshot? snapshot)
+    {
+        if (options.CheckpointInterval <= 0)
+            return options.CheckpointInterval;
+        if (snapshot?.Metadata.Configuration is not { } config)
+            return options.CheckpointInterval;
+        if (!config.TryGetValue("delta.checkpointInterval", out var raw))
+            return options.CheckpointInterval;
+        // A malformed or non-positive value is ignored rather than fatal: this is a declaration read from
+        // a table someone else may have written, and refusing to OPEN a table over it would turn a bad
+        // property into an unreadable table.
+        return int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed)
+               && parsed > 0
+            ? parsed
+            : options.CheckpointInterval;
     }
 
     /// <summary>
