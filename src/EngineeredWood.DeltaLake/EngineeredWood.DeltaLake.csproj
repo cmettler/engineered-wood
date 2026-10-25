@@ -19,7 +19,10 @@
     <PackageReference Include="System.Text.Json" Version="9.*" />
     <PackageReference Include="System.Memory" Version="4.6.3" />
     <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="9.*" />
-    <PackageReference Include="System.Threading.Tasks.Extensions" Version="4.6.0" />
+    <!-- [FABRICATOR-PATCH: OFFER-READY] 4.6.0 -> 4.6.3: System.Text.Json 9.* resolves 9.0.22, whose
+         System.IO.Pipelines 9.0.22 is not on nuget.org, so Pipelines 10.0.0 is taken and needs >= 4.6.3;
+         the 4.6.0 pin then fails restore with NU1605 (2026-10-25). Retired when upstream bumps it. -->
+    <PackageReference Include="System.Threading.Tasks.Extensions" Version="4.6.3" />
   </ItemGroup>
 
   <ItemGroup>
